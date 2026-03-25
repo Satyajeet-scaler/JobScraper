@@ -91,6 +91,10 @@
       .error {
         color: #fca5a5;
       }
+      .actions {
+        display: grid;
+        gap: 10px;
+      }
     </style>
   </head>
   <body>
@@ -105,34 +109,36 @@
               <select id="site_name" multiple>
                 <option value="linkedin" selected>linkedin</option>
                 <option value="indeed">indeed</option>
-                <option value="zip_recruiter">zip_recruiter</option>
                 <option value="glassdoor">glassdoor</option>
                 <option value="google">google</option>
                 <option value="bayt">bayt</option>
                 <option value="naukri">naukri</option>
-                <option value="bdjobs">bdjobs</option>
               </select>
             </div>
             <div>
               <label for="search_term">Search term</label>
               <input id="search_term" value="software engineer" />
+              <label for="google_search_term" style="margin-top: 10px;">Google search term</label>
+              <input id="google_search_term" placeholder="Required when google is selected" />
               <label for="location" style="margin-top: 10px;">Location</label>
-              <input id="location" value="United States" />
+              <input id="location" value="India" />
+              <label for="country_indeed" style="margin-top: 10px;">country_indeed</label>
+              <input id="country_indeed" value="india" />
               <label for="results_wanted" style="margin-top: 10px;">Results wanted</label>
               <input id="results_wanted" type="number" min="1" max="100" value="20" />
             </div>
             <div>
-              <label for="hours_old">Hours old</label>
-              <input id="hours_old" type="number" min="1" max="720" value="72" />
+              <label for="hours_old" style="margin-top: 10px;">Hours old</label>
+              <input id="hours_old" type="number" min="1" max="720" placeholder="Optional" />
               <label for="linkedin_fetch_description" style="margin-top: 10px;">LinkedIn fetch description</label>
               <select id="linkedin_fetch_description">
                 <option value="false" selected>false</option>
                 <option value="true">true</option>
               </select>
-              <div style="margin-top: 16px;">
+              <label for="offset" style="margin-top: 10px;">offset</label>
+              <input id="offset" type="number" min="0" value="0" />
+              <div class="actions" style="margin-top: 16px;">
                 <button id="submitBtn" type="submit">Fetch Jobs</button>
-              </div>
-              <div style="margin-top: 10px;">
                 <button id="downloadCsvBtn" type="button" disabled>Download CSV</button>
               </div>
             </div>
@@ -158,6 +164,10 @@
       function selectedSites() {
         const select = document.getElementById("site_name");
         return Array.from(select.selectedOptions).map((o) => o.value);
+      }
+
+      function hasSite(site) {
+        return selectedSites().includes(site);
       }
 
       function renderJobs(payload) {
@@ -274,13 +284,30 @@
         statusEl.textContent = "Fetching jobs...";
         resultsEl.innerHTML = "";
 
+        const sites = selectedSites();
+        const googleSearchTerm = document.getElementById("google_search_term").value.trim();
+        const hoursOldRaw = document.getElementById("hours_old").value.trim();
+
+        if (hasSite("google") && !googleSearchTerm) {
+          statusEl.innerHTML = '<span class="error">google_search_term is required when google is selected.</span>';
+          submitBtn.disabled = false;
+          return;
+        }
+
         const params = new URLSearchParams();
-        selectedSites().forEach((site) => params.append("site_name", site));
+        sites.forEach((site) => params.append("site_name", site));
         params.set("search_term", document.getElementById("search_term").value.trim());
+        if (googleSearchTerm) {
+          params.set("google_search_term", googleSearchTerm);
+        }
         params.set("location", document.getElementById("location").value.trim());
+        params.set("country_indeed", document.getElementById("country_indeed").value.trim());
         params.set("results_wanted", document.getElementById("results_wanted").value);
-        params.set("hours_old", document.getElementById("hours_old").value);
+        if (hoursOldRaw !== "") {
+          params.set("hours_old", hoursOldRaw);
+        }
         params.set("linkedin_fetch_description", document.getElementById("linkedin_fetch_description").value);
+        params.set("offset", document.getElementById("offset").value);
 
         try {
           const response = await fetch(`/jobs?${params.toString()}`);

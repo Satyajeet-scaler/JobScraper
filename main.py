@@ -1,3 +1,5 @@
+import math
+from pathlib import Path
 from typing import Literal, Optional
 
 from fastapi.encoders import jsonable_encoder
@@ -5,13 +7,11 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse, JSONResponse
 from jobspy import scrape_jobs
 from pandas import DataFrame
-import math
-from pathlib import Path
 
 
 app = FastAPI(
-    title="LinkedIn Tech Jobs API",
-    description="Fetch tech-focused job listings from LinkedIn via JobSpy.",
+    title="India Jobs API",
+    description="Fetch India-focused job listings from supported JobSpy sources.",
     version="1.0.0",
 )
 BASE_DIR = Path(__file__).resolve().parent
@@ -19,12 +19,10 @@ BASE_DIR = Path(__file__).resolve().parent
 SupportedSite = Literal[
     "linkedin",
     "indeed",
-    "zip_recruiter",
     "glassdoor",
     "google",
     "bayt",
     "naukri",
-    "bdjobs",
 ]
 
 
@@ -51,6 +49,19 @@ def sanitize_for_json(value):
     return value
 
 
+def validate_site_specific_constraints(
+    site_name: list[SupportedSite],
+    google_search_term: Optional[str],
+) -> None:
+    site_set = set(site_name)
+
+    if "google" in site_set and not google_search_term:
+        raise HTTPException(
+            status_code=400,
+            detail="google_search_term is required when site_name includes google.",
+        )
+
+
 @app.get("/health")
 def health_check() -> dict:
     return {"status": "ok"}
@@ -67,15 +78,19 @@ def get_linkedin_jobs(
         default=["linkedin"],
         description=(
             "One or more job sources. Supported values: "
-            "linkedin, indeed, zip_recruiter, glassdoor, google, bayt, naukri, bdjobs."
+            "linkedin, indeed, glassdoor, google, bayt, naukri."
         ),
     ),
     search_term: str = Query(
         default="software engineer",
         description="Keywords for job search (example: backend engineer, data engineer).",
     ),
+    google_search_term: Optional[str] = Query(
+        default=None,
+        description="Required when site_name includes google. Use a specific Google Jobs query.",
+    ),
     location: str = Query(
-        default="United States",
+        default="India",
         description="Location to search jobs in.",
     ),
     results_wanted: int = Query(
@@ -84,8 +99,12 @@ def get_linkedin_jobs(
         le=100,
         description="Number of job listings to fetch (1-100).",
     ),
+    country_indeed: str = Query(
+        default="india",
+        description="Country filter for Indeed and Glassdoor.",
+    ),
     hours_old: Optional[int] = Query(
-        default=72,
+        default=None,
         ge=1,
         le=720,
         description="Fetch jobs posted in the last N hours.",
@@ -94,15 +113,35 @@ def get_linkedin_jobs(
         default=False,
         description="Whether to fetch full LinkedIn descriptions (slower).",
     ),
+    offset: int = Query(
+        default=0,
+        ge=0,
+        description="Start index for paged scraping.",
+    ),
+    verbose: int = Query(
+        default=0,
+        ge=0,
+        le=2,
+        description="JobSpy verbosity level (0-2).",
+    ),
 ) -> JSONResponse:
+    validate_site_specific_constraints(
+        site_name=site_name,
+        google_search_term=google_search_term,
+    )
+
     try:
         jobs_df = scrape_jobs(
             site_name=site_name,
             search_term=search_term,
+            google_search_term=google_search_term,
             location=location,
             results_wanted=results_wanted,
+            country_indeed=country_indeed,
             hours_old=hours_old,
             linkedin_fetch_description=linkedin_fetch_description,
+            offset=offset,
+            verbose=verbose,
         )
     except Exception as exc:
         raise HTTPException(
@@ -117,7 +156,9 @@ def get_linkedin_jobs(
             "count": len(jobs),
             "source": site_name,
             "search_term": search_term,
+            "google_search_term": google_search_term,
             "location": location,
+            "country_indeed": country_indeed,
             "jobs": jobs,
             }
         )

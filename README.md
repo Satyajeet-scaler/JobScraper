@@ -1,6 +1,6 @@
-# LinkedIn Tech Jobs API (JobSpy)
+# India Jobs API (JobSpy)
 
-Simple FastAPI service that fetches tech jobs from LinkedIn using `python-jobspy`.
+Simple FastAPI service that fetches jobs for India-focused searches using `python-jobspy`.
 
 ## Python Version Requirement
 
@@ -75,8 +75,8 @@ railway open
 ## Endpoints
 
 - `GET /health` - basic service health
-- `GET /jobs` - fetch jobs from LinkedIn
-  - default source is LinkedIn, but you can pass one or more `site_name` values
+- `GET /jobs` - fetch jobs from India-supported sources
+  - defaults to LinkedIn, and you can pass one or more `site_name` values
 
 ### Example
 
@@ -87,15 +87,23 @@ curl "http://127.0.0.1:8000/jobs?search_term=python%20developer&location=India&r
 Multiple sources example:
 
 ```bash
-curl "http://127.0.0.1:8000/jobs?site_name=linkedin&site_name=indeed&search_term=software%20engineer&location=United%20States"
+curl "http://127.0.0.1:8000/jobs?site_name=linkedin&site_name=indeed&search_term=software%20engineer&location=India&country_indeed=india"
 ```
 
 ### Query Params
 
 - `site_name` (repeatable, default: `linkedin`)
-  - Supported values: `linkedin`, `indeed`, `zip_recruiter`, `glassdoor`, `google`, `bayt`, `naukri`, `bdjobs`
+  - Supported values: `linkedin`, `indeed`, `glassdoor`, `google`, `bayt`, `naukri`
 - `search_term` (default: `software engineer`)
-- `location` (default: `United States`)
+- `google_search_term` (required when `site_name=google`)
+- `location` (default: `India`)
+- `country_indeed` (default: `india`, for Indeed/Glassdoor)
 - `results_wanted` (default: `20`, range: `1-100`)
-- `hours_old` (default: `72`, range: `1-720`)
+- `hours_old` (optional, range: `1-720`)
 - `linkedin_fetch_description` (default: `false`)
+- `offset` (default: `0`)
+- `verbose` (`0-2`)
+
+### Site-specific constraints
+
+- Google: requires `google_search_term`

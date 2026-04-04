@@ -2,3 +2,9 @@ fastapi
 uvicorn
 python-jobspy
 pandas
+gspread
+google-auth
+requests
+google-generativeai
+apscheduler
+apify-client

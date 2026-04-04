@@ -1,0 +1,8 @@
+# https://docs.railway.app/deploy/config-as-code
+[build]
+builder = "DOCKERFILE"
+
+[deploy]
+healthcheckPath = "/health"
+healthcheckTimeout = 120
+restartPolicyType = "ON_FAILURE"

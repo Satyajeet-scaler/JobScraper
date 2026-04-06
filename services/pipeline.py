@@ -913,7 +913,7 @@ def _post_slack_summary(
             initial_delay_seconds=1.0,
         ).raise_for_status()
         sent_messages += 1
-
+        sleep(1)
     logger.info("slack posted per-job messages=%s total_relevant=%s", sent_messages, len(relevant_jobs))
 
 

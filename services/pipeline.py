@@ -51,7 +51,7 @@ def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
 
     linkedin_posts_metrics: dict[str, Any] | None = None
     linkedin_posts_error: str = ""
-    run_linkedin_posts_in_parallel = os.getenv("LINKEDIN_POSTS_PIPELINE_ENABLED", "false").lower() in ("1", "true", "yes")
+    run_linkedin_posts_in_parallel = os.getenv("LINKEDIN_POSTS_PIPELINE_ENABLED", "true").lower() in ("1", "true", "yes")
 
     try:
         logger.info("pipeline[%s] started run_date=%s", pipeline_run_id, run_date)

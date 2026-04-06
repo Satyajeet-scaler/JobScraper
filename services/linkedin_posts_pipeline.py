@@ -48,6 +48,11 @@ def run_linkedin_posts_pipeline(run_id: str | None = None) -> dict[str, Any]:
 
         relevant_rows, classification_errors = _classify_relevant_posts(normalized)
         _write_linkedin_posts_sheets(run_date=run_date, scraped_rows=normalized, relevant_rows=relevant_rows)
+        _post_linkedin_posts_slack_summary(
+            run_date=run_date,
+            scraped_rows=normalized,
+            relevant_rows=relevant_rows,
+        )
 
         metrics = {
             "run_id": pipeline_run_id,
@@ -347,3 +352,102 @@ Return strict JSON:
   "priority": "P1|P2|P3|P4|"
 }
 """
+
+
+def _post_linkedin_posts_slack_summary(
+    run_date: str,
+    scraped_rows: list[dict[str, Any]],
+    relevant_rows: list[dict[str, Any]],
+) -> None:
+    slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL")
+    if not slack_webhook_url:
+        logger.info("linkedin-posts slack skipped: SLACK_WEBHOOK_URL not configured")
+        return
+
+    slack_channel = os.getenv("LINKEDIN_POSTS_SLACK_CHANNEL", os.getenv("SLACK_CHANNEL", "relevant-scraped-jobs"))
+    slack_username = os.getenv("SLACK_USERNAME", "Karan Bot")
+    slack_icon_emoji = os.getenv("SLACK_ICON_EMOJI", ":karandeep:")
+
+    summary_body = (
+        f"LinkedIn posts digest ({run_date})\n"
+        f"- Scraped posts: {len(scraped_rows)}\n"
+        f"- Relevant posts: {len(relevant_rows)}"
+    )
+    _retry(
+        action=lambda: _post_slack_payload(
+            webhook_url=slack_webhook_url,
+            text=summary_body,
+            channel=slack_channel,
+            username=slack_username,
+            icon_emoji=slack_icon_emoji,
+        ),
+        retries=3,
+        initial_delay_seconds=1.0,
+    ).raise_for_status()
+
+    if not relevant_rows:
+        _retry(
+            action=lambda: _post_slack_payload(
+                webhook_url=slack_webhook_url,
+                text="No relevant LinkedIn hiring posts in this run.",
+                channel=slack_channel,
+                username=slack_username,
+                icon_emoji=slack_icon_emoji,
+            ),
+            retries=3,
+            initial_delay_seconds=1.0,
+        ).raise_for_status()
+        return
+
+    for row in relevant_rows:
+        author = (row.get("author_name") or "-").strip() or "-"
+        company = (row.get("company") or "-").strip() or "-"
+        role_category = (row.get("role_category") or "-").strip() or "-"
+        priority = (row.get("priority") or "-").strip() or "-"
+        posted_at = str(row.get("posted_at") or "-")
+        query = (row.get("search_query") or "-").strip() or "-"
+        url = (row.get("post_url") or "-").strip() or "-"
+        reason = (row.get("reason") or "-").strip() or "-"
+
+        message = (
+            f"Author: {author}\n"
+            f"Company: {company}\n"
+            f"Role Category: {role_category}\n"
+            f"Priority: {priority}\n"
+            f"Posted At: {posted_at}\n"
+            f"Query: {query}\n"
+            f"URL : {url}\n"
+            f"Reason: {reason}"
+        )
+        _retry(
+            action=lambda: _post_slack_payload(
+                webhook_url=slack_webhook_url,
+                text=message,
+                channel=slack_channel,
+                username=slack_username,
+                icon_emoji=slack_icon_emoji,
+            ),
+            retries=3,
+            initial_delay_seconds=1.0,
+        ).raise_for_status()
+        sleep(1)
+
+
+def _post_slack_payload(
+    webhook_url: str,
+    text: str,
+    channel: str,
+    username: str,
+    icon_emoji: str,
+) -> requests.Response:
+    payload = {
+        "text": text,
+        "channel": channel,
+        "username": username,
+        "icon_emoji": icon_emoji,
+    }
+    return requests.post(
+        webhook_url,
+        data={"payload": json.dumps(payload, ensure_ascii=True)},
+        timeout=20,
+    )

@@ -30,6 +30,7 @@ async def scrape_linkedin_job_recruiters(
     *,
     storage_state_path: str | Path | None = None,
     timeout_ms: float = 60_000.0,
+    force_fail_timeout_s: float = 15.0,
     hydration_wait_s: float = 5.0,
     headless: bool = True,
     strict_job_urls: bool = False,
@@ -69,12 +70,15 @@ async def scrape_linkedin_job_recruiters(
             continue
         try:
             logger.info("LinkedIn fetch (%d/%d): %s", i, len(job_urls), url)
-            html = await fetch_html_playwright(
-                url,
-                storage_state_path=state_path,
-                timeout_ms=timeout_ms,
-                hydration_wait_s=hydration_wait_s,
-                headless=headless,
+            html = await asyncio.wait_for(
+                fetch_html_playwright(
+                    url,
+                    storage_state_path=state_path,
+                    timeout_ms=timeout_ms,
+                    hydration_wait_s=hydration_wait_s,
+                    headless=headless,
+                ),
+                timeout=force_fail_timeout_s,
             )
             parsed = parse_meet_the_hiring_team(html)
             parsed["page_title"] = parse_recruiter_snippet(html).get("page_title")
@@ -109,6 +113,7 @@ def scrape_linkedin_job_recruiters_sync(
     *,
     storage_state_path: str | Path | None = None,
     timeout_ms: float = 60_000.0,
+    force_fail_timeout_s: float = 15.0,
     hydration_wait_s: float = 5.0,
     headless: bool = True,
     strict_job_urls: bool = False,
@@ -119,6 +124,7 @@ def scrape_linkedin_job_recruiters_sync(
             job_urls,
             storage_state_path=storage_state_path,
             timeout_ms=timeout_ms,
+            force_fail_timeout_s=force_fail_timeout_s,
             hydration_wait_s=hydration_wait_s,
             headless=headless,
             strict_job_urls=strict_job_urls,

@@ -7,9 +7,12 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
+ENV DISPLAY=:99
+
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     xvfb \
+    x11-utils \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir --upgrade pip

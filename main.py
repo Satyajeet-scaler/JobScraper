@@ -10,12 +10,16 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi.encoders import jsonable_encoder
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, status
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, JSONResponse
 from jobspy import scrape_jobs
 from pandas import DataFrame
 
-from services.linkedin_session import get_linkedin_storage_path, login_linkedin_save_storage_sync
+from services.linkedin_session import (
+    get_linkedin_storage_path,
+    login_linkedin_save_storage_sync,
+    save_linkedin_storage_state_json,
+)
 from services.pipeline import get_pipeline_run_metrics, run_daily_jobs_pipeline
 from services.naukri_only_pipeline import get_naukri_run_metrics, run_naukri_scrape_only_pipeline
 
@@ -267,6 +271,61 @@ def trigger_linkedin_auto_login(
             "storage_path": str(get_linkedin_storage_path()),
             "detail": "Login runs in background; check server logs for saved JSON or errors.",
         },
+    )
+
+
+@app.post("/internal/linkedin-session")
+async def save_linkedin_session(
+    request: Request,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """
+    Save Playwright ``storage_state`` JSON (e.g. local ``linkedin_storage.json``) to
+    ``LINKEDIN_STORAGE_PATH`` on the server.
+    Accepts ``application/json`` body or ``multipart/form-data`` with field ``file``.
+    """
+    validate_internal_trigger_token(x_internal_token)
+    content_type = request.headers.get("content-type", "")
+
+    try:
+        if "multipart/form-data" in content_type:
+            form = await request.form()
+            upload = form.get("file")
+            if upload is None:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Missing form field 'file'.",
+                )
+            raw_bytes = await upload.read()
+            data = json.loads(raw_bytes.decode("utf-8"))
+        else:
+            body = await request.body()
+            if not body.strip():
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Empty body.",
+                )
+            data = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid JSON: {exc}",
+        ) from exc
+
+    try:
+        path = save_linkedin_storage_state_json(data)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    return JSONResponse(
+        content={
+            "status": "saved",
+            "path": str(path),
+            "cookies": len(data.get("cookies", [])),
+        }
     )
 
 

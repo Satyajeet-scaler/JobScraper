@@ -22,16 +22,14 @@ Optional
 - ``LINKEDIN_DELAY_BETWEEN_FIELDS_S`` — seconds to wait after filling the email field before
   filling the password (default ``0``).
 
-**Railway / headless:** Server containers have no real display. ``LINKEDIN_HEADLESS=false`` does
-not show a window there and usually **fails** unless you add a virtual framebuffer (e.g. Xvfb) in
-your image or run login elsewhere and upload ``linkedin_storage.json``. For Railway, prefer
-``LINKEDIN_HEADLESS=true`` and accept checkpoint limitations, or generate the session file locally
-or in a one-off environment with a display.
+**Railway / headless:** Use ``LINKEDIN_HEADLESS=true``. For a reliable session without server-side
+checkpoints, sign in elsewhere and ``POST`` ``storage_state`` JSON to ``/internal/linkedin-session``.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -299,3 +297,32 @@ async def login_linkedin_save_storage_async(
 def login_linkedin_save_storage_sync(**kwargs: Any) -> Path:
     """Synchronous wrapper around :func:`login_linkedin_save_storage_async`."""
     return asyncio.run(login_linkedin_save_storage_async(**kwargs))
+
+
+def validate_playwright_storage_state(data: Any) -> dict[str, Any]:
+    """Ensure JSON looks like a Playwright ``storage_state`` export."""
+    if not isinstance(data, dict):
+        raise ValueError("Body must be a JSON object")
+    cookies = data.get("cookies")
+    if cookies is None:
+        raise ValueError(
+            "Missing 'cookies'; expected Playwright storage_state "
+            "(from context.storage_state() or equivalent export)"
+        )
+    if not isinstance(cookies, list):
+        raise ValueError("'cookies' must be a list")
+    return data
+
+
+def save_linkedin_storage_state_json(data: dict[str, Any]) -> Path:
+    """Write validated storage state to :func:`get_linkedin_storage_path`."""
+    validate_playwright_storage_state(data)
+    path = get_linkedin_storage_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    logger.info(
+        "Saved LinkedIn storage state to %s (%d cookies)",
+        path,
+        len(data.get("cookies", [])),
+    )
+    return path

@@ -4,8 +4,7 @@
 #   INTERNAL_TRIGGER_TOKEN     — required for POST /internal/* (daily jobs, linkedin login, etc.)
 #   LINKEDIN_EMAIL             — for /internal/linkedin-auto-login
 #   LINKEDIN_PASSWORD
-#   LINKEDIN_HEADLESS          — optional; Docker runs under Xvfb (:99) so headed mode can work.
-#                              Use true for normal server automation; false only if you need non-headless.
+#   LINKEDIN_HEADLESS          — use true on Railway (no display). POST local linkedin_storage.json to /internal/linkedin-session.
 # Optional: LINKEDIN_STORAGE_PATH=/app/data/linkedin_storage.json with a volume so sessions survive redeploys
 # Optional: APP_LOG_LEVEL, Google/Slack keys used by services/pipeline.py, etc.
 #

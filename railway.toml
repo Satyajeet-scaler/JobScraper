@@ -6,6 +6,7 @@
 #   LINKEDIN_PASSWORD
 #   LINKEDIN_HEADLESS          — use true on Railway (no display). POST local linkedin_storage.json to /internal/linkedin-session.
 # Optional: LINKEDIN_STORAGE_PATH=/app/data/linkedin_storage.json with a volume so sessions survive redeploys
+# Optional: LINKEDIN_RECRUITER_SHEET_ENABLED=true — after classification, scrape LinkedIn recruiters into tab recruiters_info_{date} (or RECRUITERS_INFO_WORKSHEET)
 # Optional: APP_LOG_LEVEL, Google/Slack keys used by services/pipeline.py, etc.
 #
 [build]

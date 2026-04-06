@@ -14,6 +14,7 @@ from jobspy import scrape_jobs
 from pandas import DataFrame, to_datetime
 
 from services.google_sheets import GoogleSheetsWriter
+from services.linkedin_recruiter.sheets_pipeline import write_linkedin_recruiters_for_relevant_jobs
 from services.apify_naukri import normalize_naukri_item, scrape_naukri_jobs
 try:
     import google.generativeai as genai
@@ -66,7 +67,38 @@ def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
         _write_relevant_jobs_to_google_sheets(run_date=run_date, relevant_jobs=relevant)
         logger.info("pipeline[%s] relevant_jobs sheet write completed", pipeline_run_id)
 
-        _post_slack_summary(run_date=run_date, scraped_jobs=deduped, relevant_jobs=relevant)
+        recruiter_sheet_rows = 0
+        linkedin_jobs_with_recruiter_profiles: frozenset[str] = frozenset()
+        try:
+            recruiter_sheet_rows, linkedin_jobs_with_recruiter_profiles = (
+                write_linkedin_recruiters_for_relevant_jobs(
+                    run_date=run_date,
+                    relevant_jobs=relevant,
+                )
+            )
+            logger.info(
+                "pipeline[%s] linkedin recruiters sheet completed rows_written=%s jobs_with_profiles=%s",
+                pipeline_run_id,
+                recruiter_sheet_rows,
+                len(linkedin_jobs_with_recruiter_profiles),
+            )
+        except Exception as exc:
+            logger.warning(
+                "pipeline[%s] linkedin recruiters sheet failed but pipeline will continue: %s",
+                pipeline_run_id,
+                exc,
+            )
+
+        slack_jobs = _relevant_jobs_for_slack_with_recruiter_info(
+            relevant,
+            linkedin_job_urls_with_recruiters=linkedin_jobs_with_recruiter_profiles,
+        )
+        _post_slack_summary(
+            run_date=run_date,
+            scraped_jobs=deduped,
+            relevant_jobs_total=len(relevant),
+            slack_jobs=slack_jobs,
+        )
         logger.info("pipeline[%s] slack post completed", pipeline_run_id)
         try:
             _update_company_match_sheet_with_ai(run_date=run_date, relevant_jobs=relevant)
@@ -86,6 +118,7 @@ def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
             "deduped_count": len(deduped),
             "relevant_count": len(relevant),
             "classification_errors": classifier_metrics["classification_errors"],
+            "recruiter_sheet_rows": recruiter_sheet_rows,
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         PIPELINE_RUN_METRICS[pipeline_run_id] = metrics
@@ -839,10 +872,27 @@ def _write_relevant_jobs_to_google_sheets(
     )
 
 
+def _relevant_jobs_for_slack_with_recruiter_info(
+    relevant_jobs: list[dict[str, Any]],
+    *,
+    linkedin_job_urls_with_recruiters: frozenset[str],
+) -> list[dict[str, Any]]:
+    """Per-job Slack digest: only classified rows whose job_url got ≥1 LinkedIn recruiter profile URL."""
+    if not linkedin_job_urls_with_recruiters:
+        return []
+    out: list[dict[str, Any]] = []
+    for job in relevant_jobs:
+        url = (job.get("job_url") or "").strip()
+        if url in linkedin_job_urls_with_recruiters:
+            out.append(job)
+    return out
+
+
 def _post_slack_summary(
     run_date: str,
     scraped_jobs: list[dict[str, Any]],
-    relevant_jobs: list[dict[str, Any]],
+    relevant_jobs_total: int,
+    slack_jobs: list[dict[str, Any]],
 ) -> None:
     slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL")
     if not slack_webhook_url:
@@ -856,7 +906,8 @@ def _post_slack_summary(
     summary_body = (
         f"Daily jobs digest ({run_date})\n"
         f"- Scraped (deduped): {len(scraped_jobs)}\n"
-        f"- Relevant: {len(relevant_jobs)}"
+        f"- Relevant (classified): {relevant_jobs_total}\n"
+        f"- Slack job posts (LinkedIn + recruiter profile): {len(slack_jobs)}"
     )
     _retry(
         action=lambda: _post_slack_payload(
@@ -869,7 +920,7 @@ def _post_slack_summary(
         retries=3,
         initial_delay_seconds=1.0,
     ).raise_for_status()
-    if not relevant_jobs:
+    if relevant_jobs_total == 0:
         _retry(
             action=lambda: _post_slack_payload(
                 webhook_url=slack_webhook_url,
@@ -884,8 +935,23 @@ def _post_slack_summary(
         logger.info("slack posted no relevant jobs message")
         return
 
+    if not slack_jobs:
+        _retry(
+            action=lambda: _post_slack_payload(
+                webhook_url=slack_webhook_url,
+                text="No LinkedIn jobs with recruiter profile URLs in this digest.",
+                channel=slack_channel,
+                username=slack_username,
+                icon_emoji=slack_icon_emoji,
+            ),
+            retries=3,
+            initial_delay_seconds=1.0,
+        ).raise_for_status()
+        logger.info("slack posted no recruiter-profile jobs message")
+        return
+
     sent_messages = 0
-    for job in relevant_jobs:
+    for job in slack_jobs:
         company = (job.get("company") or "-").strip() or "-"
         title = (job.get("title") or "-").strip() or "-"
         location = (job.get("location") or "-").strip() or "-"
@@ -914,7 +980,11 @@ def _post_slack_summary(
         ).raise_for_status()
         sent_messages += 1
         sleep(1)
-    logger.info("slack posted per-job messages=%s total_relevant=%s", sent_messages, len(relevant_jobs))
+    logger.info(
+        "slack posted per-job messages=%s slack_jobs_with_recruiter_info=%s",
+        sent_messages,
+        len(slack_jobs),
+    )
 
 
 def _pretty_platform_label(site_value: Any) -> str:

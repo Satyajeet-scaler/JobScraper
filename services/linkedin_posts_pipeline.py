@@ -11,6 +11,7 @@ import requests
 
 from services.apify_linkedin_posts import normalize_linkedin_post_item, scrape_linkedin_posts
 from services.google_sheets import GoogleSheetsWriter
+from services.handover_owners import load_owner_rows_for_handover
 
 try:
     import google.generativeai as genai
@@ -48,11 +49,14 @@ def run_linkedin_posts_pipeline(run_id: str | None = None) -> dict[str, Any]:
 
         relevant_rows, classification_errors = _classify_relevant_posts(normalized)
         _write_linkedin_posts_sheets(run_date=run_date, scraped_rows=normalized, relevant_rows=relevant_rows)
-        _post_linkedin_posts_slack_summary(
-            run_date=run_date,
-            scraped_rows=normalized,
-            relevant_rows=relevant_rows,
-        )
+        try:
+            _post_linkedin_posts_slack_summary(
+                run_date=run_date,
+                scraped_rows=normalized,
+                relevant_rows=relevant_rows,
+            )
+        except Exception as exc:
+            logger.warning("linkedin-posts slack notification failed (sheets already written): %s", exc)
 
         metrics = {
             "run_id": pipeline_run_id,
@@ -354,6 +358,29 @@ Return strict JSON:
 """
 
 
+def _slack_display_field(value: Any, default: str = "-") -> str:
+    """Slack text must be built from strings; Apify fields may be dict/list."""
+    if value is None:
+        return default
+    if isinstance(value, str):
+        return value.strip() or default
+    if isinstance(value, dict):
+        for key in ("search", "query", "keyword", "text", "name", "title"):
+            inner = value.get(key)
+            if isinstance(inner, str) and inner.strip():
+                return inner.strip()
+        try:
+            return json.dumps(value, ensure_ascii=True)[:500]
+        except (TypeError, ValueError):
+            return str(value)[:500]
+    if isinstance(value, (list, tuple)):
+        try:
+            return json.dumps(value, ensure_ascii=True)[:500]
+        except (TypeError, ValueError):
+            return str(value)[:500]
+    return str(value).strip() or default
+
+
 def _post_linkedin_posts_slack_summary(
     run_date: str,
     scraped_rows: list[dict[str, Any]],
@@ -399,15 +426,89 @@ def _post_linkedin_posts_slack_summary(
         ).raise_for_status()
         return
 
+    use_handover = os.getenv("LINKEDIN_POSTS_OWNER_HANDOVER", "true").lower() in ("1", "true", "yes")
+    owner_rows = load_owner_rows_for_handover() if use_handover else None
+    if use_handover and not owner_rows:
+        logger.warning(
+            "linkedin-posts handover: owner sheet unavailable; posting without owner assignment "
+            "(set GOOGLE_SPREADSHEET_ID and owner_slack_ID tab)"
+        )
+
+    if owner_rows:
+        owner_buckets: dict[int, list[dict[str, Any]]] = {i: [] for i in range(len(owner_rows))}
+        for idx, row in enumerate(relevant_rows):
+            owner_buckets[idx % len(owner_rows)].append(row)
+
+        for owner_idx, owner in enumerate(owner_rows):
+            bucket = owner_buckets.get(owner_idx, [])
+            if not bucket:
+                continue
+            owner_name = (owner.get("owner_name") or "Owner").strip() or "Owner"
+            owner_slack_id = (owner.get("owner_slack_id") or "").strip()
+            owner_email = (owner.get("owner_email") or "").strip()
+            owner_tag = f"<@{owner_slack_id}>" if owner_slack_id else owner_name
+            header = (
+                f"LinkedIn posts handover — {owner_name}\n"
+                f"Handover Owner: {owner_tag} ({owner_email or '-'})\n"
+                f"Posts in this block: {len(bucket)}"
+            )
+            _retry(
+                action=lambda h=header: _post_slack_payload(
+                    webhook_url=slack_webhook_url,
+                    text=h,
+                    channel=slack_channel,
+                    username=slack_username,
+                    icon_emoji=slack_icon_emoji,
+                ),
+                retries=3,
+                initial_delay_seconds=1.0,
+            ).raise_for_status()
+            sleep(1)
+
+            for row in bucket:
+                author = _slack_display_field(row.get("author_name"))
+                company = _slack_display_field(row.get("company"))
+                role_category = _slack_display_field(row.get("role_category"))
+                priority = _slack_display_field(row.get("priority"))
+                posted_at = _slack_display_field(row.get("posted_at"))
+                query = _slack_display_field(row.get("search_query"))
+                url = _slack_display_field(row.get("post_url"))
+                reason = _slack_display_field(row.get("reason"))
+
+                message = (
+                    f"Handover Owner: {owner_tag} ({owner_email or '-'})\n"
+                    f"Author: {author}\n"
+                    f"Company: {company}\n"
+                    f"Role Category: {role_category}\n"
+                    f"Priority: {priority}\n"
+                    f"Posted At: {posted_at}\n"
+                    f"Query: {query}\n"
+                    f"URL : {url}\n"
+                    f"Reason: {reason}"
+                )
+                _retry(
+                    action=lambda m=message: _post_slack_payload(
+                        webhook_url=slack_webhook_url,
+                        text=m,
+                        channel=slack_channel,
+                        username=slack_username,
+                        icon_emoji=slack_icon_emoji,
+                    ),
+                    retries=3,
+                    initial_delay_seconds=1.0,
+                ).raise_for_status()
+                sleep(1)
+        return
+
     for row in relevant_rows:
-        author = (row.get("author_name") or "-").strip() or "-"
-        company = (row.get("company") or "-").strip() or "-"
-        role_category = (row.get("role_category") or "-").strip() or "-"
-        priority = (row.get("priority") or "-").strip() or "-"
-        posted_at = str(row.get("posted_at") or "-")
-        query = (row.get("search_query") or "-").strip() or "-"
-        url = (row.get("post_url") or "-").strip() or "-"
-        reason = (row.get("reason") or "-").strip() or "-"
+        author = _slack_display_field(row.get("author_name"))
+        company = _slack_display_field(row.get("company"))
+        role_category = _slack_display_field(row.get("role_category"))
+        priority = _slack_display_field(row.get("priority"))
+        posted_at = _slack_display_field(row.get("posted_at"))
+        query = _slack_display_field(row.get("search_query"))
+        url = _slack_display_field(row.get("post_url"))
+        reason = _slack_display_field(row.get("reason"))
 
         message = (
             f"Author: {author}\n"
@@ -420,9 +521,9 @@ def _post_linkedin_posts_slack_summary(
             f"Reason: {reason}"
         )
         _retry(
-            action=lambda: _post_slack_payload(
+            action=lambda m=message: _post_slack_payload(
                 webhook_url=slack_webhook_url,
-                text=message,
+                text=m,
                 channel=slack_channel,
                 username=slack_username,
                 icon_emoji=slack_icon_emoji,

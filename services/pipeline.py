@@ -14,6 +14,7 @@ from jobspy import scrape_jobs
 from pandas import DataFrame, to_datetime
 
 from services.google_sheets import GoogleSheetsWriter
+from services.handover_owners import worksheet_row_dicts
 from services.linkedin_recruiter.sheets_pipeline import write_linkedin_recruiters_for_relevant_jobs
 from services.linkedin_posts_pipeline import run_linkedin_posts_pipeline
 from services.apify_naukri import normalize_naukri_item, scrape_naukri_jobs
@@ -922,8 +923,8 @@ def _post_recruiter_handover_notifications(run_date: str) -> int:
         logger.warning("handover slack skipped: required sheet missing: %s", exc)
         return 0
 
-    recruiter_rows = _rows_from_worksheet(recruiters_ws)
-    owner_rows = _rows_from_worksheet(owners_ws)
+    recruiter_rows = worksheet_row_dicts(recruiters_ws)
+    owner_rows = worksheet_row_dicts(owners_ws)
     if not recruiter_rows:
         logger.info("handover slack skipped: no recruiter rows")
         return 0
@@ -942,75 +943,69 @@ def _post_recruiter_handover_notifications(run_date: str) -> int:
         logger.info("handover slack skipped: no recruiter rows for run_date=%s", run_date)
         return 0
 
-    sent_messages = 0
+    # Keep round-robin assignment, but dispatch grouped by owner so each owner's jobs
+    # are sent together in one contiguous block.
+    owner_buckets: dict[int, list[dict[str, str]]] = {idx: [] for idx in range(len(owner_rows))}
     for idx, row in enumerate(filtered_rows):
-        owner = owner_rows[idx % len(owner_rows)]
+        owner_idx = idx % len(owner_rows)
+        owner_buckets[owner_idx].append(row)
+
+    sent_messages = 0
+    for owner_idx, owner in enumerate(owner_rows):
+        assigned_rows = owner_buckets.get(owner_idx, [])
+        if not assigned_rows:
+            continue
         owner_name = (owner.get("owner_name") or "Owner").strip() or "Owner"
         owner_slack_id = (owner.get("owner_slack_id") or "").strip()
         owner_email = (owner.get("owner_email") or "").strip()
         owner_tag = f"<@{owner_slack_id}>" if owner_slack_id else owner_name
 
-        company = (row.get("company") or "-").strip() or "-"
-        title = (row.get("title") or "-").strip() or "-"
-        platform = _pretty_platform_label(row.get("site"))
-        job_url = (row.get("job_url") or "-").strip() or "-"
-        recruiter_profile_url = (row.get("recruiter_profile_url") or "").strip()
-        recruiter_email = (row.get("recruiter_email") or "").strip()
+        for row in assigned_rows:
+            company = (row.get("company") or "-").strip() or "-"
+            title = (row.get("title") or "-").strip() or "-"
+            platform = _pretty_platform_label(row.get("site"))
+            job_url = (row.get("job_url") or "-").strip() or "-"
+            recruiter_profile_url = (row.get("recruiter_profile_url") or "").strip()
+            recruiter_email = (row.get("recruiter_email") or "").strip()
 
-        if recruiter_profile_url:
-            handover_line = f"Handover Owner: {owner_tag} ({owner_email or '-'})"
-            recruiter_line = f"Recruiter Profile: {recruiter_profile_url}"
-        else:
-            internal_line = (
-                f"Matched Internal Recruiter Email: {recruiter_email}"
-                if recruiter_email
-                else "Matched Internal Recruiter Email: -"
+            if recruiter_profile_url:
+                handover_line = f"Handover Owner: {owner_tag} ({owner_email or '-'})"
+                recruiter_line = f"Recruiter Profile: {recruiter_profile_url}"
+            else:
+                internal_line = (
+                    f"Matched Internal Recruiter Email: {recruiter_email}"
+                    if recruiter_email
+                    else "Matched Internal Recruiter Email: -"
+                )
+                handover_line = f"Handover Owner: {owner_tag} ({owner_email or '-'})"
+                recruiter_line = f"{internal_line}"
+            message = (
+                f"Company Name: {company}\n"
+                f"Title: {title}\n"
+                f"Platform: {platform}\n"
+                f"URL : {job_url}\n"
+                f"{handover_line}\n"
+                f"{recruiter_line}"
             )
-            handover_line = f"Handover Owner: {owner_tag} ({owner_email or '-'})"
-            recruiter_line = f"{internal_line}"
-        message = (
-            f"Company Name: {company}\n"
-            f"Title: {title}\n"
-            f"Platform: {platform}\n"
-            f"URL : {job_url}\n"
-            f"{handover_line}\n"
-            f"{recruiter_line}"
-        )
-        _retry(
-            action=lambda: _post_slack_payload(
-                webhook_url=slack_webhook_url,
-                text=message,
-                channel=slack_channel,
-                username=slack_username,
-                icon_emoji=slack_icon_emoji,
-            ),
-            retries=3,
-            initial_delay_seconds=1.0,
-        ).raise_for_status()
-        sent_messages += 1
-        sleep(1)
+            _retry(
+                action=lambda: _post_slack_payload(
+                    webhook_url=slack_webhook_url,
+                    text=message,
+                    channel=slack_channel,
+                    username=slack_username,
+                    icon_emoji=slack_icon_emoji,
+                ),
+                retries=3,
+                initial_delay_seconds=1.0,
+            ).raise_for_status()
+            sent_messages += 1
+            sleep(1)
     logger.info(
         "handover slack posted messages=%s rows=%s",
         sent_messages,
         len(filtered_rows),
     )
     return sent_messages
-
-
-def _rows_from_worksheet(worksheet) -> list[dict[str, str]]:
-    values = worksheet.get_all_values()
-    if len(values) <= 1:
-        return []
-    headers = [str(h or "").strip() for h in values[0]]
-    out: list[dict[str, str]] = []
-    for raw_row in values[1:]:
-        row: dict[str, str] = {}
-        for idx, header in enumerate(headers):
-            if not header:
-                continue
-            row[header.strip().lower()] = raw_row[idx].strip() if idx < len(raw_row) else ""
-        out.append(row)
-    return out
 
 
 def _pretty_platform_label(site_value: Any) -> str:

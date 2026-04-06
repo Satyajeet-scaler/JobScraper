@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import os
 import sys
 from pathlib import Path
 
@@ -19,7 +21,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 
-async def _main(storage_path: Path | None) -> None:
+async def _main(storage_path: Path | None, *, upload: bool = True) -> None:
     from playwright.async_api import async_playwright
 
     from services.linkedin_session import get_linkedin_storage_path
@@ -50,6 +52,62 @@ async def _main(storage_path: Path | None) -> None:
             await browser.close()
 
     print(f"Saved session to {out}")
+    if upload:
+        _upload_session_to_railway_if_configured(out)
+
+
+def _upload_session_to_railway_if_configured(storage_path: Path) -> None:
+    """
+    If LINKEDIN_SESSION_UPLOAD_URL and INTERNAL_TRIGGER_TOKEN are set, POST the JSON to
+    Railway ``POST /internal/linkedin-session`` (same as manual curl).
+    """
+    url = (os.getenv("LINKEDIN_SESSION_UPLOAD_URL") or "").strip()
+    token = (os.getenv("INTERNAL_TRIGGER_TOKEN") or "").strip()
+    if not url:
+        print(
+            "Tip: set LINKEDIN_SESSION_UPLOAD_URL (e.g. https://<your-app>.up.railway.app/internal/linkedin-session) "
+            "and INTERNAL_TRIGGER_TOKEN to upload this file to the server automatically next time."
+        )
+        return
+    if not token:
+        print("LINKEDIN_SESSION_UPLOAD_URL is set but INTERNAL_TRIGGER_TOKEN is missing; skipping upload.")
+        return
+
+    try:
+        import requests
+    except ImportError:
+        print("requests is required for upload; pip install requests")
+        sys.exit(1)
+
+    try:
+        raw = storage_path.read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except (OSError, json.JSONDecodeError) as exc:
+        print(f"Could not read session file for upload: {exc}")
+        sys.exit(1)
+
+    try:
+        response = requests.post(
+            url.rstrip("/"),
+            json=data,
+            headers={
+                "Content-Type": "application/json",
+                "x-internal-token": token,
+            },
+            timeout=60,
+        )
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        print(f"Upload to Railway failed: {exc}")
+        if hasattr(exc, "response") and exc.response is not None:
+            print(getattr(exc.response, "text", "")[:2000])
+        sys.exit(1)
+
+    try:
+        body = response.json()
+    except json.JSONDecodeError:
+        body = response.text
+    print(f"Uploaded session to Railway: {body}")
 
 
 def main() -> None:
@@ -63,8 +121,13 @@ def main() -> None:
         default=None,
         help="Output JSON path (default: get_linkedin_storage_path() -> data/linkedin_storage.json)",
     )
+    parser.add_argument(
+        "--no-upload",
+        action="store_true",
+        help="Skip POST to Railway even when LINKEDIN_SESSION_UPLOAD_URL is set.",
+    )
     args = parser.parse_args()
-    asyncio.run(_main(args.output))
+    asyncio.run(_main(args.output, upload=not args.no_upload))
 
 
 if __name__ == "__main__":

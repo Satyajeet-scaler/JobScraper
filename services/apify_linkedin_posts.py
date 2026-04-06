@@ -1,3 +1,4 @@
+import json
 import os
 from typing import Any
 
@@ -32,9 +33,10 @@ def normalize_linkedin_post_item(item: dict[str, Any]) -> dict[str, Any]:
     Normalize actor output into a stable shape while preserving original payload.
     Actor schemas evolve, so keep best-effort field mapping.
     """
+    raw_search = _first_non_empty(item, ["searchQuery", "query", "keyword"])
     return {
         "site": "linkedin_posts",
-        "search_query": _first_non_empty(item, ["searchQuery", "query", "keyword"]),
+        "search_query": _coerce_search_query_string(raw_search),
         "content_type": _first_non_empty(item, ["contentType", "type"]),
         "post_url": _first_non_empty(item, ["postUrl", "url", "postURL", "linkedinPostUrl"]),
         "post_id": _first_non_empty(item, ["postId", "id", "urn"]),
@@ -49,6 +51,24 @@ def normalize_linkedin_post_item(item: dict[str, Any]) -> dict[str, Any]:
         "reposts_count": _first_non_empty(item, ["repostsCount", "sharesCount", "numShares"]),
         "raw_payload": item,
     }
+
+
+def _coerce_search_query_string(value: Any) -> str | None:
+    """Actor may return query as a string or nested dict (e.g. search + filters)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip() or None
+    if isinstance(value, dict):
+        for key in ("search", "query", "keyword", "text"):
+            inner = value.get(key)
+            if isinstance(inner, str) and inner.strip():
+                return inner.strip()
+        try:
+            return json.dumps(value, ensure_ascii=True)
+        except (TypeError, ValueError):
+            return str(value)
+    return str(value).strip() or None
 
 
 def _first_non_empty(payload: dict[str, Any], keys: list[str]) -> Any:

@@ -5,7 +5,6 @@ import os
 import uuid
 import traceback
 from datetime import date, datetime, timedelta, timezone
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from time import perf_counter, sleep
 from typing import Any
 
@@ -52,100 +51,94 @@ def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
 
     linkedin_posts_metrics: dict[str, Any] | None = None
     linkedin_posts_error: str = ""
-    run_linkedin_posts_in_parallel = os.getenv("LINKEDIN_POSTS_PIPELINE_ENABLED", "true").lower() in ("1", "true", "yes")
+    run_linkedin_posts_enabled = os.getenv("LINKEDIN_POSTS_PIPELINE_ENABLED", "true").lower() in ("1", "true", "yes")
 
     try:
         logger.info("pipeline[%s] started run_date=%s", pipeline_run_id, run_date)
-        linkedin_posts_future = None
-        with ThreadPoolExecutor(max_workers=1) as side_executor:
-            if run_linkedin_posts_in_parallel:
-                linkedin_posts_future = side_executor.submit(run_linkedin_posts_pipeline)
-                logger.info("pipeline[%s] linkedin-posts side pipeline started in parallel", pipeline_run_id)
+        scraped = _scrape_target_jobs()
+        logger.info("pipeline[%s] scrape completed scraped_count=%s", pipeline_run_id, len(scraped))
+        deduped = _dedupe_jobs(scraped)
+        logger.info("pipeline[%s] dedupe completed deduped_count=%s", pipeline_run_id, len(deduped))
+        _write_scraped_jobs_to_google_sheets(run_date=run_date, scraped_jobs=deduped)
+        logger.info("pipeline[%s] scraped_jobs sheet write completed", pipeline_run_id)
 
-            scraped = _scrape_target_jobs()
-            logger.info("pipeline[%s] scrape completed scraped_count=%s", pipeline_run_id, len(scraped))
-            deduped = _dedupe_jobs(scraped)
-            logger.info("pipeline[%s] dedupe completed deduped_count=%s", pipeline_run_id, len(deduped))
-            _write_scraped_jobs_to_google_sheets(run_date=run_date, scraped_jobs=deduped)
-            logger.info("pipeline[%s] scraped_jobs sheet write completed", pipeline_run_id)
+        relevant, classifier_metrics = _classify_relevant_jobs(deduped)
+        logger.info(
+            "pipeline[%s] classification completed relevant_count=%s classification_errors=%s",
+            pipeline_run_id,
+            len(relevant),
+            classifier_metrics["classification_errors"],
+        )
+        _write_relevant_jobs_to_google_sheets(run_date=run_date, relevant_jobs=relevant)
+        logger.info("pipeline[%s] relevant_jobs sheet write completed", pipeline_run_id)
 
-            relevant, classifier_metrics = _classify_relevant_jobs(deduped)
-            logger.info(
-                "pipeline[%s] classification completed relevant_count=%s classification_errors=%s",
-                pipeline_run_id,
-                len(relevant),
-                classifier_metrics["classification_errors"],
+        recruiter_sheet_rows = 0
+        try:
+            recruiter_sheet_rows, _ = (
+                write_linkedin_recruiters_for_relevant_jobs(
+                    run_date=run_date,
+                    relevant_jobs=relevant,
+                )
             )
-            _write_relevant_jobs_to_google_sheets(run_date=run_date, relevant_jobs=relevant)
-            logger.info("pipeline[%s] relevant_jobs sheet write completed", pipeline_run_id)
+            logger.info(
+                "pipeline[%s] linkedin recruiters sheet completed rows_written=%s",
+                pipeline_run_id,
+                recruiter_sheet_rows,
+            )
+        except Exception as exc:
+            logger.warning(
+                "pipeline[%s] linkedin recruiters sheet failed but pipeline will continue: %s",
+                pipeline_run_id,
+                exc,
+            )
 
-            recruiter_sheet_rows = 0
+        handover_notifications_sent = 0
+        try:
+            handover_notifications_sent = _post_recruiter_handover_notifications(run_date=run_date)
+            logger.info(
+                "pipeline[%s] recruiter handover notifications sent=%s",
+                pipeline_run_id,
+                handover_notifications_sent,
+            )
+        except Exception as exc:
+            logger.warning(
+                "pipeline[%s] recruiter handover notifications failed but pipeline will continue: %s",
+                pipeline_run_id,
+                exc,
+            )
+
+        if run_linkedin_posts_enabled:
             try:
-                recruiter_sheet_rows, _ = (
-                    write_linkedin_recruiters_for_relevant_jobs(
-                        run_date=run_date,
-                        relevant_jobs=relevant,
-                    )
-                )
-                logger.info(
-                    "pipeline[%s] linkedin recruiters sheet completed rows_written=%s",
-                    pipeline_run_id,
-                    recruiter_sheet_rows,
-                )
+                linkedin_posts_metrics = run_linkedin_posts_pipeline()
             except Exception as exc:
-                logger.warning(
-                    "pipeline[%s] linkedin recruiters sheet failed but pipeline will continue: %s",
-                    pipeline_run_id,
-                    exc,
-                )
+                linkedin_posts_error = str(exc)
+                logger.warning("pipeline[%s] linkedin-posts pipeline failed: %s", pipeline_run_id, exc)
 
-            handover_notifications_sent = 0
-            try:
-                handover_notifications_sent = _post_recruiter_handover_notifications(run_date=run_date)
-                logger.info(
-                    "pipeline[%s] recruiter handover notifications sent=%s",
-                    pipeline_run_id,
-                    handover_notifications_sent,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "pipeline[%s] recruiter handover notifications failed but pipeline will continue: %s",
-                    pipeline_run_id,
-                    exc,
-                )
-
-            if linkedin_posts_future is not None:
-                try:
-                    linkedin_posts_metrics = linkedin_posts_future.result()
-                except Exception as exc:
-                    linkedin_posts_error = str(exc)
-                    logger.warning("pipeline[%s] linkedin-posts side pipeline failed: %s", pipeline_run_id, exc)
-
-            metrics = {
-                "run_id": pipeline_run_id,
-                "status": "completed",
-                "run_date": run_date,
-                "scraped_count": len(scraped),
-                "deduped_count": len(deduped),
-                "relevant_count": len(relevant),
-                "classification_errors": classifier_metrics["classification_errors"],
-                "recruiter_sheet_rows": recruiter_sheet_rows,
-                "handover_notifications_sent": handover_notifications_sent,
-                "linkedin_posts_parallel_enabled": run_linkedin_posts_in_parallel,
-                "linkedin_posts_parallel_status": (
-                    "completed"
-                    if linkedin_posts_metrics and linkedin_posts_metrics.get("status") == "completed"
-                    else ("failed" if linkedin_posts_error else "disabled")
-                ),
-                "linkedin_posts_parallel_scraped_count": (
-                    linkedin_posts_metrics.get("scraped_count") if linkedin_posts_metrics else 0
-                ),
-                "linkedin_posts_parallel_relevant_count": (
-                    linkedin_posts_metrics.get("relevant_count") if linkedin_posts_metrics else 0
-                ),
-                "linkedin_posts_parallel_error": linkedin_posts_error,
-                "duration_seconds": round(perf_counter() - started_at, 2),
-            }
+        metrics = {
+            "run_id": pipeline_run_id,
+            "status": "completed",
+            "run_date": run_date,
+            "scraped_count": len(scraped),
+            "deduped_count": len(deduped),
+            "relevant_count": len(relevant),
+            "classification_errors": classifier_metrics["classification_errors"],
+            "recruiter_sheet_rows": recruiter_sheet_rows,
+            "handover_notifications_sent": handover_notifications_sent,
+            "linkedin_posts_enabled": run_linkedin_posts_enabled,
+            "linkedin_posts_status": (
+                "completed"
+                if linkedin_posts_metrics and linkedin_posts_metrics.get("status") == "completed"
+                else ("failed" if linkedin_posts_error else "disabled")
+            ),
+            "linkedin_posts_scraped_count": (
+                linkedin_posts_metrics.get("scraped_count") if linkedin_posts_metrics else 0
+            ),
+            "linkedin_posts_relevant_count": (
+                linkedin_posts_metrics.get("relevant_count") if linkedin_posts_metrics else 0
+            ),
+            "linkedin_posts_error": linkedin_posts_error,
+            "duration_seconds": round(perf_counter() - started_at, 2),
+        }
         PIPELINE_RUN_METRICS[pipeline_run_id] = metrics
         logger.info("pipeline[%s] completed duration_seconds=%s", pipeline_run_id, metrics["duration_seconds"])
         return metrics
@@ -373,7 +366,6 @@ def _classify_relevant_jobs(jobs: list[dict[str, Any]]) -> tuple[list[dict[str, 
     gemini_model = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
     ai_url = os.getenv("AI_CLASSIFIER_URL")
     ai_token = os.getenv("AI_CLASSIFIER_TOKEN")
-    ai_max_workers = max(1, int(os.getenv("AI_CLASSIFIER_MAX_WORKERS", "6")))
     ai_batch_size = max(1, int(os.getenv("AI_CLASSIFIER_BATCH_SIZE", "50")))
     prompt_template = os.getenv(
         "AI_RELEVANCE_PROMPT",
@@ -390,7 +382,7 @@ def _classify_relevant_jobs(jobs: list[dict[str, Any]]) -> tuple[list[dict[str, 
         len(jobs),
         len(batches),
         ai_batch_size,
-        ai_max_workers,
+        1,
     )
     for idx, batch in enumerate(batches, start=1):
         logger.info("classification batch=%s/%s size=%s", idx, len(batches), len(batch))
@@ -424,35 +416,28 @@ def _classify_relevant_jobs(jobs: list[dict[str, Any]]) -> tuple[list[dict[str, 
             )
             continue
 
-        with ThreadPoolExecutor(max_workers=ai_max_workers) as executor:
-            future_to_job = {
-                executor.submit(
-                    _classify_single_job,
+        for job in batch:
+            try:
+                decision = _classify_single_job(
                     job,
                     gemini_api_key,
                     gemini_model,
                     ai_url,
                     ai_token,
                     prompt_template,
-                ): job
-                for job in batch
-            }
-            for future in as_completed(future_to_job):
-                job = future_to_job[future]
-                try:
-                    decision = future.result()
-                except Exception as exc:
-                    classification_errors += 1
-                    logger.warning("classification error: %s", exc)
-                    continue
-                if decision.get("is_relevant"):
-                    enriched = dict(job)
-                    enriched["matched_role"] = decision.get("matched_role", "")
-                    enriched["role_category"] = decision.get("role_category", "")
-                    enriched["priority"] = decision.get("priority", "")
-                    enriched["reason"] = decision.get("reason", "")
-                    enriched["confidence"] = decision.get("confidence", "")
-                    relevant_jobs.append(enriched)
+                )
+            except Exception as exc:
+                classification_errors += 1
+                logger.warning("classification error: %s", exc)
+                continue
+            if decision.get("is_relevant"):
+                enriched = dict(job)
+                enriched["matched_role"] = decision.get("matched_role", "")
+                enriched["role_category"] = decision.get("role_category", "")
+                enriched["priority"] = decision.get("priority", "")
+                enriched["reason"] = decision.get("reason", "")
+                enriched["confidence"] = decision.get("confidence", "")
+                relevant_jobs.append(enriched)
         logger.info(
             "classification batch=%s/%s completed relevant_total_so_far=%s errors_so_far=%s",
             idx,

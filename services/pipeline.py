@@ -79,19 +79,17 @@ def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
             logger.info("pipeline[%s] relevant_jobs sheet write completed", pipeline_run_id)
 
             recruiter_sheet_rows = 0
-            linkedin_jobs_with_recruiter_profiles: frozenset[str] = frozenset()
             try:
-                recruiter_sheet_rows, linkedin_jobs_with_recruiter_profiles = (
+                recruiter_sheet_rows, _ = (
                     write_linkedin_recruiters_for_relevant_jobs(
                         run_date=run_date,
                         relevant_jobs=relevant,
                     )
                 )
                 logger.info(
-                    "pipeline[%s] linkedin recruiters sheet completed rows_written=%s jobs_with_profiles=%s",
+                    "pipeline[%s] linkedin recruiters sheet completed rows_written=%s",
                     pipeline_run_id,
                     recruiter_sheet_rows,
-                    len(linkedin_jobs_with_recruiter_profiles),
                 )
             except Exception as exc:
                 logger.warning(
@@ -100,23 +98,17 @@ def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
                     exc,
                 )
 
-            slack_jobs = _relevant_jobs_for_slack_with_recruiter_info(
-                relevant,
-                linkedin_job_urls_with_recruiters=linkedin_jobs_with_recruiter_profiles,
-            )
-            _post_slack_summary(
-                run_date=run_date,
-                scraped_jobs=deduped,
-                relevant_jobs_total=len(relevant),
-                slack_jobs=slack_jobs,
-            )
-            logger.info("pipeline[%s] slack post completed", pipeline_run_id)
+            handover_notifications_sent = 0
             try:
-                _update_company_match_sheet_with_ai(run_date=run_date, relevant_jobs=relevant)
-                logger.info("pipeline[%s] company match sheet update completed", pipeline_run_id)
+                handover_notifications_sent = _post_recruiter_handover_notifications(run_date=run_date)
+                logger.info(
+                    "pipeline[%s] recruiter handover notifications sent=%s",
+                    pipeline_run_id,
+                    handover_notifications_sent,
+                )
             except Exception as exc:
                 logger.warning(
-                    "pipeline[%s] company match step failed but pipeline will continue: %s",
+                    "pipeline[%s] recruiter handover notifications failed but pipeline will continue: %s",
                     pipeline_run_id,
                     exc,
                 )
@@ -137,6 +129,7 @@ def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
                 "relevant_count": len(relevant),
                 "classification_errors": classifier_metrics["classification_errors"],
                 "recruiter_sheet_rows": recruiter_sheet_rows,
+                "handover_notifications_sent": handover_notifications_sent,
                 "linkedin_posts_parallel_enabled": run_linkedin_posts_in_parallel,
                 "linkedin_posts_parallel_status": (
                     "completed"
@@ -903,100 +896,85 @@ def _write_relevant_jobs_to_google_sheets(
     )
 
 
-def _relevant_jobs_for_slack_with_recruiter_info(
-    relevant_jobs: list[dict[str, Any]],
-    *,
-    linkedin_job_urls_with_recruiters: frozenset[str],
-) -> list[dict[str, Any]]:
-    """Per-job Slack digest: only classified rows whose job_url got ≥1 LinkedIn recruiter profile URL."""
-    if not linkedin_job_urls_with_recruiters:
-        return []
-    out: list[dict[str, Any]] = []
-    for job in relevant_jobs:
-        url = (job.get("job_url") or "").strip()
-        if url in linkedin_job_urls_with_recruiters:
-            out.append(job)
-    return out
-
-
-def _post_slack_summary(
-    run_date: str,
-    scraped_jobs: list[dict[str, Any]],
-    relevant_jobs_total: int,
-    slack_jobs: list[dict[str, Any]],
-) -> None:
+def _post_recruiter_handover_notifications(run_date: str) -> int:
+    """Send one Slack handover message per recruiters_info row, owner-assigned in round robin."""
     slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL")
     if not slack_webhook_url:
-        logger.info("slack skipped: SLACK_WEBHOOK_URL not configured")
-        return
+        logger.info("handover slack skipped: SLACK_WEBHOOK_URL not configured")
+        return 0
 
     slack_channel = os.getenv("SLACK_CHANNEL", "relevant-scraped-jobs")
     slack_username = os.getenv("SLACK_USERNAME", "Karan Bot")
     slack_icon_emoji = os.getenv("SLACK_ICON_EMOJI", ":karandeep:")
+    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
+    if not spreadsheet_id:
+        logger.info("handover slack skipped: GOOGLE_SPREADSHEET_ID not configured")
+        return 0
 
-    summary_body = (
-        f"Daily jobs digest ({run_date})\n"
-        f"- Scraped (deduped): {len(scraped_jobs)}\n"
-        f"- Relevant (classified): {relevant_jobs_total}\n"
-        f"- Slack job posts (LinkedIn + recruiter profile): {len(slack_jobs)}"
-    )
-    _retry(
-        action=lambda: _post_slack_payload(
-            webhook_url=slack_webhook_url,
-            text=summary_body,
-            channel=slack_channel,
-            username=slack_username,
-            icon_emoji=slack_icon_emoji,
-        ),
-        retries=3,
-        initial_delay_seconds=1.0,
-    ).raise_for_status()
-    if relevant_jobs_total == 0:
-        _retry(
-            action=lambda: _post_slack_payload(
-                webhook_url=slack_webhook_url,
-                text="No relevant jobs today.",
-                channel=slack_channel,
-                username=slack_username,
-                icon_emoji=slack_icon_emoji,
-            ),
-            retries=3,
-            initial_delay_seconds=1.0,
-        ).raise_for_status()
-        logger.info("slack posted no relevant jobs message")
-        return
+    recruiters_tab = os.getenv("RECRUITERS_INFO_WORKSHEET") or f"recruiters_info_{run_date}"
+    owner_tab = os.getenv("OWNER_SHEET_NAME", "owner_slack_ID")
+    writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
 
-    if not slack_jobs:
-        _retry(
-            action=lambda: _post_slack_payload(
-                webhook_url=slack_webhook_url,
-                text="No LinkedIn jobs with recruiter profile URLs in this digest.",
-                channel=slack_channel,
-                username=slack_username,
-                icon_emoji=slack_icon_emoji,
-            ),
-            retries=3,
-            initial_delay_seconds=1.0,
-        ).raise_for_status()
-        logger.info("slack posted no recruiter-profile jobs message")
-        return
+    try:
+        recruiters_ws = writer.sheet.worksheet(recruiters_tab)
+        owners_ws = writer.sheet.worksheet(owner_tab)
+    except Exception as exc:
+        logger.warning("handover slack skipped: required sheet missing: %s", exc)
+        return 0
+
+    recruiter_rows = _rows_from_worksheet(recruiters_ws)
+    owner_rows = _rows_from_worksheet(owners_ws)
+    if not recruiter_rows:
+        logger.info("handover slack skipped: no recruiter rows")
+        return 0
+    if not owner_rows:
+        logger.warning("handover slack skipped: owner sheet has no rows")
+        return 0
+
+    # Keep only rows for this run date when run_date column exists.
+    filtered_rows: list[dict[str, str]] = []
+    for row in recruiter_rows:
+        row_run_date = (row.get("run_date") or "").strip()
+        if row_run_date and row_run_date != run_date:
+            continue
+        filtered_rows.append(row)
+    if not filtered_rows:
+        logger.info("handover slack skipped: no recruiter rows for run_date=%s", run_date)
+        return 0
 
     sent_messages = 0
-    for job in slack_jobs:
-        company = (job.get("company") or "-").strip() or "-"
-        title = (job.get("title") or "-").strip() or "-"
-        location = (job.get("location") or "-").strip() or "-"
-        platform = _pretty_platform_label(job.get("site"))
-        posted_date = str(job.get("date_posted") or "-")
-        url = (job.get("job_url") or "-").strip() or "-"
+    for idx, row in enumerate(filtered_rows):
+        owner = owner_rows[idx % len(owner_rows)]
+        owner_name = (owner.get("owner_name") or "Owner").strip() or "Owner"
+        owner_slack_id = (owner.get("owner_slack_id") or "").strip()
+        owner_email = (owner.get("owner_email") or "").strip()
+        owner_tag = f"<@{owner_slack_id}>" if owner_slack_id else owner_name
 
+        company = (row.get("company") or "-").strip() or "-"
+        title = (row.get("title") or "-").strip() or "-"
+        platform = _pretty_platform_label(row.get("site"))
+        job_url = (row.get("job_url") or "-").strip() or "-"
+        recruiter_profile_url = (row.get("recruiter_profile_url") or "").strip()
+        recruiter_email = (row.get("recruiter_email") or "").strip()
+
+        if recruiter_profile_url:
+            handover_line = f"Handover Owner: {owner_tag} ({owner_email or '-'})"
+            recruiter_line = f"Recruiter Profile: {recruiter_profile_url}"
+        else:
+            internal_line = (
+                f"Matched Internal Recruiter Email: {recruiter_email}"
+                if recruiter_email
+                else "Matched Internal Recruiter Email: -"
+            )
+            handover_line = f"Handover Owner: {owner_tag} ({owner_email or '-'})"
+            recruiter_line = f"{internal_line}"
         message = (
             f"Company Name: {company}\n"
             f"Title: {title}\n"
-            f"Location: {location}\n"
             f"Platform: {platform}\n"
-            f"Posted Date: {posted_date}\n"
-            f"URL : {url}"
+            f"URL : {job_url}\n"
+            f"{handover_line}\n"
+            f"{recruiter_line}"
         )
         _retry(
             action=lambda: _post_slack_payload(
@@ -1012,10 +990,27 @@ def _post_slack_summary(
         sent_messages += 1
         sleep(1)
     logger.info(
-        "slack posted per-job messages=%s slack_jobs_with_recruiter_info=%s",
+        "handover slack posted messages=%s rows=%s",
         sent_messages,
-        len(slack_jobs),
+        len(filtered_rows),
     )
+    return sent_messages
+
+
+def _rows_from_worksheet(worksheet) -> list[dict[str, str]]:
+    values = worksheet.get_all_values()
+    if len(values) <= 1:
+        return []
+    headers = [str(h or "").strip() for h in values[0]]
+    out: list[dict[str, str]] = []
+    for raw_row in values[1:]:
+        row: dict[str, str] = {}
+        for idx, header in enumerate(headers):
+            if not header:
+                continue
+            row[header.strip().lower()] = raw_row[idx].strip() if idx < len(raw_row) else ""
+        out.append(row)
+    return out
 
 
 def _pretty_platform_label(site_value: Any) -> str:
@@ -1032,264 +1027,6 @@ def _pretty_platform_label(site_value: Any) -> str:
 
 def get_pipeline_run_metrics(run_id: str) -> dict[str, Any] | None:
     return PIPELINE_RUN_METRICS.get(run_id)
-
-
-def _update_company_match_sheet_with_ai(
-    run_date: str,
-    relevant_jobs: list[dict[str, Any]],
-) -> None:
-    """
-    Post-slack step:
-    - Read target sheet with column `company`
-    - AI-match target company -> relevant_jobs_{date} company
-    - Write matched relevant sheet row number(s) into the column right next to `company`
-    """
-    company_match_enabled = os.getenv("COMPANY_MATCH_ENABLED", "true").lower() == "true"
-
-    started = perf_counter()
-    max_seconds = max(10, int(os.getenv("COMPANY_MATCH_MAX_SECONDS", "300")))
-
-    if not relevant_jobs:
-        logger.info("company match skipped: no relevant jobs")
-        return
-
-    gemini_api_key = os.getenv("GEMINI_API_KEY")
-    if not gemini_api_key:
-        logger.info("company match skipped: GEMINI_API_KEY not set")
-        return
-    if genai is None:
-        logger.info("company match skipped: google-generativeai package unavailable")
-        return
-
-    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
-    if not spreadsheet_id:
-        logger.info("company match skipped: GOOGLE_SPREADSHEET_ID not set")
-        return
-
-    target_tab = os.getenv("COMPANY_MATCH_SHEET_NAME")
-    if not target_tab:
-        logger.info("company match skipped: COMPANY_MATCH_SHEET_NAME not set")
-        return
-
-    writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-    try:
-        worksheet = writer.sheet.worksheet(target_tab)
-    except Exception as exc:
-        logger.warning("company match skipped: target tab not found tab=%s err=%s", target_tab, exc)
-        return
-
-    headers = worksheet.row_values(1)
-    if not headers:
-        logger.warning("company match skipped: target tab has no header row")
-        return
-
-    header_map = {h.strip().lower(): i + 1 for i, h in enumerate(headers)}
-    company_col = header_map.get("company")
-    if not company_col:
-        logger.warning("company match skipped: required `company` column not found")
-        return
-    target_write_col = company_col + 1
-    if target_write_col > len(headers):
-        target_col_letter = GoogleSheetsWriter._column_letter(target_write_col)
-        worksheet.update(f"{target_col_letter}1", [["matched_relevant_rows"]])
-        headers.append("matched_relevant_rows")
-        logger.info(
-            "company match created output column next to `company` at %s1",
-            target_col_letter,
-        )
-
-    rows = worksheet.get_all_values()
-    if len(rows) <= 1:
-        logger.info("company match skipped: target tab has no data rows")
-        return
-
-    relevant_companies = []
-    for idx, job in enumerate(relevant_jobs, start=2):  # relevant sheet row index starts at 2
-        company = (job.get("company") or "").strip()
-        if company:
-            relevant_companies.append({"relevant_row": idx, "company": company})
-    if not relevant_companies:
-        logger.info("company match skipped: relevant jobs missing company values")
-        return
-
-    target_rows = []
-    for row_idx in range(2, len(rows) + 1):
-        row_vals = rows[row_idx - 1]
-        company = row_vals[company_col - 1].strip() if len(row_vals) >= company_col else ""
-        if company:
-            target_rows.append({"sheet_row": row_idx, "company": company})
-
-    if not target_rows:
-        logger.info("company match skipped: no company rows in target tab")
-        return
-
-    matches: dict[int, str] = {}
-    if not company_match_enabled:
-        logger.info("company match running in string mode (COMPANY_MATCH_ENABLED=false)")
-        matches = _match_companies_by_string(
-            target_rows=target_rows,
-            relevant_companies=relevant_companies,
-        )
-    else:
-        model_name = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-        batch_size = max(1, int(os.getenv("COMPANY_MATCH_BATCH_SIZE", "40")))
-
-        batches = _chunk(target_rows, batch_size)
-        logger.info(
-            "company match started target_rows=%s relevant_rows=%s batches=%s batch_size=%s max_seconds=%s",
-            len(target_rows),
-            len(relevant_companies),
-            len(batches),
-            batch_size,
-            max_seconds,
-        )
-
-        for idx, batch in enumerate(batches, start=1):
-            elapsed = perf_counter() - started
-            if elapsed > max_seconds:
-                logger.warning(
-                    "company match timeout reached after %.2fs at batch %s/%s; stopping early",
-                    elapsed,
-                    idx,
-                    len(batches),
-                )
-                break
-
-            logger.info("company match batch=%s/%s size=%s", idx, len(batches), len(batch))
-            batch_matches = _match_companies_with_ai_batch(
-                batch=batch,
-                relevant_companies=relevant_companies,
-                api_key=gemini_api_key,
-                model_name=model_name,
-            )
-            matches.update(batch_matches)
-            logger.info("company match batch=%s/%s completed matched_rows_so_far=%s", idx, len(batches), len(matches))
-
-    if not matches:
-        logger.info("company match completed: no matches found")
-        return
-
-    target_col_letter = GoogleSheetsWriter._column_letter(target_write_col)
-    updates = []
-    for sheet_row, relevant_row in matches.items():
-        updates.append({"range": f"{target_col_letter}{sheet_row}", "values": [[relevant_row]]})
-    worksheet.batch_update(updates)
-    logger.info(
-        "company match updated rows=%s tab=%s target_col=%s",
-        len(updates),
-        target_tab,
-        target_col_letter,
-    )
-
-
-def _match_companies_with_ai_batch(
-    batch: list[dict[str, Any]],
-    relevant_companies: list[dict[str, Any]],
-    api_key: str,
-    model_name: str,
-) -> dict[int, str]:
-    genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(model_name)
-    content = (
-        "Match companies between two lists using similarity.\n"
-        "Input A: relevant sheet rows with keys {relevant_row, company}.\n"
-        "Input B: target sheet rows with keys {sheet_row, company}.\n"
-        "Return ONLY a JSON array of matches.\n"
-        "Each item must be one of:\n"
-        "- {sheet_row: number, matched_relevant_rows: [number, ...]}\n"
-        "- {sheet_row: number, matched_relevant_row: number|null}\n"
-        "Return all good matches for each sheet_row. Use empty array or null when no good match.\n"
-        "STRICT OUTPUT RULES:\n"
-        "- No markdown\n"
-        "- No explanation text\n"
-        "- No code fences\n"
-        "- No trailing text before/after JSON\n"
-        "- Output must start with '[' and end with ']'\n\n"
-        f"RelevantRows={json.dumps(relevant_companies, ensure_ascii=True)}\n"
-        f"TargetRows={json.dumps(batch, ensure_ascii=True)}"
-    )
-    response = _retry(
-        action=lambda: model.generate_content(content),
-        retries=3,
-        initial_delay_seconds=1.0,
-    )
-    raw_text = getattr(response, "text", "") or ""
-    try:
-        parsed = _parse_classifier_json(raw_text)
-    except Exception:
-        # Fallback: some models may emit one JSON object per line.
-        parsed = _parse_json_objects_from_lines(raw_text)
-    if not isinstance(parsed, list):
-        return {}
-
-    matches: dict[int, str] = {}
-    for item in parsed:
-        if not isinstance(item, dict):
-            continue
-        sheet_row = item.get("sheet_row")
-        if not isinstance(sheet_row, int):
-            continue
-
-        matched_rows = item.get("matched_relevant_rows")
-        if isinstance(matched_rows, list):
-            cleaned = [str(r) for r in matched_rows if isinstance(r, int)]
-            if cleaned:
-                matches[sheet_row] = ",".join(cleaned)
-            continue
-
-        matched_row = item.get("matched_relevant_row")
-        if isinstance(matched_row, int):
-            matches[sheet_row] = str(matched_row)
-    return matches
-
-
-def _match_companies_by_string(
-    target_rows: list[dict[str, Any]],
-    relevant_companies: list[dict[str, Any]],
-) -> dict[int, str]:
-    by_company: dict[str, list[int]] = {}
-    for item in relevant_companies:
-        normalized = _normalize_company_name(item.get("company"))
-        if not normalized:
-            continue
-        by_company.setdefault(normalized, []).append(int(item["relevant_row"]))
-
-    matches: dict[int, str] = {}
-    for target in target_rows:
-        normalized = _normalize_company_name(target.get("company"))
-        if not normalized:
-            continue
-        candidate_rows = by_company.get(normalized, [])
-        if candidate_rows:
-            matches[int(target["sheet_row"])] = ",".join(str(x) for x in candidate_rows)
-    logger.info("company match string mode completed matched_rows=%s", len(matches))
-    return matches
-
-
-def _normalize_company_name(value: Any) -> str:
-    if value is None:
-        return ""
-    text = str(value).strip().lower()
-    if not text:
-        return ""
-    return " ".join(text.split())
-
-
-def _parse_json_objects_from_lines(raw_text: str) -> list[dict[str, Any]]:
-    items: list[dict[str, Any]] = []
-    for line in raw_text.splitlines():
-        candidate = line.strip().strip(",")
-        if not candidate:
-            continue
-        if not candidate.startswith("{") or not candidate.endswith("}"):
-            continue
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(parsed, dict):
-            items.append(parsed)
-    return items
 
 
 def _post_slack_payload(

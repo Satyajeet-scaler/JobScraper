@@ -12,7 +12,7 @@ import logging
 from pathlib import Path
 from typing import Any, Sequence
 
-from services.linkedin_recruiter.fetch import fetch_html_playwright
+from services.linkedin_recruiter.fetch import fetch_html_playwright_many
 from services.linkedin_recruiter.jobs import PRIMARY_SECTION_HEADING, parse_meet_the_hiring_team
 from services.linkedin_recruiter.snippet import parse_recruiter_snippet
 from services.linkedin_session import get_linkedin_storage_path
@@ -31,6 +31,7 @@ async def scrape_linkedin_job_recruiters(
     storage_state_path: str | Path | None = None,
     timeout_ms: float = 60_000.0,
     force_fail_timeout_s: float = 15.0,
+    recycle_every: int = 25,
     hydration_wait_s: float = 5.0,
     headless: bool = True,
     strict_job_urls: bool = False,
@@ -55,6 +56,7 @@ async def scrape_linkedin_job_recruiters(
         state_path,
     )
     results: list[dict[str, Any]] = []
+    indexed_linkedin_urls: list[tuple[int, str]] = []
     for i, url in enumerate(job_urls, start=1):
         if not is_linkedin_job_url(url):
             logger.warning("LinkedIn skip (%d/%d): not a job URL: %s", i, len(job_urls), url)
@@ -68,18 +70,26 @@ async def scrape_linkedin_job_recruiters(
                 }
             )
             continue
+        indexed_linkedin_urls.append((i, url))
+
+    if indexed_linkedin_urls:
+        fetched = await fetch_html_playwright_many(
+            [url for _, url in indexed_linkedin_urls],
+            storage_state_path=state_path,
+            timeout_ms=timeout_ms,
+            hydration_wait_s=hydration_wait_s,
+            headless=headless,
+            force_fail_timeout_s=force_fail_timeout_s,
+            recycle_every=recycle_every,
+        )
+        by_url = {item["url"]: item for item in fetched}
+
+    for i, url in indexed_linkedin_urls:
+        item = by_url.get(url, {"url": url, "error": "missing fetch result"})
         try:
-            logger.info("LinkedIn fetch (%d/%d): %s", i, len(job_urls), url)
-            html = await asyncio.wait_for(
-                fetch_html_playwright(
-                    url,
-                    storage_state_path=state_path,
-                    timeout_ms=timeout_ms,
-                    hydration_wait_s=hydration_wait_s,
-                    headless=headless,
-                ),
-                timeout=force_fail_timeout_s,
-            )
+            if "error" in item:
+                raise RuntimeError(item["error"])
+            html = item["html"]
             parsed = parse_meet_the_hiring_team(html)
             parsed["page_title"] = parse_recruiter_snippet(html).get("page_title")
             nrec = len(parsed.get("recruiters") or [])
@@ -114,6 +124,7 @@ def scrape_linkedin_job_recruiters_sync(
     storage_state_path: str | Path | None = None,
     timeout_ms: float = 60_000.0,
     force_fail_timeout_s: float = 15.0,
+    recycle_every: int = 25,
     hydration_wait_s: float = 5.0,
     headless: bool = True,
     strict_job_urls: bool = False,
@@ -125,6 +136,7 @@ def scrape_linkedin_job_recruiters_sync(
             storage_state_path=storage_state_path,
             timeout_ms=timeout_ms,
             force_fail_timeout_s=force_fail_timeout_s,
+            recycle_every=recycle_every,
             hydration_wait_s=hydration_wait_s,
             headless=headless,
             strict_job_urls=strict_job_urls,

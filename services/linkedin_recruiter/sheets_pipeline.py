@@ -79,17 +79,32 @@ def write_linkedin_recruiters_for_relevant_jobs(
             storage = None
 
         unique_urls = list(dict.fromkeys(j["job_url"].strip() for j in li_relevant if j.get("job_url")))
+        max_urls = int(os.getenv("LINKEDIN_RECRUITER_MAX_URLS_PER_RUN", "60"))
+        if max_urls > 0 and len(unique_urls) > max_urls:
+            logger.info(
+                "linkedin recruiter scrape: capping urls from %s to %s (LINKEDIN_RECRUITER_MAX_URLS_PER_RUN)",
+                len(unique_urls),
+                max_urls,
+            )
+            unique_urls = unique_urls[:max_urls]
         if storage is not None:
             headless = os.getenv("LINKEDIN_HEADLESS", "true").lower() in ("1", "true", "yes")
+            force_fail_timeout_s = float(os.getenv("LINKEDIN_RECRUITER_FORCE_FAIL_TIMEOUT_S", "15"))
+            recycle_every = int(os.getenv("LINKEDIN_RECRUITER_RECYCLE_EVERY", "25"))
             logger.info(
-                "linkedin recruiter scrape: unique_linkedin_job_urls=%s headless=%s",
+                "linkedin recruiter scrape: unique_linkedin_job_urls=%s headless=%s force_fail_timeout_s=%s recycle_every=%s",
                 len(unique_urls),
                 headless,
+                force_fail_timeout_s,
+                recycle_every,
             )
             results = scrape_linkedin_job_recruiters_sync(
                 unique_urls,
                 storage_state_path=storage,
                 headless=headless,
+                force_fail_timeout_s=force_fail_timeout_s,
+                recycle_every=recycle_every,
+                timeout_ms=max(15000.0, force_fail_timeout_s * 1000.0),
             )
             by_url = {r["url"]: r for r in results}
     else:

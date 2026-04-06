@@ -15,6 +15,7 @@ from pandas import DataFrame, to_datetime
 
 from services.google_sheets import GoogleSheetsWriter
 from services.linkedin_recruiter.sheets_pipeline import write_linkedin_recruiters_for_relevant_jobs
+from services.linkedin_posts_pipeline import run_linkedin_posts_pipeline
 from services.apify_naukri import normalize_naukri_item, scrape_naukri_jobs
 try:
     import google.generativeai as genai
@@ -48,79 +49,109 @@ def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
         "started": True,
     }
 
+    linkedin_posts_metrics: dict[str, Any] | None = None
+    linkedin_posts_error: str = ""
+    run_linkedin_posts_in_parallel = os.getenv("LINKEDIN_POSTS_PIPELINE_ENABLED", "false").lower() in ("1", "true", "yes")
+
     try:
         logger.info("pipeline[%s] started run_date=%s", pipeline_run_id, run_date)
-        scraped = _scrape_target_jobs()
-        logger.info("pipeline[%s] scrape completed scraped_count=%s", pipeline_run_id, len(scraped))
-        deduped = _dedupe_jobs(scraped)
-        logger.info("pipeline[%s] dedupe completed deduped_count=%s", pipeline_run_id, len(deduped))
-        _write_scraped_jobs_to_google_sheets(run_date=run_date, scraped_jobs=deduped)
-        logger.info("pipeline[%s] scraped_jobs sheet write completed", pipeline_run_id)
+        linkedin_posts_future = None
+        with ThreadPoolExecutor(max_workers=1) as side_executor:
+            if run_linkedin_posts_in_parallel:
+                linkedin_posts_future = side_executor.submit(run_linkedin_posts_pipeline)
+                logger.info("pipeline[%s] linkedin-posts side pipeline started in parallel", pipeline_run_id)
 
-        relevant, classifier_metrics = _classify_relevant_jobs(deduped)
-        logger.info(
-            "pipeline[%s] classification completed relevant_count=%s classification_errors=%s",
-            pipeline_run_id,
-            len(relevant),
-            classifier_metrics["classification_errors"],
-        )
-        _write_relevant_jobs_to_google_sheets(run_date=run_date, relevant_jobs=relevant)
-        logger.info("pipeline[%s] relevant_jobs sheet write completed", pipeline_run_id)
+            scraped = _scrape_target_jobs()
+            logger.info("pipeline[%s] scrape completed scraped_count=%s", pipeline_run_id, len(scraped))
+            deduped = _dedupe_jobs(scraped)
+            logger.info("pipeline[%s] dedupe completed deduped_count=%s", pipeline_run_id, len(deduped))
+            _write_scraped_jobs_to_google_sheets(run_date=run_date, scraped_jobs=deduped)
+            logger.info("pipeline[%s] scraped_jobs sheet write completed", pipeline_run_id)
 
-        recruiter_sheet_rows = 0
-        linkedin_jobs_with_recruiter_profiles: frozenset[str] = frozenset()
-        try:
-            recruiter_sheet_rows, linkedin_jobs_with_recruiter_profiles = (
-                write_linkedin_recruiters_for_relevant_jobs(
-                    run_date=run_date,
-                    relevant_jobs=relevant,
-                )
-            )
+            relevant, classifier_metrics = _classify_relevant_jobs(deduped)
             logger.info(
-                "pipeline[%s] linkedin recruiters sheet completed rows_written=%s jobs_with_profiles=%s",
+                "pipeline[%s] classification completed relevant_count=%s classification_errors=%s",
                 pipeline_run_id,
-                recruiter_sheet_rows,
-                len(linkedin_jobs_with_recruiter_profiles),
+                len(relevant),
+                classifier_metrics["classification_errors"],
             )
-        except Exception as exc:
-            logger.warning(
-                "pipeline[%s] linkedin recruiters sheet failed but pipeline will continue: %s",
-                pipeline_run_id,
-                exc,
-            )
+            _write_relevant_jobs_to_google_sheets(run_date=run_date, relevant_jobs=relevant)
+            logger.info("pipeline[%s] relevant_jobs sheet write completed", pipeline_run_id)
 
-        slack_jobs = _relevant_jobs_for_slack_with_recruiter_info(
-            relevant,
-            linkedin_job_urls_with_recruiters=linkedin_jobs_with_recruiter_profiles,
-        )
-        _post_slack_summary(
-            run_date=run_date,
-            scraped_jobs=deduped,
-            relevant_jobs_total=len(relevant),
-            slack_jobs=slack_jobs,
-        )
-        logger.info("pipeline[%s] slack post completed", pipeline_run_id)
-        try:
-            _update_company_match_sheet_with_ai(run_date=run_date, relevant_jobs=relevant)
-            logger.info("pipeline[%s] company match sheet update completed", pipeline_run_id)
-        except Exception as exc:
-            logger.warning(
-                "pipeline[%s] company match step failed but pipeline will continue: %s",
-                pipeline_run_id,
-                exc,
-            )
+            recruiter_sheet_rows = 0
+            linkedin_jobs_with_recruiter_profiles: frozenset[str] = frozenset()
+            try:
+                recruiter_sheet_rows, linkedin_jobs_with_recruiter_profiles = (
+                    write_linkedin_recruiters_for_relevant_jobs(
+                        run_date=run_date,
+                        relevant_jobs=relevant,
+                    )
+                )
+                logger.info(
+                    "pipeline[%s] linkedin recruiters sheet completed rows_written=%s jobs_with_profiles=%s",
+                    pipeline_run_id,
+                    recruiter_sheet_rows,
+                    len(linkedin_jobs_with_recruiter_profiles),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "pipeline[%s] linkedin recruiters sheet failed but pipeline will continue: %s",
+                    pipeline_run_id,
+                    exc,
+                )
 
-        metrics = {
-            "run_id": pipeline_run_id,
-            "status": "completed",
-            "run_date": run_date,
-            "scraped_count": len(scraped),
-            "deduped_count": len(deduped),
-            "relevant_count": len(relevant),
-            "classification_errors": classifier_metrics["classification_errors"],
-            "recruiter_sheet_rows": recruiter_sheet_rows,
-            "duration_seconds": round(perf_counter() - started_at, 2),
-        }
+            slack_jobs = _relevant_jobs_for_slack_with_recruiter_info(
+                relevant,
+                linkedin_job_urls_with_recruiters=linkedin_jobs_with_recruiter_profiles,
+            )
+            _post_slack_summary(
+                run_date=run_date,
+                scraped_jobs=deduped,
+                relevant_jobs_total=len(relevant),
+                slack_jobs=slack_jobs,
+            )
+            logger.info("pipeline[%s] slack post completed", pipeline_run_id)
+            try:
+                _update_company_match_sheet_with_ai(run_date=run_date, relevant_jobs=relevant)
+                logger.info("pipeline[%s] company match sheet update completed", pipeline_run_id)
+            except Exception as exc:
+                logger.warning(
+                    "pipeline[%s] company match step failed but pipeline will continue: %s",
+                    pipeline_run_id,
+                    exc,
+                )
+
+            if linkedin_posts_future is not None:
+                try:
+                    linkedin_posts_metrics = linkedin_posts_future.result()
+                except Exception as exc:
+                    linkedin_posts_error = str(exc)
+                    logger.warning("pipeline[%s] linkedin-posts side pipeline failed: %s", pipeline_run_id, exc)
+
+            metrics = {
+                "run_id": pipeline_run_id,
+                "status": "completed",
+                "run_date": run_date,
+                "scraped_count": len(scraped),
+                "deduped_count": len(deduped),
+                "relevant_count": len(relevant),
+                "classification_errors": classifier_metrics["classification_errors"],
+                "recruiter_sheet_rows": recruiter_sheet_rows,
+                "linkedin_posts_parallel_enabled": run_linkedin_posts_in_parallel,
+                "linkedin_posts_parallel_status": (
+                    "completed"
+                    if linkedin_posts_metrics and linkedin_posts_metrics.get("status") == "completed"
+                    else ("failed" if linkedin_posts_error else "disabled")
+                ),
+                "linkedin_posts_parallel_scraped_count": (
+                    linkedin_posts_metrics.get("scraped_count") if linkedin_posts_metrics else 0
+                ),
+                "linkedin_posts_parallel_relevant_count": (
+                    linkedin_posts_metrics.get("relevant_count") if linkedin_posts_metrics else 0
+                ),
+                "linkedin_posts_parallel_error": linkedin_posts_error,
+                "duration_seconds": round(perf_counter() - started_at, 2),
+            }
         PIPELINE_RUN_METRICS[pipeline_run_id] = metrics
         logger.info("pipeline[%s] completed duration_seconds=%s", pipeline_run_id, metrics["duration_seconds"])
         return metrics

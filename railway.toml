@@ -7,6 +7,11 @@
 #   LINKEDIN_HEADLESS          — use true on Railway (no display). POST local linkedin_storage.json to /internal/linkedin-session.
 # Optional: LINKEDIN_STORAGE_PATH=/app/data/linkedin_storage.json with a volume so sessions survive redeploys
 # Optional: LINKEDIN_RECRUITER_SHEET_ENABLED=true — after classification, scrape LinkedIn recruiters into tab recruiters_info_{date} (or RECRUITERS_INFO_WORKSHEET)
+# Optional: LINKEDIN_POSTS_PIPELINE_ENABLED=true — run LinkedIn-posts Apify pipeline in parallel with /internal/run-daily-jobs
+# Optional: APIFY_LINKEDIN_POSTS_ACTOR_ID=buIWk2uOUzTmcLsuB
+# Optional: APIFY_LINKEDIN_POST_QUERIES='["hiring data analyst Bangalore","hiring backend developer India"]'
+# Optional: APIFY_LINKEDIN_POSTS_MAX_POSTS=30, APIFY_LINKEDIN_POSTS_POSTED_LIMIT=24h, APIFY_LINKEDIN_POSTS_SORT_BY=date
+# Optional: AI_RELEVANCE_PROMPT_LINKEDIN_POSTS="..."
 # Optional: APP_LOG_LEVEL, Google/Slack keys used by services/pipeline.py, etc.
 #
 [build]

@@ -1,4 +1,13 @@
-# https://docs.railway.app/deploy/config-as-code
+# https://docs.railway.com/deploy/config-as-code
+#
+# Set variables in the Railway dashboard (or linked env group):
+#   INTERNAL_TRIGGER_TOKEN     — required for POST /internal/* (daily jobs, linkedin login, etc.)
+#   LINKEDIN_EMAIL             — for /internal/linkedin-auto-login
+#   LINKEDIN_PASSWORD
+#   LINKEDIN_HEADLESS=true     — required on Railway (no display)
+# Optional: LINKEDIN_STORAGE_PATH=/app/data/linkedin_storage.json with a volume so sessions survive redeploys
+# Optional: APP_LOG_LEVEL, Google/Slack keys used by services/pipeline.py, etc.
+#
 [build]
 builder = "DOCKERFILE"
 

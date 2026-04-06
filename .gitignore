@@ -31,3 +31,6 @@ dist/
 # Local environment files
 .env
 .env.*
+
+# Playwright LinkedIn session (cookies); do not commit
+data/linkedin_storage.json

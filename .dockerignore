@@ -8,3 +8,8 @@ __pycache__
 .Python
 .DS_Store
 agent-transcripts
+
+# Do not bake local LinkedIn session into the image
+data/linkedin_storage.json
+.env
+.env.*

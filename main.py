@@ -1,3 +1,4 @@
+import json
 import math
 import os
 import uuid
@@ -14,6 +15,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from jobspy import scrape_jobs
 from pandas import DataFrame
 
+from services.linkedin_session import get_linkedin_storage_path, login_linkedin_save_storage_sync
 from services.pipeline import get_pipeline_run_metrics, run_daily_jobs_pipeline
 from services.naukri_only_pipeline import get_naukri_run_metrics, run_naukri_scrape_only_pipeline
 
@@ -106,6 +108,26 @@ def _run_daily_jobs_from_scheduler() -> None:
     run_id = str(uuid.uuid4())
     logger.info("scheduler triggered daily pipeline run_id=%s", run_id)
     run_daily_jobs_pipeline(run_id)
+
+
+def _run_linkedin_auto_login_and_log(job_id: str) -> None:
+    """Run Playwright LinkedIn login; log saved storage JSON (contains session secrets)."""
+    try:
+        path = login_linkedin_save_storage_sync()
+        raw = path.read_text(encoding="utf-8")
+        try:
+            pretty = json.dumps(json.loads(raw), indent=2, ensure_ascii=False)
+        except json.JSONDecodeError:
+            pretty = raw
+        logger.info(
+            "linkedin_auto_login[%s] ok path=%s bytes=%d\n%s",
+            job_id,
+            path,
+            len(raw.encode("utf-8")),
+            pretty,
+        )
+    except Exception as exc:
+        logger.exception("linkedin_auto_login[%s] failed: %s", job_id, exc)
 
 
 def _build_scheduler() -> BackgroundScheduler:
@@ -221,6 +243,31 @@ def get_naukri_run_status(
     if not metrics:
         raise HTTPException(status_code=404, detail="Run ID not found.")
     return JSONResponse(content=metrics)
+
+
+@app.post("/internal/linkedin-auto-login")
+def trigger_linkedin_auto_login(
+    background_tasks: BackgroundTasks,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """
+    Run automated LinkedIn login (env credentials + Playwright) in the background.
+    On success, the saved ``storage_state`` JSON is written to application logs (sensitive).
+    """
+    validate_internal_trigger_token(x_internal_token)
+
+    job_id = str(uuid.uuid4())
+    background_tasks.add_task(_run_linkedin_auto_login_and_log, job_id)
+
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "job_id": job_id,
+            "status": "accepted",
+            "storage_path": str(get_linkedin_storage_path()),
+            "detail": "Login runs in background; check server logs for saved JSON or errors.",
+        },
+    )
 
 
 @app.get("/jobs")

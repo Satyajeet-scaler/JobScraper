@@ -8,3 +8,4 @@ requests
 google-generativeai
 apscheduler
 apify-client
+playwright>=1.40.0

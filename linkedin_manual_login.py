@@ -14,6 +14,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from urllib.parse import urlparse
 
 # Allow `python linkedin_manual_login.py` from job_scaper without package install
 _ROOT = Path(__file__).resolve().parent
@@ -61,7 +62,9 @@ def _upload_session_to_railway_if_configured(storage_path: Path) -> None:
     If LINKEDIN_SESSION_UPLOAD_URL and INTERNAL_TRIGGER_TOKEN are set, POST the JSON to
     Railway ``POST /internal/linkedin-session`` (same as manual curl).
     """
-    url = (os.getenv("LINKEDIN_SESSION_UPLOAD_URL") or "").strip()
+    url = (os.getenv("LINKEDIN_SESSION_UPLOAD_URL") or "").strip().rstrip("/")
+    if url and "://" not in url:
+        url = f"https://{url}"
     token = (os.getenv("INTERNAL_TRIGGER_TOKEN") or "").strip()
     if not url:
         print(
@@ -72,6 +75,12 @@ def _upload_session_to_railway_if_configured(storage_path: Path) -> None:
     if not token:
         print("LINKEDIN_SESSION_UPLOAD_URL is set but INTERNAL_TRIGGER_TOKEN is missing; skipping upload.")
         return
+
+    parsed = urlparse(url)
+    path = (parsed.path or "").rstrip("/") or "/"
+    if path == "/" and "linkedin-session" not in url:
+        url = f"{url}/internal/linkedin-session"
+        print(f"Using upload URL: {url} (appended /internal/linkedin-session — set full path in LINKEDIN_SESSION_UPLOAD_URL if different)")
 
     try:
         import requests
@@ -88,7 +97,7 @@ def _upload_session_to_railway_if_configured(storage_path: Path) -> None:
 
     try:
         response = requests.post(
-            url.rstrip("/"),
+            url,
             json=data,
             headers={
                 "Content-Type": "application/json",

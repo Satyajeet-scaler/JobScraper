@@ -48,7 +48,18 @@ def run_linkedin_posts_pipeline(run_id: str | None = None) -> dict[str, Any]:
         source_columns = _collect_source_columns(raw_rows)
         normalized = [normalize_linkedin_post_item(row) for row in raw_rows]
 
+        logger.info(
+            "linkedin-posts pipeline[%s] classification started rows=%s",
+            pipeline_run_id,
+            len(normalized),
+        )
         relevant_rows, classification_errors = _classify_relevant_posts(normalized)
+        logger.info(
+            "linkedin-posts pipeline[%s] classification ended relevant=%s errors=%s",
+            pipeline_run_id,
+            len(relevant_rows),
+            classification_errors,
+        )
         _write_linkedin_posts_sheets(run_date=run_date, scraped_rows=normalized, relevant_rows=relevant_rows)
         try:
             _post_linkedin_posts_slack_summary(
@@ -156,10 +167,12 @@ def _classify_relevant_posts(rows: list[dict[str, Any]]) -> tuple[list[dict[str,
     ai_url = os.getenv("AI_CLASSIFIER_URL")
     ai_token = os.getenv("AI_CLASSIFIER_TOKEN")
     prompt_template = os.getenv("AI_RELEVANCE_PROMPT_LINKEDIN_POSTS", _default_linkedin_posts_prompt())
+    mode = "gemini" if gemini_api_key else ("external_ai" if ai_url else "keyword_fallback")
+    logger.info("linkedin-posts classification mode=%s rows=%s model=%s", mode, len(rows), gemini_model)
 
     relevant_rows: list[dict[str, Any]] = []
     errors = 0
-    for row in rows:
+    for idx, row in enumerate(rows, start=1):
         try:
             decision = _classify_single_post(
                 row=row,
@@ -169,8 +182,17 @@ def _classify_relevant_posts(rows: list[dict[str, Any]]) -> tuple[list[dict[str,
                 ai_token=ai_token,
                 prompt=prompt_template,
             )
-        except Exception:
+        except Exception as exc:
             errors += 1
+            if errors <= 5:
+                logger.warning(
+                    "linkedin-posts classification error row=%s/%s mode=%s post_id=%s err=%s",
+                    idx,
+                    len(rows),
+                    mode,
+                    row.get("post_id"),
+                    exc,
+                )
             continue
 
         enriched = dict(row)
@@ -181,6 +203,12 @@ def _classify_relevant_posts(rows: list[dict[str, Any]]) -> tuple[list[dict[str,
         enriched["confidence"] = decision.get("confidence", 0)
         if enriched["is_relevant"]:
             relevant_rows.append(enriched)
+    logger.info(
+        "linkedin-posts classification completed mode=%s relevant=%s errors=%s",
+        mode,
+        len(relevant_rows),
+        errors,
+    )
     return relevant_rows, errors
 
 

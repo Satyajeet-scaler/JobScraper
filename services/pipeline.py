@@ -16,7 +16,7 @@ from pandas import DataFrame, to_datetime
 from services.google_sheets import GoogleSheetsWriter
 from services.handover_owners import worksheet_row_dicts
 from services.linkedin_recruiter.sheets_pipeline import write_linkedin_recruiters_for_relevant_jobs
-from services.linkedin_posts_pipeline import run_linkedin_posts_pipeline
+from services.linkedin_posts_pipeline import run_linkedin_posts_pipeline, post_linkedin_posts_slack_handover
 from services.apify_naukri import normalize_naukri_item, scrape_naukri_jobs
 try:
     import google.generativeai as genai
@@ -73,58 +73,76 @@ def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
         _write_relevant_jobs_to_google_sheets(run_date=run_date, relevant_jobs=relevant)
         logger.info("pipeline[%s] relevant_jobs sheet write completed", pipeline_run_id)
 
-        def _recruiter_flow() -> tuple[int, int, int, int]:
-            """Run recruiter scrape + handover; returns (sheet_rows, notifs_sent, case3, case2)."""
-            sheet_rows = 0
+        # --- Phase 1: scrape + classify + write sheets in PARALLEL ---
+        def _recruiter_scrape_flow() -> int:
+            """Scrape recruiters and write sheet; returns rows_written."""
             try:
-                sheet_rows, _ = write_linkedin_recruiters_for_relevant_jobs(
+                rows_written, _ = write_linkedin_recruiters_for_relevant_jobs(
                     run_date=run_date,
                     relevant_jobs=relevant,
                 )
                 logger.info(
                     "pipeline[%s] linkedin recruiters sheet completed rows_written=%s",
-                    pipeline_run_id, sheet_rows,
+                    pipeline_run_id, rows_written,
                 )
+                return rows_written
             except Exception as exc:
                 logger.warning(
                     "pipeline[%s] linkedin recruiters sheet failed but pipeline will continue: %s",
                     pipeline_run_id, exc,
                 )
+                return 0
 
-            notifs, c3, c2 = 0, 0, 0
-            try:
-                notifs = _post_recruiter_handover_notifications(run_date=run_date)
-                c3, c2 = _get_recruiter_handover_case_counts(run_date=run_date)
-                logger.info(
-                    "pipeline[%s] recruiter handover notifications sent=%s",
-                    pipeline_run_id, notifs,
-                )
-            except Exception as exc:
-                logger.warning(
-                    "pipeline[%s] recruiter handover notifications failed but pipeline will continue: %s",
-                    pipeline_run_id, exc,
-                )
-            return sheet_rows, notifs, c3, c2
-
-        def _linkedin_posts_flow() -> tuple[dict[str, Any] | None, str]:
-            """Run LinkedIn posts pipeline; returns (metrics, error_string)."""
+        def _linkedin_posts_scrape_flow() -> tuple[dict[str, Any] | None, str]:
+            """Scrape + classify + write sheets (NO Slack); returns (metrics, error)."""
             if not run_linkedin_posts_enabled:
                 return None, ""
             try:
-                return run_linkedin_posts_pipeline(), ""
+                return run_linkedin_posts_pipeline(send_slack=False), ""
             except Exception as exc:
                 logger.warning("pipeline[%s] linkedin-posts pipeline failed: %s", pipeline_run_id, exc)
                 return None, str(exc)
 
-        logger.info("pipeline[%s] starting recruiter + linkedin-posts in parallel", pipeline_run_id)
+        logger.info("pipeline[%s] starting recruiter + linkedin-posts scraping in parallel", pipeline_run_id)
         with ThreadPoolExecutor(max_workers=2) as executor:
-            recruiter_future: Future = executor.submit(_recruiter_flow)
-            linkedin_posts_future: Future = executor.submit(_linkedin_posts_flow)
+            recruiter_future: Future = executor.submit(_recruiter_scrape_flow)
+            linkedin_posts_future: Future = executor.submit(_linkedin_posts_scrape_flow)
 
-        recruiter_sheet_rows, handover_notifications_sent, recruiter_case3_count, recruiter_case2_count = (
-            recruiter_future.result()
-        )
+        recruiter_sheet_rows = recruiter_future.result()
         linkedin_posts_metrics, linkedin_posts_error = linkedin_posts_future.result()
+        logger.info("pipeline[%s] parallel scraping completed", pipeline_run_id)
+
+        # --- Phase 2: send ALL Slack messages SEQUENTIALLY ---
+        # Case 3 (recruiter detail) + Case 2 (internal POC) first
+        handover_notifications_sent = 0
+        recruiter_case3_count = 0
+        recruiter_case2_count = 0
+        try:
+            handover_notifications_sent = _post_recruiter_handover_notifications(run_date=run_date)
+            recruiter_case3_count, recruiter_case2_count = _get_recruiter_handover_case_counts(run_date=run_date)
+            logger.info(
+                "pipeline[%s] recruiter handover notifications sent=%s",
+                pipeline_run_id, handover_notifications_sent,
+            )
+        except Exception as exc:
+            logger.warning(
+                "pipeline[%s] recruiter handover notifications failed but pipeline will continue: %s",
+                pipeline_run_id, exc,
+            )
+
+        # Case 1 (LinkedIn posts) after recruiter cases
+        if linkedin_posts_metrics and linkedin_posts_metrics.get("status") == "completed":
+            try:
+                post_linkedin_posts_slack_handover(
+                    run_date=run_date,
+                    scraped_rows=[],
+                    relevant_rows=_load_relevant_linkedin_posts_from_sheet(run_date),
+                )
+            except Exception as exc:
+                logger.warning(
+                    "pipeline[%s] linkedin-posts slack handover failed: %s",
+                    pipeline_run_id, exc,
+                )
 
         linkedin_case1_count = (
             int(linkedin_posts_metrics.get("relevant_count", 0)) if linkedin_posts_metrics else 0
@@ -998,17 +1016,17 @@ def _post_recruiter_handover_notifications(run_date: str) -> int:
                 job_url = (row.get("job_url") or "-").strip() or "-"
                 profile_url = (row.get("recruiter_profile_url") or "-").strip() or "-"
                 msg = (
-                    f"{tag}\n\n"
-                    f"Company: {company}\n\n"
-                    f"Role: {role}\n\n"
-                    f"Job URL: {job_url}\n\n"
+                    f"{tag}\n"
+                    f"Company: {company}\n"
+                    f"Role: {role}\n"
+                    f"Job URL: {job_url}\n"
                     f"Recruiter Profile: {profile_url}"
                 )
                 _send(msg)
                 sent += 1
 
     if case2_rows:
-        _send(":rotating_light: *INCOMING LEAD FROM EXISTING INTERNAL POC*")
+        _send(":rotating_light: *INCOMING LEAD with EXISTING INTERNAL POC*")
         sent += 1
 
         owner_buckets_2: dict[int, list[dict[str, str]]] = {i: [] for i in range(len(owner_rows))}
@@ -1026,10 +1044,10 @@ def _post_recruiter_handover_notifications(run_date: str) -> int:
                 job_url = (row.get("job_url") or "-").strip() or "-"
                 poc_email = (row.get("recruiter_email") or "-").strip() or "-"
                 msg = (
-                    f"{tag}\n\n"
-                    f"Company: {company}\n\n"
-                    f"Role: {role}\n\n"
-                    f"Job URL: {job_url}\n\n"
+                    f"{tag}\n"
+                    f"Company: {company}\n"
+                    f"Role: {role}\n"
+                    f"Job URL: {job_url}\n"
                     f"Internal POC Email: {poc_email}"
                 )
                 _send(msg)
@@ -1040,6 +1058,23 @@ def _post_recruiter_handover_notifications(run_date: str) -> int:
         sent, len(case3_rows), len(case2_rows),
     )
     return sent
+
+
+def _load_relevant_linkedin_posts_from_sheet(run_date: str) -> list[dict[str, Any]]:
+    """Read linkedin_posts_relevant_{date} tab to get rows for Slack handover."""
+    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
+    if not spreadsheet_id:
+        return []
+    tab = f"linkedin_posts_relevant_{run_date}"
+    try:
+        writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
+        ws = writer.sheet.worksheet(tab)
+        rows = worksheet_row_dicts(ws)
+        logger.info("loaded %s relevant linkedin posts from sheet %s", len(rows), tab)
+        return rows
+    except Exception as exc:
+        logger.warning("failed to load relevant linkedin posts sheet=%s err=%s", tab, exc)
+        return []
 
 
 def _get_recruiter_handover_case_counts(run_date: str) -> tuple[int, int]:

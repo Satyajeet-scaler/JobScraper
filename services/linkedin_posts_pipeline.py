@@ -23,12 +23,21 @@ LINKEDIN_POSTS_RUN_METRICS: dict[str, dict[str, Any]] = {}
 _SLACK_TEXT_SOFT_LIMIT = 3500
 
 
-def run_linkedin_posts_pipeline(run_id: str | None = None) -> dict[str, Any]:
+def run_linkedin_posts_pipeline(
+    run_id: str | None = None,
+    *,
+    send_slack: bool = True,
+    run_date: str | None = None,
+) -> dict[str, Any]:
     """
     Scrape LinkedIn posts via Apify, run dedicated relevancy filter, and write sheets.
+
+    When called from the daily pipeline with ``send_slack=False``, Slack messages are
+    deferred so the caller can send them after all other case messages finish (avoids
+    interleaving from parallel threads).
     """
     pipeline_run_id = run_id or str(uuid.uuid4())
-    run_date = date.today().isoformat()
+    run_date = (run_date or date.today().isoformat()).strip()
     started_at = perf_counter()
     LINKEDIN_POSTS_RUN_METRICS[pipeline_run_id] = {
         "run_id": pipeline_run_id,
@@ -61,14 +70,16 @@ def run_linkedin_posts_pipeline(run_id: str | None = None) -> dict[str, Any]:
             classification_errors,
         )
         _write_linkedin_posts_sheets(run_date=run_date, scraped_rows=normalized, relevant_rows=relevant_rows)
-        try:
-            _post_linkedin_posts_slack_summary(
-                run_date=run_date,
-                scraped_rows=normalized,
-                relevant_rows=relevant_rows,
-            )
-        except Exception as exc:
-            logger.warning("linkedin-posts slack notification failed (sheets already written): %s", exc)
+
+        if send_slack:
+            try:
+                post_linkedin_posts_slack_handover(
+                    run_date=run_date,
+                    scraped_rows=normalized,
+                    relevant_rows=relevant_rows,
+                )
+            except Exception as exc:
+                logger.warning("linkedin-posts slack notification failed (sheets already written): %s", exc)
 
         metrics = {
             "run_id": pipeline_run_id,
@@ -341,6 +352,14 @@ def _write_linkedin_posts_sheets(
     scraped_rows: list[dict[str, Any]],
     relevant_rows: list[dict[str, Any]],
 ) -> None:
+    _write_linkedin_posts_scraped_only(run_date=run_date, scraped_rows=scraped_rows)
+    _write_linkedin_posts_relevant_only(run_date=run_date, relevant_rows=relevant_rows)
+
+
+def _write_linkedin_posts_scraped_only(
+    run_date: str,
+    scraped_rows: list[dict[str, Any]],
+) -> None:
     spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
     if not spreadsheet_id:
         raise RuntimeError("GOOGLE_SPREADSHEET_ID is required for LinkedIn posts pipeline.")
@@ -348,9 +367,20 @@ def _write_linkedin_posts_sheets(
     writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
     chunk_size = max(1, int(os.getenv("GOOGLE_SHEETS_WRITE_CHUNK_SIZE", "200")))
     scraped_tab = os.getenv("LINKEDIN_POSTS_SCRAPED_TAB_TEMPLATE", "linkedin_posts_scraped_{date}").format(date=run_date)
-    relevant_tab = os.getenv("LINKEDIN_POSTS_RELEVANT_TAB_TEMPLATE", "linkedin_posts_relevant_{date}").format(date=run_date)
-
     writer.write_rows(scraped_tab, _with_run_date(scraped_rows, run_date), chunk_size=chunk_size)
+
+
+def _write_linkedin_posts_relevant_only(
+    run_date: str,
+    relevant_rows: list[dict[str, Any]],
+) -> None:
+    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
+    if not spreadsheet_id:
+        raise RuntimeError("GOOGLE_SPREADSHEET_ID is required for LinkedIn posts pipeline.")
+
+    writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
+    chunk_size = max(1, int(os.getenv("GOOGLE_SHEETS_WRITE_CHUNK_SIZE", "200")))
+    relevant_tab = os.getenv("LINKEDIN_POSTS_RELEVANT_TAB_TEMPLATE", "linkedin_posts_relevant_{date}").format(date=run_date)
     writer.write_rows(relevant_tab, _with_run_date(relevant_rows, run_date), chunk_size=chunk_size)
 
 
@@ -652,17 +682,20 @@ def _slack_post_url_from_row(row: dict[str, Any]) -> str:
     )
 
 
-def _post_linkedin_posts_slack_summary(
+def post_linkedin_posts_slack_handover(
     run_date: str,
     scraped_rows: list[dict[str, Any]],
     relevant_rows: list[dict[str, Any]],
 ) -> None:
+    """Send LinkedIn posts handover to Slack, grouped by owner.
+
+    Public so the daily pipeline can call it after all other case messages finish.
+    """
     slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL")
     if not slack_webhook_url:
         logger.info("linkedin-posts slack skipped: SLACK_WEBHOOK_URL not configured")
         return
 
-    # Keep LinkedIn-post notifications in the same channel as daily job handovers.
     slack_channel = os.getenv("SLACK_CHANNEL", "relevant-scraped-jobs")
     slack_username = os.getenv("SLACK_USERNAME", "Karan Bot")
     slack_icon_emoji = os.getenv("SLACK_ICON_EMOJI", ":karandeep:")
@@ -680,45 +713,11 @@ def _post_linkedin_posts_slack_summary(
             "(set GOOGLE_SPREADSHEET_ID and owner_slack_ID tab)"
         )
 
-    # 1) Send the heading message
-    heading = ":rotating_light: *INCOMING LINKEDIN JOB POST VIA VALIDATED AUTHOR*"
-    _retry(
-        action=lambda: _post_slack_payload(
-            webhook_url=slack_webhook_url,
-            text=heading,
-            channel=slack_channel,
-            username=slack_username,
-            icon_emoji=slack_icon_emoji,
-        ),
-        retries=3,
-        initial_delay_seconds=1.0,
-    ).raise_for_status()
-    sleep(1)
-
-    # 2) Send one message per post with round-robin owner assignment
-    sent = 0
-    for idx, row in enumerate(relevant_rows):
-        author = _slack_author_from_row(row)
-        url = _slack_post_url_from_row(row)
-
-        if owner_rows:
-            owner = owner_rows[idx % len(owner_rows)]
-            owner_name = (owner.get("owner_name") or "Owner").strip() or "Owner"
-            owner_slack_id = (owner.get("owner_slack_id") or "").strip()
-            owner_tag = f"*{owner_name}* (<@{owner_slack_id}>)" if owner_slack_id else f"*{owner_name}*"
-        else:
-            owner_tag = "*Unassigned*"
-
-        message = (
-            f"{owner_tag}\n"
-            f"{url}\n"
-            f'This is lead posted by author "{author}"\n'
-            "Note: Please consume the lead in next 2 hours and update"
-        )
+    def _send(text: str) -> None:
         _retry(
-            action=lambda m=message: _post_slack_payload(
+            action=lambda t=text: _post_slack_payload(
                 webhook_url=slack_webhook_url,
-                text=m,
+                text=t,
                 channel=slack_channel,
                 username=slack_username,
                 icon_emoji=slack_icon_emoji,
@@ -726,8 +725,49 @@ def _post_linkedin_posts_slack_summary(
             retries=3,
             initial_delay_seconds=1.0,
         ).raise_for_status()
-        sent += 1
         sleep(1)
+
+    # 1) Case heading
+    _send(":rotating_light: *INCOMING LINKEDIN JOB POST VIA VALIDATED AUTHOR*")
+    sent = 1
+
+    # 2) Round-robin assign to owners, then send grouped by owner
+    if owner_rows:
+        owner_buckets: dict[int, list[dict[str, Any]]] = {i: [] for i in range(len(owner_rows))}
+        for idx, row in enumerate(relevant_rows):
+            owner_buckets[idx % len(owner_rows)].append(row)
+
+        for owner_idx, owner in enumerate(owner_rows):
+            bucket = owner_buckets.get(owner_idx, [])
+            if not bucket:
+                continue
+            owner_name = (owner.get("owner_name") or "Owner").strip() or "Owner"
+            owner_slack_id = (owner.get("owner_slack_id") or "").strip()
+            owner_tag = f"*{owner_name}* (<@{owner_slack_id}>)" if owner_slack_id else f"*{owner_name}*"
+
+            for row in bucket:
+                author = _slack_author_from_row(row)
+                url = _slack_post_url_from_row(row)
+                msg = (
+                    f"{owner_tag}\n"
+                    f"{url}\n"
+                    f'This is lead posted by author "{author}"\n'
+                    "Note: Please consume the lead in next 2 hours and update"
+                )
+                _send(msg)
+                sent += 1
+    else:
+        for row in relevant_rows:
+            author = _slack_author_from_row(row)
+            url = _slack_post_url_from_row(row)
+            msg = (
+                f"*Unassigned*\n"
+                f"{url}\n"
+                f'This is lead posted by author "{author}"\n'
+                "Note: Please consume the lead in next 2 hours and update"
+            )
+            _send(msg)
+            sent += 1
 
     logger.info("linkedin-posts handover sent heading + %s individual post messages", sent)
 

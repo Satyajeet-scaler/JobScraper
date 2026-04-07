@@ -23,6 +23,19 @@ from services.linkedin_session import (
 from services.pipeline import get_pipeline_run_metrics, run_daily_jobs_pipeline
 from services.naukri_only_pipeline import get_naukri_run_metrics, run_naukri_scrape_only_pipeline
 from services.linkedin_posts_pipeline import get_linkedin_posts_run_metrics, run_linkedin_posts_pipeline
+from services.scrape_relevance_service import (
+    get_classify_only_run_metrics,
+    get_scrape_only_run_metrics,
+    run_classify_relevant_only,
+    run_scrape_jobs_only,
+)
+from services.recruiter_info_service import get_recruiter_info_run_metrics, run_recruiter_info_extraction
+from services.linkedin_posts_split_service import (
+    get_linkedin_posts_classify_only_metrics,
+    get_linkedin_posts_scrape_only_metrics,
+    run_linkedin_posts_classify_only,
+    run_linkedin_posts_scrape_only,
+)
 
 
 app = FastAPI(
@@ -223,6 +236,87 @@ def get_daily_run_status(
     return JSONResponse(content=metrics)
 
 
+@app.post("/internal/run-scrape-jobs")
+def run_scrape_jobs(
+    background_tasks: BackgroundTasks,
+    run_date: Optional[str] = Query(default=None, description="Optional date YYYY-MM-DD"),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    run_id = str(uuid.uuid4())
+    background_tasks.add_task(run_scrape_jobs_only, run_id, run_date)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={"run_id": run_id, "status": "accepted", "run_date": run_date},
+    )
+
+
+@app.get("/internal/run-scrape-jobs/{run_id}")
+def get_scrape_jobs_run_status(
+    run_id: str,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    metrics = get_scrape_only_run_metrics(run_id)
+    if not metrics:
+        raise HTTPException(status_code=404, detail="Run ID not found.")
+    return JSONResponse(content=metrics)
+
+
+@app.post("/internal/run-classify-relevant")
+def run_classify_relevant(
+    background_tasks: BackgroundTasks,
+    run_date: Optional[str] = Query(default=None, description="Optional date YYYY-MM-DD"),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    run_id = str(uuid.uuid4())
+    background_tasks.add_task(run_classify_relevant_only, run_id, run_date)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={"run_id": run_id, "status": "accepted", "run_date": run_date},
+    )
+
+
+@app.get("/internal/run-classify-relevant/{run_id}")
+def get_classify_relevant_run_status(
+    run_id: str,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    metrics = get_classify_only_run_metrics(run_id)
+    if not metrics:
+        raise HTTPException(status_code=404, detail="Run ID not found.")
+    return JSONResponse(content=metrics)
+
+
+@app.post("/internal/run-recruiter-info")
+def run_recruiter_info(
+    background_tasks: BackgroundTasks,
+    run_date: Optional[str] = Query(default=None, description="Optional date YYYY-MM-DD"),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    run_id = str(uuid.uuid4())
+    background_tasks.add_task(run_recruiter_info_extraction, run_id, run_date)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={"run_id": run_id, "status": "accepted", "run_date": run_date},
+    )
+
+
+@app.get("/internal/run-recruiter-info/{run_id}")
+def get_recruiter_info_run_status(
+    run_id: str,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    metrics = get_recruiter_info_run_metrics(run_id)
+    if not metrics:
+        raise HTTPException(status_code=404, detail="Run ID not found.")
+    return JSONResponse(content=metrics)
+
+
 @app.post("/internal/run-naukri-scrape")
 def run_naukri_scrape(
     background_tasks: BackgroundTasks,
@@ -272,6 +366,60 @@ def get_linkedin_posts_run_status(
 ) -> JSONResponse:
     validate_internal_trigger_token(x_internal_token)
     metrics = get_linkedin_posts_run_metrics(run_id)
+    if not metrics:
+        raise HTTPException(status_code=404, detail="Run ID not found.")
+    return JSONResponse(content=metrics)
+
+
+@app.post("/internal/run-linkedin-posts-scrape")
+def run_linkedin_posts_scrape(
+    background_tasks: BackgroundTasks,
+    run_date: Optional[str] = Query(default=None, description="Optional date YYYY-MM-DD"),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    run_id = str(uuid.uuid4())
+    background_tasks.add_task(run_linkedin_posts_scrape_only, run_id, run_date)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={"run_id": run_id, "status": "accepted", "run_date": run_date},
+    )
+
+
+@app.get("/internal/run-linkedin-posts-scrape/{run_id}")
+def get_linkedin_posts_scrape_status(
+    run_id: str,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    metrics = get_linkedin_posts_scrape_only_metrics(run_id)
+    if not metrics:
+        raise HTTPException(status_code=404, detail="Run ID not found.")
+    return JSONResponse(content=metrics)
+
+
+@app.post("/internal/run-linkedin-posts-classify")
+def run_linkedin_posts_classify(
+    background_tasks: BackgroundTasks,
+    run_date: Optional[str] = Query(default=None, description="Optional date YYYY-MM-DD"),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    run_id = str(uuid.uuid4())
+    background_tasks.add_task(run_linkedin_posts_classify_only, run_id, run_date)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={"run_id": run_id, "status": "accepted", "run_date": run_date},
+    )
+
+
+@app.get("/internal/run-linkedin-posts-classify/{run_id}")
+def get_linkedin_posts_classify_status(
+    run_id: str,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    metrics = get_linkedin_posts_classify_only_metrics(run_id)
     if not metrics:
         raise HTTPException(status_code=404, detail="Run ID not found.")
     return JSONResponse(content=metrics)

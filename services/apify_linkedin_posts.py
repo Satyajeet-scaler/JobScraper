@@ -1,11 +1,51 @@
 import json
 import os
+import re
 from typing import Any
 
 from apify_client import ApifyClient
 
 
 DEFAULT_LINKEDIN_POSTS_ACTOR_ID = "buIWk2uOUzTmcLsuB"
+_AUTHOR_INFO_COMPANY = re.compile(r"(?:@| at )\s*([A-Za-z0-9][A-Za-z0-9&.,()'’\\\\ -]{1,80})", re.I)
+
+
+def _deep_get(payload: Any, path: str) -> Any:
+    cur = payload
+    for part in path.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+        if cur is None:
+            return None
+    return cur
+
+
+def _first_non_empty_deep(payload: dict[str, Any], paths: list[str]) -> Any:
+    for path in paths:
+        value = _deep_get(payload, path)
+        if value is None:
+            continue
+        if isinstance(value, str) and value.strip() == "":
+            continue
+        return value
+    return None
+
+
+def _extract_company_from_author_info(info: Any) -> str | None:
+    if not isinstance(info, str):
+        return None
+    m = _AUTHOR_INFO_COMPANY.search(info)
+    if not m:
+        return None
+    company = (m.group(1) or "").strip(" .,-|")
+    if not company:
+        return None
+    # avoid capturing "Hiring" etc
+    lowered = company.lower()
+    if lowered.startswith(("hiring", "recruiting", "looking", "open")):
+        return None
+    return company
 
 
 def scrape_linkedin_posts(run_input: dict[str, Any]) -> list[dict[str, Any]]:
@@ -34,17 +74,29 @@ def normalize_linkedin_post_item(item: dict[str, Any]) -> dict[str, Any]:
     Actor schemas evolve, so keep best-effort field mapping.
     """
     raw_search = _first_non_empty(item, ["searchQuery", "query", "keyword"])
+    # Newer actor shape has nested author + linkedinUrl + content + query.
+    author_name = _first_non_empty_deep(item, ["author.name"]) or _first_non_empty(
+        item, ["authorName", "profileName", "name"]
+    )
+    author_profile_url = _first_non_empty_deep(item, ["author.linkedinUrl"]) or _first_non_empty(
+        item, ["authorProfileUrl", "profileUrl", "authorUrl"]
+    )
+    company = _first_non_empty_deep(item, ["company.name"]) or _first_non_empty(
+        item, ["companyName", "company", "organizationName"]
+    )
+    if not company:
+        company = _extract_company_from_author_info(_first_non_empty_deep(item, ["author.info"]))
     return {
         "site": "linkedin_posts",
         "search_query": _coerce_search_query_string(raw_search),
         "content_type": _first_non_empty(item, ["contentType", "type"]),
-        "post_url": _first_non_empty(item, ["postUrl", "url", "postURL", "linkedinPostUrl"]),
-        "post_id": _first_non_empty(item, ["postId", "id", "urn"]),
-        "post_text": _first_non_empty(item, ["text", "content", "postText", "description"]),
+        "post_url": _first_non_empty(item, ["linkedinUrl", "postUrl", "url", "postURL", "linkedinPostUrl", "activityUrl"]),
+        "post_id": _first_non_empty(item, ["postId", "id", "urn", "entityId", "shareUrn"]),
+        "post_text": _first_non_empty(item, ["content", "text", "postText", "description"]),
         "posted_at": _first_non_empty(item, ["postedAt", "createdAt", "timestamp", "date"]),
-        "author_name": _first_non_empty(item, ["authorName", "profileName", "name"]),
-        "author_profile_url": _first_non_empty(item, ["authorProfileUrl", "profileUrl", "authorUrl"]),
-        "company": _first_non_empty(item, ["companyName", "company", "organizationName"]),
+        "author_name": author_name,
+        "author_profile_url": author_profile_url,
+        "company": company,
         "job_title_hint": _first_non_empty(item, ["title", "jobTitle", "headline"]),
         "likes_count": _first_non_empty(item, ["likesCount", "numLikes", "reactionsCount"]),
         "comments_count": _first_non_empty(item, ["commentsCount", "numComments"]),

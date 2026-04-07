@@ -20,6 +20,7 @@ except ImportError:  # pragma: no cover - optional dependency behavior
 
 logger = logging.getLogger(__name__)
 LINKEDIN_POSTS_RUN_METRICS: dict[str, dict[str, Any]] = {}
+_SLACK_TEXT_SOFT_LIMIT = 3500
 
 
 def run_linkedin_posts_pipeline(run_id: str | None = None) -> dict[str, Any]:
@@ -478,7 +479,8 @@ def _post_linkedin_posts_slack_summary(
         logger.info("linkedin-posts slack skipped: SLACK_WEBHOOK_URL not configured")
         return
 
-    slack_channel = os.getenv("LINKEDIN_POSTS_SLACK_CHANNEL", os.getenv("SLACK_CHANNEL", "relevant-scraped-jobs"))
+    # Keep LinkedIn-post notifications in the same channel as daily job handovers.
+    slack_channel = os.getenv("SLACK_CHANNEL", "relevant-scraped-jobs")
     slack_username = os.getenv("SLACK_USERNAME", "Karan Bot")
     slack_icon_emoji = os.getenv("SLACK_ICON_EMOJI", ":karandeep:")
 
@@ -526,6 +528,7 @@ def _post_linkedin_posts_slack_summary(
         for idx, row in enumerate(relevant_rows):
             owner_buckets[idx % len(owner_rows)].append(row)
 
+        owner_sections: list[str] = []
         for owner_idx, owner in enumerate(owner_rows):
             bucket = owner_buckets.get(owner_idx, [])
             if not bucket:
@@ -573,15 +576,18 @@ def _post_linkedin_posts_slack_summary(
                     f"URL : {url}\n"
                     f"Reason: {reason}"
                 )
-            message = (
-                f"Incoming linkedin job post via validated author\n"
-                f"Owner : {owner_tag} ({owner_email or '-'})\n"
-                "Note : Please consume the lead in next 2 hours\n"
-                "---\n"
-                + "\n\n".join(entries)
+            owner_sections.append(
+                f"*Owner : {owner_tag} ({owner_email or '-'})*\n" + "\n\n".join(entries)
             )
+
+        case_prefix = (
+            "Incoming linkedin job post via validated author\n"
+            "Note : Please consume the lead in next 2 hours\n"
+            "---\n"
+        )
+        for chunk in _chunk_slack_entries(prefix=case_prefix, entries=owner_sections):
             _retry(
-                action=lambda m=message: _post_slack_payload(
+                action=lambda m=chunk: _post_slack_payload(
                     webhook_url=slack_webhook_url,
                     text=m,
                     channel=slack_channel,
@@ -624,25 +630,24 @@ def _post_linkedin_posts_slack_summary(
             f"URL : {url}\n"
             f"Reason: {reason}"
         )
-    message = (
+    prefix = (
         "Incoming linkedin job post via validated author\n"
-        "Owner : -\n"
         "Note : Please consume the lead in next 2 hours\n"
         "---\n"
-        + "\n\n".join(entries)
     )
-    _retry(
-        action=lambda m=message: _post_slack_payload(
-            webhook_url=slack_webhook_url,
-            text=m,
-            channel=slack_channel,
-            username=slack_username,
-            icon_emoji=slack_icon_emoji,
-        ),
-        retries=3,
-        initial_delay_seconds=1.0,
-    ).raise_for_status()
-    sleep(1)
+    for chunk in _chunk_slack_entries(prefix=prefix, entries=entries):
+        _retry(
+            action=lambda m=chunk: _post_slack_payload(
+                webhook_url=slack_webhook_url,
+                text=m,
+                channel=slack_channel,
+                username=slack_username,
+                icon_emoji=slack_icon_emoji,
+            ),
+            retries=3,
+            initial_delay_seconds=1.0,
+        ).raise_for_status()
+        sleep(1)
     _post_linkedin_posts_handover_data_summary(
         webhook_url=slack_webhook_url,
         channel=slack_channel,
@@ -685,6 +690,31 @@ def _post_linkedin_posts_handover_data_summary(
         initial_delay_seconds=1.0,
     ).raise_for_status()
     sleep(1)
+
+
+def _chunk_slack_entries(prefix: str, entries: list[str]) -> list[str]:
+    """
+    Split large handover payloads into Slack-safe chunks.
+    """
+    if not entries:
+        return [prefix.rstrip()]
+    chunks: list[str] = []
+    current = prefix
+    for entry in entries:
+        candidate = f"{current}\n\n{entry}" if current.strip() != prefix.strip() else f"{current}{entry}"
+        if len(candidate) <= _SLACK_TEXT_SOFT_LIMIT:
+            current = candidate
+            continue
+        if current.strip():
+            chunks.append(current)
+        # If one entry itself is huge, hard-truncate rather than fail entire handover.
+        if len(prefix) + len(entry) > _SLACK_TEXT_SOFT_LIMIT:
+            allowed = max(200, _SLACK_TEXT_SOFT_LIMIT - len(prefix) - 20)
+            entry = entry[:allowed] + "\n... (truncated)"
+        current = f"{prefix}{entry}"
+    if current.strip():
+        chunks.append(current)
+    return chunks
 
 
 def _post_slack_payload(

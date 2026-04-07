@@ -1007,6 +1007,7 @@ def _post_recruiter_handover_notifications(run_date: str) -> int:
         "Incoming lead from existing company pool",
     ):
         owners_for_case = case_owner_entries.get(case_heading, {})
+        owner_sections: list[str] = []
         for owner_idx, entries in owners_for_case.items():
             if not entries:
                 continue
@@ -1015,27 +1016,32 @@ def _post_recruiter_handover_notifications(run_date: str) -> int:
             owner_slack_id = (owner.get("owner_slack_id") or "").strip()
             owner_email = (owner.get("owner_email") or "").strip()
             owner_tag = f"<@{owner_slack_id}>" if owner_slack_id else owner_name
-            base = (
-                f"{case_heading}\n"
-                f"Owner : {owner_tag} ({owner_email or '-'})\n"
-                "Note : Please consume the lead in next 2 hours\n"
-                "---\n"
+            owner_sections.append(
+                f"*Owner : {owner_tag} ({owner_email or '-'})*\n" + "\n\n".join(entries)
             )
-            body = "\n\n".join(entries)
-            message = base + body
-            _retry(
-                action=lambda m=message: _post_slack_payload(
-                    webhook_url=slack_webhook_url,
-                    text=m,
-                    channel=slack_channel,
-                    username=slack_username,
-                    icon_emoji=slack_icon_emoji,
-                ),
-                retries=3,
-                initial_delay_seconds=1.0,
-            ).raise_for_status()
-            sent_messages += 1
-            sleep(1)
+
+        if not owner_sections:
+            continue
+
+        message = (
+            f"{case_heading}\n"
+            "Note : Please consume the lead in next 2 hours\n"
+            "---\n"
+            + "\n\n".join(owner_sections)
+        )
+        _retry(
+            action=lambda m=message: _post_slack_payload(
+                webhook_url=slack_webhook_url,
+                text=m,
+                channel=slack_channel,
+                username=slack_username,
+                icon_emoji=slack_icon_emoji,
+            ),
+            retries=3,
+            initial_delay_seconds=1.0,
+        ).raise_for_status()
+        sent_messages += 1
+        sleep(1)
     logger.info(
         "handover slack posted messages=%s rows=%s",
         sent_messages,

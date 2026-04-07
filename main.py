@@ -356,11 +356,12 @@ def run_scrape_jobs(
     x_internal_token: Optional[str] = Header(default=None),
 ) -> JSONResponse:
     validate_internal_trigger_token(x_internal_token)
+    resolved_date = run_date or _cron_today()
     run_id = str(uuid.uuid4())
-    background_tasks.add_task(run_scrape_jobs_only, run_id, run_date)
+    background_tasks.add_task(run_scrape_jobs_only, run_id, resolved_date)
     return JSONResponse(
         status_code=status.HTTP_202_ACCEPTED,
-        content={"run_id": run_id, "status": "accepted", "run_date": run_date},
+        content={"run_id": run_id, "status": "accepted", "run_date": resolved_date},
     )
 
 
@@ -383,11 +384,12 @@ def run_classify_relevant(
     x_internal_token: Optional[str] = Header(default=None),
 ) -> JSONResponse:
     validate_internal_trigger_token(x_internal_token)
+    resolved_date = run_date or _cron_today()
     run_id = str(uuid.uuid4())
-    background_tasks.add_task(run_classify_relevant_only, run_id, run_date)
+    background_tasks.add_task(run_classify_relevant_only, run_id, resolved_date)
     return JSONResponse(
         status_code=status.HTTP_202_ACCEPTED,
-        content={"run_id": run_id, "status": "accepted", "run_date": run_date},
+        content={"run_id": run_id, "status": "accepted", "run_date": resolved_date},
     )
 
 
@@ -410,11 +412,12 @@ def run_recruiter_info(
     x_internal_token: Optional[str] = Header(default=None),
 ) -> JSONResponse:
     validate_internal_trigger_token(x_internal_token)
+    resolved_date = run_date or _cron_today()
     run_id = str(uuid.uuid4())
-    background_tasks.add_task(run_recruiter_info_extraction, run_id, run_date)
+    background_tasks.add_task(run_recruiter_info_extraction, run_id, resolved_date)
     return JSONResponse(
         status_code=status.HTTP_202_ACCEPTED,
-        content={"run_id": run_id, "status": "accepted", "run_date": run_date},
+        content={"run_id": run_id, "status": "accepted", "run_date": resolved_date},
     )
 
 
@@ -491,11 +494,12 @@ def run_linkedin_posts_scrape(
     x_internal_token: Optional[str] = Header(default=None),
 ) -> JSONResponse:
     validate_internal_trigger_token(x_internal_token)
+    resolved_date = run_date or _cron_today()
     run_id = str(uuid.uuid4())
-    background_tasks.add_task(run_linkedin_posts_scrape_only, run_id, run_date)
+    background_tasks.add_task(run_linkedin_posts_scrape_only, run_id, resolved_date)
     return JSONResponse(
         status_code=status.HTTP_202_ACCEPTED,
-        content={"run_id": run_id, "status": "accepted", "run_date": run_date},
+        content={"run_id": run_id, "status": "accepted", "run_date": resolved_date},
     )
 
 
@@ -518,11 +522,12 @@ def run_linkedin_posts_classify(
     x_internal_token: Optional[str] = Header(default=None),
 ) -> JSONResponse:
     validate_internal_trigger_token(x_internal_token)
+    resolved_date = run_date or _cron_today()
     run_id = str(uuid.uuid4())
-    background_tasks.add_task(run_linkedin_posts_classify_only, run_id, run_date)
+    background_tasks.add_task(run_linkedin_posts_classify_only, run_id, resolved_date)
     return JSONResponse(
         status_code=status.HTTP_202_ACCEPTED,
-        content={"run_id": run_id, "status": "accepted", "run_date": run_date},
+        content={"run_id": run_id, "status": "accepted", "run_date": resolved_date},
     )
 
 
@@ -557,6 +562,8 @@ def internal_send_slack_handover(
     run_date = body.get("run_date")
     if run_date is not None and not isinstance(run_date, str):
         raise HTTPException(status_code=400, detail="run_date must be a string YYYY-MM-DD or omitted.")
+    if run_date is None:
+        run_date = _cron_today()
 
     def _bool_flag(key: str, default: bool = True) -> bool:
         if key not in body:

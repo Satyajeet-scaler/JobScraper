@@ -302,6 +302,20 @@ def health_check() -> dict:
     return {"status": "ok"}
 
 
+@app.get("/internal/debug-time")
+def debug_time() -> dict:
+    from datetime import date, datetime
+    tz = ZoneInfo(os.getenv("CRON_TIMEZONE", "Asia/Kolkata"))
+    utc = ZoneInfo("UTC")
+    return {
+        "cron_today": _cron_today(),
+        "date_today_system": date.today().isoformat(),
+        "now_cron_tz": datetime.now(tz).isoformat(),
+        "now_utc": datetime.now(utc).isoformat(),
+        "cron_timezone": os.getenv("CRON_TIMEZONE", "Asia/Kolkata"),
+    }
+
+
 @app.get("/")
 def home() -> FileResponse:
     return FileResponse(BASE_DIR / "static" / "index.html")

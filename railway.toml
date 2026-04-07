@@ -11,6 +11,10 @@
 # Optional: LINKEDIN_RECRUITER_MAX_URLS_PER_RUN=0 (0 = no cap; set e.g. 60 to limit per run)
 # Optional: LINKEDIN_RECRUITER_FORCE_FAIL_TIMEOUT_S=15
 # Optional: LINKEDIN_RECRUITER_RECYCLE_EVERY=25
+# Optional: LINKEDIN_RECRUITER_RETRY_COUNT=3
+# Optional: LINKEDIN_RECRUITER_RETRY_BASE_DELAY_S=1
+# Optional: LINKEDIN_RECRUITER_LAUNCH_RETRY_COUNT=1 (retry whole recruiter scrape on Chromium launch crash)
+# Optional: LINKEDIN_RECRUITER_LAUNCH_RETRY_DELAY_S=3
 # Optional: LINKEDIN_POSTS_PIPELINE_ENABLED=true — run LinkedIn-posts Apify pipeline in parallel with /internal/run-daily-jobs
 # Optional: APIFY_LINKEDIN_POSTS_ACTOR_ID=buIWk2uOUzTmcLsuB
 # Optional: APIFY_LINKEDIN_POST_QUERIES='["hiring data analyst Bangalore","hiring backend developer India"]'

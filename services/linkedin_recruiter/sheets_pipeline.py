@@ -25,6 +25,58 @@ from services.linkedin_session import get_linkedin_storage_path
 logger = logging.getLogger(__name__)
 
 
+def _is_browser_launch_crash(exc: Exception) -> bool:
+    text = str(exc or "").lower()
+    markers = (
+        "browsertype.launch",
+        "sigsegv",
+        "signal 11",
+        "target page, context or browser has been closed",
+    )
+    return any(m in text for m in markers)
+
+
+def _scrape_with_launch_retry(
+    unique_urls: list[str],
+    *,
+    storage: Any,
+    headless: bool,
+    force_fail_timeout_s: float,
+    recycle_every: int,
+    retry_count: int,
+    retry_base_delay_s: float,
+) -> list[dict[str, Any]]:
+    launch_retry_count = max(0, int(os.getenv("LINKEDIN_RECRUITER_LAUNCH_RETRY_COUNT", "1")))
+    launch_retry_delay_s = max(0.0, float(os.getenv("LINKEDIN_RECRUITER_LAUNCH_RETRY_DELAY_S", "3")))
+    attempt = 1
+    max_attempts = launch_retry_count + 1
+    while True:
+        try:
+            return scrape_linkedin_job_recruiters_sync(
+                unique_urls,
+                storage_state_path=storage,
+                headless=headless,
+                force_fail_timeout_s=force_fail_timeout_s,
+                recycle_every=recycle_every,
+                retry_count=retry_count,
+                retry_base_delay_s=retry_base_delay_s,
+                timeout_ms=max(15000.0, force_fail_timeout_s * 1000.0),
+            )
+        except Exception as exc:
+            if attempt >= max_attempts or not _is_browser_launch_crash(exc):
+                raise
+            logger.warning(
+                "linkedin recruiter scrape launch crash attempt=%s/%s; retrying in %.1fs: %s",
+                attempt,
+                max_attempts,
+                launch_retry_delay_s,
+                exc,
+            )
+            sleep(launch_retry_delay_s)
+            attempt += 1
+            launch_retry_delay_s *= 2
+
+
 def _retry_sheet_write(action: Callable[[], T], retries: int, initial_delay_seconds: float) -> T:
     delay = initial_delay_seconds
     last_error: Exception | None = None
@@ -93,20 +145,24 @@ def write_linkedin_recruiters_for_relevant_jobs(
             headless = os.getenv("LINKEDIN_HEADLESS", "true").lower() in ("1", "true", "yes")
             force_fail_timeout_s = float(os.getenv("LINKEDIN_RECRUITER_FORCE_FAIL_TIMEOUT_S", "15"))
             recycle_every = int(os.getenv("LINKEDIN_RECRUITER_RECYCLE_EVERY", "25"))
+            retry_count = int(os.getenv("LINKEDIN_RECRUITER_RETRY_COUNT", "3"))
+            retry_base_delay_s = float(os.getenv("LINKEDIN_RECRUITER_RETRY_BASE_DELAY_S", "1"))
             logger.info(
-                "linkedin recruiter scrape: unique_linkedin_job_urls=%s headless=%s force_fail_timeout_s=%s recycle_every=%s",
+                "linkedin recruiter scrape: unique_linkedin_job_urls=%s headless=%s force_fail_timeout_s=%s recycle_every=%s retry_count=%s",
                 len(unique_urls),
                 headless,
                 force_fail_timeout_s,
                 recycle_every,
+                retry_count,
             )
-            results = scrape_linkedin_job_recruiters_sync(
+            results = _scrape_with_launch_retry(
                 unique_urls,
-                storage_state_path=storage,
+                storage=storage,
                 headless=headless,
                 force_fail_timeout_s=force_fail_timeout_s,
                 recycle_every=recycle_every,
-                timeout_ms=max(15000.0, force_fail_timeout_s * 1000.0),
+                retry_count=max(0, retry_count),
+                retry_base_delay_s=max(0.0, retry_base_delay_s),
             )
             by_url = {r["url"]: r for r in results}
     else:

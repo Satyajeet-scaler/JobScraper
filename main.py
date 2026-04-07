@@ -123,10 +123,45 @@ def validate_internal_trigger_token(internal_token: Optional[str]) -> None:
         )
 
 
-def _run_daily_jobs_from_scheduler() -> None:
+def _run_scrape_jobs_from_scheduler() -> None:
     run_id = str(uuid.uuid4())
-    logger.info("scheduler triggered daily pipeline run_id=%s", run_id)
-    run_daily_jobs_pipeline(run_id)
+    logger.info("scheduler triggered scrape-only run_id=%s", run_id)
+    run_scrape_jobs_only(run_id=run_id, run_date=None)
+
+
+def _run_classify_relevant_from_scheduler() -> None:
+    run_id = str(uuid.uuid4())
+    logger.info("scheduler triggered classify-only run_id=%s", run_id)
+    run_classify_relevant_only(run_id=run_id, run_date=None)
+
+
+def _run_recruiter_info_from_scheduler() -> None:
+    run_id = str(uuid.uuid4())
+    logger.info("scheduler triggered recruiter-info run_id=%s", run_id)
+    run_recruiter_info_extraction(run_id=run_id, run_date=None)
+
+
+def _run_linkedin_posts_scrape_from_scheduler() -> None:
+    run_id = str(uuid.uuid4())
+    logger.info("scheduler triggered linkedin-posts-scrape run_id=%s", run_id)
+    run_linkedin_posts_scrape_only(run_id=run_id, run_date=None)
+
+
+def _run_linkedin_posts_classify_from_scheduler() -> None:
+    run_id = str(uuid.uuid4())
+    logger.info("scheduler triggered linkedin-posts-classify run_id=%s", run_id)
+    run_linkedin_posts_classify_only(run_id=run_id, run_date=None)
+
+
+def _run_slack_handover_from_scheduler() -> None:
+    logger.info("scheduler triggered slack-handover")
+    summary = send_handover_notifications(
+        run_date=None,
+        send_linkedin_post=True,
+        send_recruiter_info=True,
+        send_internal_poc=True,
+    )
+    logger.info("scheduler slack-handover summary=%s", summary)
 
 
 def _run_linkedin_auto_login_and_log(job_id: str) -> None:
@@ -151,15 +186,58 @@ def _run_linkedin_auto_login_and_log(job_id: str) -> None:
 
 def _build_scheduler() -> BackgroundScheduler:
     timezone_name = os.getenv("CRON_TIMEZONE", "Asia/Kolkata")
-    cron_hour = int(os.getenv("DAILY_CRON_HOUR", "0"))
-    cron_minute = int(os.getenv("DAILY_CRON_MINUTE", "0"))
     timezone = ZoneInfo(timezone_name)
 
     scheduler = BackgroundScheduler(timezone=timezone)
     scheduler.add_job(
-        _run_daily_jobs_from_scheduler,
-        trigger=CronTrigger(hour=cron_hour, minute=cron_minute, timezone=timezone),
-        id="daily-jobs-pipeline",
+        _run_scrape_jobs_from_scheduler,
+        trigger=CronTrigger(hour=0, minute=10, timezone=timezone),
+        id="daily-scrape-jobs-only",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=1800,
+    )
+    scheduler.add_job(
+        _run_classify_relevant_from_scheduler,
+        trigger=CronTrigger(hour=1, minute=0, timezone=timezone),
+        id="daily-classify-relevant-only",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=1800,
+    )
+    scheduler.add_job(
+        _run_recruiter_info_from_scheduler,
+        trigger=CronTrigger(hour=3, minute=0, timezone=timezone),
+        id="daily-recruiter-info-only",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=1800,
+    )
+    scheduler.add_job(
+        _run_linkedin_posts_scrape_from_scheduler,
+        trigger=CronTrigger(hour=4, minute=0, timezone=timezone),
+        id="daily-linkedin-posts-scrape-only",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=1800,
+    )
+    scheduler.add_job(
+        _run_linkedin_posts_classify_from_scheduler,
+        trigger=CronTrigger(hour=5, minute=0, timezone=timezone),
+        id="daily-linkedin-posts-classify-only",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=1800,
+    )
+    scheduler.add_job(
+        _run_slack_handover_from_scheduler,
+        trigger=CronTrigger(hour=9, minute=30, timezone=timezone),
+        id="daily-slack-handover-all-cases",
         replace_existing=True,
         max_instances=1,
         coalesce=True,
@@ -183,10 +261,17 @@ def startup_event() -> None:
     _scheduler = _build_scheduler()
     _scheduler.start()
     logger.info(
-        "internal scheduler started timezone=%s hour=%s minute=%s",
+        (
+            "internal scheduler started timezone=%s "
+            "scrape=%s classify=%s recruiter=%s linkedin_scrape=%s linkedin_classify=%s slack=%s"
+        ),
         os.getenv("CRON_TIMEZONE", "Asia/Kolkata"),
-        os.getenv("DAILY_CRON_HOUR", "0"),
-        os.getenv("DAILY_CRON_MINUTE", "0"),
+        "00:10",
+        "01:00",
+        "03:00",
+        "04:00",
+        "05:00",
+        "09:30",
     )
 
 

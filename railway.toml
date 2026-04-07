@@ -8,7 +8,7 @@
 # Optional: LINKEDIN_STORAGE_PATH=/app/data/linkedin_storage.json with a volume so sessions survive redeploys
 # Local manual login: set LINKEDIN_SESSION_UPLOAD_URL=https://<app>/internal/linkedin-session + INTERNAL_TRIGGER_TOKEN to auto-upload from linkedin_manual_login.py
 # Optional: LINKEDIN_RECRUITER_SHEET_ENABLED=true — after classification, scrape LinkedIn recruiters into tab recruiters_info_{date} (or RECRUITERS_INFO_WORKSHEET)
-# Optional: LINKEDIN_RECRUITER_MAX_URLS_PER_RUN=60
+# Optional: LINKEDIN_RECRUITER_MAX_URLS_PER_RUN=0 (0 = no cap; set e.g. 60 to limit per run)
 # Optional: LINKEDIN_RECRUITER_FORCE_FAIL_TIMEOUT_S=15
 # Optional: LINKEDIN_RECRUITER_RECYCLE_EVERY=25
 # Optional: LINKEDIN_POSTS_PIPELINE_ENABLED=true — run LinkedIn-posts Apify pipeline in parallel with /internal/run-daily-jobs

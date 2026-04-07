@@ -79,7 +79,9 @@ def write_linkedin_recruiters_for_relevant_jobs(
             storage = None
 
         unique_urls = list(dict.fromkeys(j["job_url"].strip() for j in li_relevant if j.get("job_url")))
-        max_urls = int(os.getenv("LINKEDIN_RECRUITER_MAX_URLS_PER_RUN", "60"))
+        # 0/empty means "no cap" (process all unique LinkedIn job URLs).
+        # Set LINKEDIN_RECRUITER_MAX_URLS_PER_RUN to a positive integer to cap.
+        max_urls = int(os.getenv("LINKEDIN_RECRUITER_MAX_URLS_PER_RUN", "0"))
         if max_urls > 0 and len(unique_urls) > max_urls:
             logger.info(
                 "linkedin recruiter scrape: capping urls from %s to %s (LINKEDIN_RECRUITER_MAX_URLS_PER_RUN)",

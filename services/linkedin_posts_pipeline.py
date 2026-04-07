@@ -581,7 +581,7 @@ def _post_linkedin_posts_slack_summary(
             )
 
         case_prefix = (
-            "Incoming linkedin job post via validated author\n"
+            ":rotating_light: *INCOMING LINKEDIN JOB POST VIA VALIDATED AUTHOR*\n"
             "Note : Please consume the lead in next 2 hours\n"
             "---\n"
         )
@@ -631,7 +631,7 @@ def _post_linkedin_posts_slack_summary(
             f"Reason: {reason}"
         )
     prefix = (
-        "Incoming linkedin job post via validated author\n"
+        ":rotating_light: *INCOMING LINKEDIN JOB POST VIA VALIDATED AUTHOR*\n"
         "Note : Please consume the lead in next 2 hours\n"
         "---\n"
     )

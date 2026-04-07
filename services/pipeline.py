@@ -1024,7 +1024,7 @@ def _post_recruiter_handover_notifications(run_date: str) -> int:
             continue
 
         message = (
-            f"{case_heading}\n"
+            f":rotating_light: *{case_heading.upper()}*\n"
             "Note : Please consume the lead in next 2 hours\n"
             "---\n"
             + "\n\n".join(owner_sections)

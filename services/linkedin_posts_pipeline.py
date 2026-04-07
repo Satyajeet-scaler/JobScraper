@@ -552,6 +552,7 @@ def _post_linkedin_posts_slack_summary(
             ).raise_for_status()
             sleep(1)
 
+            entries: list[str] = []
             for row in bucket:
                 author = _slack_author_from_row(row)
                 company = _slack_company_from_row(row)
@@ -562,8 +563,7 @@ def _post_linkedin_posts_slack_summary(
                 url = _slack_post_url_from_row(row)
                 reason = _slack_display_field(row.get("reason"))
 
-                message = (
-                    f"Handover Owner: {owner_tag} ({owner_email or '-'})\n"
+                entries.append(
                     f"Author: {author}\n"
                     f"Company: {company}\n"
                     f"Role Category: {role_category}\n"
@@ -573,20 +573,37 @@ def _post_linkedin_posts_slack_summary(
                     f"URL : {url}\n"
                     f"Reason: {reason}"
                 )
-                _retry(
-                    action=lambda m=message: _post_slack_payload(
-                        webhook_url=slack_webhook_url,
-                        text=m,
-                        channel=slack_channel,
-                        username=slack_username,
-                        icon_emoji=slack_icon_emoji,
-                    ),
-                    retries=3,
-                    initial_delay_seconds=1.0,
-                ).raise_for_status()
-                sleep(1)
+            message = (
+                f"Incoming linkedin job post via validated author\n"
+                f"Owner : {owner_tag} ({owner_email or '-'})\n"
+                "Note : Please consume the lead in next 2 hours\n"
+                "---\n"
+                + "\n\n".join(entries)
+            )
+            _retry(
+                action=lambda m=message: _post_slack_payload(
+                    webhook_url=slack_webhook_url,
+                    text=m,
+                    channel=slack_channel,
+                    username=slack_username,
+                    icon_emoji=slack_icon_emoji,
+                ),
+                retries=3,
+                initial_delay_seconds=1.0,
+            ).raise_for_status()
+            sleep(1)
+        _post_linkedin_posts_handover_data_summary(
+            webhook_url=slack_webhook_url,
+            channel=slack_channel,
+            username=slack_username,
+            icon_emoji=slack_icon_emoji,
+            leads_scraped=len(scraped_rows),
+            relevant=len(relevant_rows),
+            handover=len(relevant_rows),
+        )
         return
 
+    entries: list[str] = []
     for row in relevant_rows:
         author = _slack_author_from_row(row)
         company = _slack_company_from_row(row)
@@ -597,7 +614,7 @@ def _post_linkedin_posts_slack_summary(
         url = _slack_post_url_from_row(row)
         reason = _slack_display_field(row.get("reason"))
 
-        message = (
+        entries.append(
             f"Author: {author}\n"
             f"Company: {company}\n"
             f"Role Category: {role_category}\n"
@@ -607,18 +624,67 @@ def _post_linkedin_posts_slack_summary(
             f"URL : {url}\n"
             f"Reason: {reason}"
         )
-        _retry(
-            action=lambda m=message: _post_slack_payload(
-                webhook_url=slack_webhook_url,
-                text=m,
-                channel=slack_channel,
-                username=slack_username,
-                icon_emoji=slack_icon_emoji,
-            ),
-            retries=3,
-            initial_delay_seconds=1.0,
-        ).raise_for_status()
-        sleep(1)
+    message = (
+        "Incoming linkedin job post via validated author\n"
+        "Owner : -\n"
+        "Note : Please consume the lead in next 2 hours\n"
+        "---\n"
+        + "\n\n".join(entries)
+    )
+    _retry(
+        action=lambda m=message: _post_slack_payload(
+            webhook_url=slack_webhook_url,
+            text=m,
+            channel=slack_channel,
+            username=slack_username,
+            icon_emoji=slack_icon_emoji,
+        ),
+        retries=3,
+        initial_delay_seconds=1.0,
+    ).raise_for_status()
+    sleep(1)
+    _post_linkedin_posts_handover_data_summary(
+        webhook_url=slack_webhook_url,
+        channel=slack_channel,
+        username=slack_username,
+        icon_emoji=slack_icon_emoji,
+        leads_scraped=len(scraped_rows),
+        relevant=len(relevant_rows),
+        handover=len(relevant_rows),
+    )
+
+
+def _post_linkedin_posts_handover_data_summary(
+    *,
+    webhook_url: str,
+    channel: str,
+    username: str,
+    icon_emoji: str,
+    leads_scraped: int,
+    relevant: int,
+    handover: int,
+) -> None:
+    message = (
+        "Data:\n"
+        f"Leads Scraped: {leads_scraped}\n"
+        f"Relevant: {relevant}\n"
+        f"Handover: {handover}\n"
+        "Internal POC: 0\n"
+        "Recruiter Detail available: 0\n"
+        "Lead Type = Linkedin Post"
+    )
+    _retry(
+        action=lambda m=message: _post_slack_payload(
+            webhook_url=webhook_url,
+            text=m,
+            channel=channel,
+            username=username,
+            icon_emoji=icon_emoji,
+        ),
+        retries=3,
+        initial_delay_seconds=1.0,
+    ).raise_for_status()
+    sleep(1)
 
 
 def _post_slack_payload(

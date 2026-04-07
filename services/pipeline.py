@@ -93,8 +93,11 @@ def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
             )
 
         handover_notifications_sent = 0
+        recruiter_case3_count = 0
+        recruiter_case2_count = 0
         try:
             handover_notifications_sent = _post_recruiter_handover_notifications(run_date=run_date)
+            recruiter_case3_count, recruiter_case2_count = _get_recruiter_handover_case_counts(run_date=run_date)
             logger.info(
                 "pipeline[%s] recruiter handover notifications sent=%s",
                 pipeline_run_id,
@@ -114,6 +117,25 @@ def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
                 linkedin_posts_error = str(exc)
                 logger.warning("pipeline[%s] linkedin-posts pipeline failed: %s", pipeline_run_id, exc)
 
+        linkedin_case1_count = (
+            int(linkedin_posts_metrics.get("relevant_count", 0)) if linkedin_posts_metrics else 0
+        )
+        try:
+            _post_daily_pipeline_final_summary(
+                run_date=run_date,
+                leads_scraped=len(deduped),
+                relevant=len(relevant),
+                recruiter_detail_available=recruiter_case3_count,
+                internal_poc=recruiter_case2_count,
+                linkedin_post_leads=linkedin_case1_count,
+            )
+        except Exception as exc:
+            logger.warning(
+                "pipeline[%s] final summary slack failed but pipeline will continue: %s",
+                pipeline_run_id,
+                exc,
+            )
+
         metrics = {
             "run_id": pipeline_run_id,
             "status": "completed",
@@ -124,6 +146,9 @@ def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
             "classification_errors": classifier_metrics["classification_errors"],
             "recruiter_sheet_rows": recruiter_sheet_rows,
             "handover_notifications_sent": handover_notifications_sent,
+            "handover_case3_recruiter_detail_count": recruiter_case3_count,
+            "handover_case2_internal_poc_count": recruiter_case2_count,
+            "handover_case1_linkedin_post_count": linkedin_case1_count,
             "linkedin_posts_enabled": run_linkedin_posts_enabled,
             "linkedin_posts_status": (
                 "completed"
@@ -935,36 +960,13 @@ def _post_recruiter_handover_notifications(run_date: str) -> int:
         owner_idx = idx % len(owner_rows)
         owner_buckets[owner_idx].append(row)
 
-    sent_messages = 0
-    for owner_idx, owner in enumerate(owner_rows):
-        assigned_rows = owner_buckets.get(owner_idx, [])
-        if not assigned_rows:
-            continue
-        owner_name = (owner.get("owner_name") or "Owner").strip() or "Owner"
-        owner_slack_id = (owner.get("owner_slack_id") or "").strip()
-        owner_email = (owner.get("owner_email") or "").strip()
-        owner_tag = f"<@{owner_slack_id}>" if owner_slack_id else owner_name
-
-        # Heading per owner block so Slack shows grouped context.
-        owner_header = (
-            f"Recruiter handover — {owner_name}\n"
-            f"Handover Owner: {owner_tag} ({owner_email or '-'})\n"
-            f"Rows in this block: {len(assigned_rows)}\n"
-            f"Run date: {run_date}"
-        )
-        _retry(
-            action=lambda h=owner_header: _post_slack_payload(
-                webhook_url=slack_webhook_url,
-                text=h,
-                channel=slack_channel,
-                username=slack_username,
-                icon_emoji=slack_icon_emoji,
-            ),
-            retries=3,
-            initial_delay_seconds=1.0,
-        ).raise_for_status()
-        sleep(1)
-
+    case_owner_entries: dict[str, dict[int, list[str]]] = {
+        "Incoming lead with recruiter details available on linkedin": {
+            idx: [] for idx in range(len(owner_rows))
+        },
+        "Incoming lead from existing company pool": {idx: [] for idx in range(len(owner_rows))},
+    }
+    for owner_idx, assigned_rows in owner_buckets.items():
         for row_idx, row in enumerate(assigned_rows, start=1):
             company = (row.get("company") or "-").strip() or "-"
             title = (row.get("title") or "-").strip() or "-"
@@ -977,29 +979,54 @@ def _post_recruiter_handover_notifications(run_date: str) -> int:
             subheading = f"Job {row_idx}/{len(assigned_rows)} — {company} | {title} ({platform})"
 
             if recruiter_profile_url:
-                handover_line = f"Handover Owner: {owner_tag} ({owner_email or '-'})"
                 recruiter_line = f"Recruiter Profile: {recruiter_profile_url}"
+                case_heading = "Incoming lead with recruiter details available on linkedin"
             else:
                 internal_line = (
                     f"Matched Internal Recruiter Email: {recruiter_email}"
                     if recruiter_email
                     else "Matched Internal Recruiter Email: -"
                 )
-                handover_line = f"Handover Owner: {owner_tag} ({owner_email or '-'})"
                 recruiter_line = f"{internal_line}"
-            message = (
+                if not recruiter_email:
+                    continue
+                case_heading = "Incoming lead from existing company pool"
+            entry = (
                 f"{subheading}\n"
                 f"Company Name: {company}\n"
                 f"Title: {title}\n"
                 f"Platform: {platform}\n"
                 f"URL : {job_url}\n"
-                f"{handover_line}\n"
                 f"{recruiter_line}"
             )
+            case_owner_entries.setdefault(case_heading, {}).setdefault(owner_idx, []).append(entry)
+
+    sent_messages = 0
+    for case_heading in (
+        "Incoming lead with recruiter details available on linkedin",
+        "Incoming lead from existing company pool",
+    ):
+        owners_for_case = case_owner_entries.get(case_heading, {})
+        for owner_idx, entries in owners_for_case.items():
+            if not entries:
+                continue
+            owner = owner_rows[owner_idx]
+            owner_name = (owner.get("owner_name") or "Owner").strip() or "Owner"
+            owner_slack_id = (owner.get("owner_slack_id") or "").strip()
+            owner_email = (owner.get("owner_email") or "").strip()
+            owner_tag = f"<@{owner_slack_id}>" if owner_slack_id else owner_name
+            base = (
+                f"{case_heading}\n"
+                f"Owner : {owner_tag} ({owner_email or '-'})\n"
+                "Note : Please consume the lead in next 2 hours\n"
+                "---\n"
+            )
+            body = "\n\n".join(entries)
+            message = base + body
             _retry(
-                action=lambda: _post_slack_payload(
+                action=lambda m=message: _post_slack_payload(
                     webhook_url=slack_webhook_url,
-                    text=message,
+                    text=m,
                     channel=slack_channel,
                     username=slack_username,
                     icon_emoji=slack_icon_emoji,
@@ -1015,6 +1042,73 @@ def _post_recruiter_handover_notifications(run_date: str) -> int:
         len(filtered_rows),
     )
     return sent_messages
+
+
+def _get_recruiter_handover_case_counts(run_date: str) -> tuple[int, int]:
+    """Return (case3_recruiter_detail_count, case2_internal_poc_count) for recruiters_info rows."""
+    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
+    if not spreadsheet_id:
+        return 0, 0
+    recruiters_tab = os.getenv("RECRUITERS_INFO_WORKSHEET") or f"recruiters_info_{run_date}"
+    try:
+        writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
+        ws = writer.sheet.worksheet(recruiters_tab)
+        rows = worksheet_row_dicts(ws)
+    except Exception as exc:
+        logger.warning("handover summary counts skipped: recruiters tab unavailable: %s", exc)
+        return 0, 0
+
+    case3 = 0
+    case2 = 0
+    for row in rows:
+        row_run_date = (row.get("run_date") or "").strip()
+        if row_run_date and row_run_date != run_date:
+            continue
+        recruiter_profile_url = (row.get("recruiter_profile_url") or "").strip()
+        recruiter_email = (row.get("recruiter_email") or "").strip()
+        if recruiter_profile_url:
+            case3 += 1
+        elif recruiter_email:
+            case2 += 1
+    return case3, case2
+
+
+def _post_daily_pipeline_final_summary(
+    *,
+    run_date: str,
+    leads_scraped: int,
+    relevant: int,
+    recruiter_detail_available: int,
+    internal_poc: int,
+    linkedin_post_leads: int,
+) -> None:
+    slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL")
+    if not slack_webhook_url:
+        return
+    slack_channel = os.getenv("SLACK_CHANNEL", "relevant-scraped-jobs")
+    slack_username = os.getenv("SLACK_USERNAME", "Karan Bot")
+    slack_icon_emoji = os.getenv("SLACK_ICON_EMOJI", ":karandeep:")
+    handover_total = recruiter_detail_available + internal_poc + linkedin_post_leads
+    text = (
+        f"Data ({run_date}):\n"
+        f"Leads Scraped: {leads_scraped}\n"
+        f"Relevant: {relevant}\n"
+        f"Handover: {handover_total}\n"
+        f"Internal POC: {internal_poc}\n"
+        f"Recruiter Detail available: {recruiter_detail_available}\n"
+        f"Lead Type = Linkedin Post: {linkedin_post_leads}"
+    )
+    _retry(
+        action=lambda t=text: _post_slack_payload(
+            webhook_url=slack_webhook_url,
+            text=t,
+            channel=slack_channel,
+            username=slack_username,
+            icon_emoji=slack_icon_emoji,
+        ),
+        retries=3,
+        initial_delay_seconds=1.0,
+    ).raise_for_status()
 
 
 def _pretty_platform_label(site_value: Any) -> str:

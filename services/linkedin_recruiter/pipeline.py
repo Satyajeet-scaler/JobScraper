@@ -33,6 +33,8 @@ async def scrape_linkedin_job_recruiters(
     force_fail_timeout_s: float = 15.0,
     recycle_every: int = 25,
     hydration_wait_s: float = 5.0,
+    retry_count: int = 3,
+    retry_base_delay_s: float = 1.0,
     headless: bool = True,
     strict_job_urls: bool = False,
 ) -> list[dict[str, Any]]:
@@ -78,6 +80,8 @@ async def scrape_linkedin_job_recruiters(
             storage_state_path=state_path,
             timeout_ms=timeout_ms,
             hydration_wait_s=hydration_wait_s,
+            retry_count=retry_count,
+            retry_base_delay_s=retry_base_delay_s,
             headless=headless,
             force_fail_timeout_s=force_fail_timeout_s,
             recycle_every=recycle_every,
@@ -126,6 +130,8 @@ def scrape_linkedin_job_recruiters_sync(
     force_fail_timeout_s: float = 15.0,
     recycle_every: int = 25,
     hydration_wait_s: float = 5.0,
+    retry_count: int = 3,
+    retry_base_delay_s: float = 1.0,
     headless: bool = True,
     strict_job_urls: bool = False,
 ) -> list[dict[str, Any]]:
@@ -138,6 +144,8 @@ def scrape_linkedin_job_recruiters_sync(
             force_fail_timeout_s=force_fail_timeout_s,
             recycle_every=recycle_every,
             hydration_wait_s=hydration_wait_s,
+            retry_count=retry_count,
+            retry_base_delay_s=retry_base_delay_s,
             headless=headless,
             strict_job_urls=strict_job_urls,
         )

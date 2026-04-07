@@ -4,13 +4,13 @@ import os
 import uuid
 import logging
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Any, Literal, Optional
 from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi.encoders import jsonable_encoder
-from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import BackgroundTasks, Body, FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, JSONResponse
 from jobspy import scrape_jobs
 from pandas import DataFrame
@@ -36,6 +36,7 @@ from services.linkedin_posts_split_service import (
     run_linkedin_posts_classify_only,
     run_linkedin_posts_scrape_only,
 )
+from services.slack_handover_notify import send_handover_notifications
 
 
 app = FastAPI(
@@ -423,6 +424,47 @@ def get_linkedin_posts_classify_status(
     if not metrics:
         raise HTTPException(status_code=404, detail="Run ID not found.")
     return JSONResponse(content=metrics)
+
+
+@app.post("/internal/send-slack-handover")
+def internal_send_slack_handover(
+    body: dict[str, Any] = Body(default_factory=dict),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """
+    Send Slack handovers by reading ``recruiters_info_{date}`` and ``linkedin_posts_relevant_{date}``.
+
+    JSON body (all optional except flags default true):
+    - ``run_date``: YYYY-MM-DD (default: today on server)
+    - ``send_linkedin_post``: bool (default true)
+    - ``send_recruiter_info``: recruiter LinkedIn profile case (default true)
+    - ``send_internal_poc``: internal POC email case (default true)
+    - Optional Slack overrides: ``webhook_url``, ``channel``, ``username``, ``icon_emoji``
+    """
+    validate_internal_trigger_token(x_internal_token)
+    run_date = body.get("run_date")
+    if run_date is not None and not isinstance(run_date, str):
+        raise HTTPException(status_code=400, detail="run_date must be a string YYYY-MM-DD or omitted.")
+
+    def _bool_flag(key: str, default: bool = True) -> bool:
+        if key not in body:
+            return default
+        v = body[key]
+        if isinstance(v, bool):
+            return v
+        raise HTTPException(status_code=400, detail=f"{key} must be a boolean.")
+
+    result = send_handover_notifications(
+        run_date,
+        send_linkedin_post=_bool_flag("send_linkedin_post", True),
+        send_recruiter_info=_bool_flag("send_recruiter_info", True),
+        send_internal_poc=_bool_flag("send_internal_poc", True),
+        webhook_url=body.get("webhook_url") if isinstance(body.get("webhook_url"), str) else None,
+        channel=body.get("channel") if isinstance(body.get("channel"), str) else None,
+        username=body.get("username") if isinstance(body.get("username"), str) else None,
+        icon_emoji=body.get("icon_emoji") if isinstance(body.get("icon_emoji"), str) else None,
+    )
+    return JSONResponse(content=jsonable_encoder(result))
 
 
 @app.post("/internal/linkedin-auto-login")

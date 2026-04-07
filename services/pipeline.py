@@ -17,6 +17,11 @@ from services.google_sheets import GoogleSheetsWriter
 from services.handover_owners import worksheet_row_dicts
 from services.linkedin_recruiter.sheets_pipeline import write_linkedin_recruiters_for_relevant_jobs
 from services.linkedin_posts_pipeline import run_linkedin_posts_pipeline, post_linkedin_posts_slack_handover
+from services.slack_handover_notify import (
+    load_linkedin_relevant_posts_from_sheet,
+    send_handover_notifications,
+    send_slack_text,
+)
 from services.apify_naukri import normalize_naukri_item, scrape_naukri_jobs
 try:
     import google.generativeai as genai
@@ -924,157 +929,26 @@ def _write_relevant_jobs_to_google_sheets(
 
 
 def _post_recruiter_handover_notifications(run_date: str) -> int:
-    """Group leads by case, then by owner. Send heading per case, then per-lead messages."""
-    slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL")
-    if not slack_webhook_url:
-        logger.info("handover slack skipped: SLACK_WEBHOOK_URL not configured")
-        return 0
-
-    slack_channel = os.getenv("SLACK_CHANNEL", "relevant-scraped-jobs")
-    slack_username = os.getenv("SLACK_USERNAME", "Karan Bot")
-    slack_icon_emoji = os.getenv("SLACK_ICON_EMOJI", ":karandeep:")
-    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
-    if not spreadsheet_id:
-        logger.info("handover slack skipped: GOOGLE_SPREADSHEET_ID not configured")
-        return 0
-
-    recruiters_tab = os.getenv("RECRUITERS_INFO_WORKSHEET") or f"recruiters_info_{run_date}"
-    owner_tab = os.getenv("OWNER_SHEET_NAME", "owner_slack_ID")
-    writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-
-    try:
-        recruiters_ws = writer.sheet.worksheet(recruiters_tab)
-        owners_ws = writer.sheet.worksheet(owner_tab)
-    except Exception as exc:
-        logger.warning("handover slack skipped: required sheet missing: %s", exc)
-        return 0
-
-    recruiter_rows = worksheet_row_dicts(recruiters_ws)
-    owner_rows = worksheet_row_dicts(owners_ws)
-    if not recruiter_rows:
-        logger.info("handover slack skipped: no recruiter rows")
-        return 0
-    if not owner_rows:
-        logger.warning("handover slack skipped: owner sheet has no rows")
-        return 0
-
-    filtered_rows: list[dict[str, str]] = []
-    for row in recruiter_rows:
-        row_run_date = (row.get("run_date") or "").strip()
-        if row_run_date and row_run_date != run_date:
-            continue
-        filtered_rows.append(row)
-    if not filtered_rows:
-        logger.info("handover slack skipped: no recruiter rows for run_date=%s", run_date)
-        return 0
-
-    case3_rows: list[dict[str, str]] = []
-    case2_rows: list[dict[str, str]] = []
-    for row in filtered_rows:
-        if (row.get("recruiter_profile_url") or "").strip():
-            case3_rows.append(row)
-        elif (row.get("recruiter_email") or "").strip():
-            case2_rows.append(row)
-
-    def _send(text: str) -> None:
-        _retry(
-            action=lambda t=text: _post_slack_payload(
-                webhook_url=slack_webhook_url,
-                text=t,
-                channel=slack_channel,
-                username=slack_username,
-                icon_emoji=slack_icon_emoji,
-            ),
-            retries=3,
-            initial_delay_seconds=1.0,
-        ).raise_for_status()
-        sleep(1)
-
-    def _owner_tag(owner: dict[str, str]) -> str:
-        name = (owner.get("owner_name") or "Owner").strip() or "Owner"
-        sid = (owner.get("owner_slack_id") or "").strip()
-        return f"*{name}* (<@{sid}>)" if sid else f"*{name}*"
-
-    sent = 0
-
-    if case3_rows:
-        _send(":rotating_light: *INCOMING LEAD WITH RECRUITER DETAILS AVAILABLE ON LINKEDIN*")
-        sent += 1
-
-        owner_buckets: dict[int, list[dict[str, str]]] = {i: [] for i in range(len(owner_rows))}
-        for idx, row in enumerate(case3_rows):
-            owner_buckets[idx % len(owner_rows)].append(row)
-
-        for owner_idx, owner in enumerate(owner_rows):
-            bucket = owner_buckets.get(owner_idx, [])
-            if not bucket:
-                continue
-            tag = _owner_tag(owner)
-            for row in bucket:
-                company = (row.get("company") or "-").strip() or "-"
-                role = (row.get("role_category") or row.get("matched_role") or "-").strip() or "-"
-                job_url = (row.get("job_url") or "-").strip() or "-"
-                profile_url = (row.get("recruiter_profile_url") or "-").strip() or "-"
-                msg = (
-                    f"{tag}\n"
-                    f"Company: {company}\n"
-                    f"Role: {role}\n"
-                    f"Job URL: {job_url}\n"
-                    f"Recruiter Profile: {profile_url}"
-                )
-                _send(msg)
-                sent += 1
-
-    if case2_rows:
-        _send(":rotating_light: *INCOMING LEAD with EXISTING INTERNAL POC*")
-        sent += 1
-
-        owner_buckets_2: dict[int, list[dict[str, str]]] = {i: [] for i in range(len(owner_rows))}
-        for idx, row in enumerate(case2_rows):
-            owner_buckets_2[idx % len(owner_rows)].append(row)
-
-        for owner_idx, owner in enumerate(owner_rows):
-            bucket = owner_buckets_2.get(owner_idx, [])
-            if not bucket:
-                continue
-            tag = _owner_tag(owner)
-            for row in bucket:
-                company = (row.get("company") or "-").strip() or "-"
-                role = (row.get("role_category") or row.get("matched_role") or "-").strip() or "-"
-                job_url = (row.get("job_url") or "-").strip() or "-"
-                poc_email = (row.get("recruiter_email") or "-").strip() or "-"
-                msg = (
-                    f"{tag}\n"
-                    f"Company: {company}\n"
-                    f"Role: {role}\n"
-                    f"Job URL: {job_url}\n"
-                    f"Internal POC Email: {poc_email}"
-                )
-                _send(msg)
-                sent += 1
-
+    """Recruiter LinkedIn profile + internal POC handovers (reads recruiters sheet)."""
+    summary = send_handover_notifications(
+        run_date,
+        send_linkedin_post=False,
+        send_recruiter_info=True,
+        send_internal_poc=True,
+    )
+    sent = int(summary.get("recruiter_messages_sent", 0))
     logger.info(
-        "handover slack posted messages=%s case3=%s case2=%s",
-        sent, len(case3_rows), len(case2_rows),
+        "handover slack posted recruiter messages=%s (detail_leads=%s internal_poc_leads=%s)",
+        sent,
+        summary.get("recruiter_detail_leads"),
+        summary.get("internal_poc_leads"),
     )
     return sent
 
 
 def _load_relevant_linkedin_posts_from_sheet(run_date: str) -> list[dict[str, Any]]:
     """Read linkedin_posts_relevant_{date} tab to get rows for Slack handover."""
-    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
-    if not spreadsheet_id:
-        return []
-    tab = f"linkedin_posts_relevant_{run_date}"
-    try:
-        writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-        ws = writer.sheet.worksheet(tab)
-        rows = worksheet_row_dicts(ws)
-        logger.info("loaded %s relevant linkedin posts from sheet %s", len(rows), tab)
-        return rows
-    except Exception as exc:
-        logger.warning("failed to load relevant linkedin posts sheet=%s err=%s", tab, exc)
-        return []
+    return load_linkedin_relevant_posts_from_sheet(run_date)
 
 
 def _get_recruiter_handover_case_counts(run_date: str) -> tuple[int, int]:
@@ -1115,12 +989,6 @@ def _post_daily_pipeline_final_summary(
     internal_poc: int,
     linkedin_post_leads: int,
 ) -> None:
-    slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL")
-    if not slack_webhook_url:
-        return
-    slack_channel = os.getenv("SLACK_CHANNEL", "relevant-scraped-jobs")
-    slack_username = os.getenv("SLACK_USERNAME", "Karan Bot")
-    slack_icon_emoji = os.getenv("SLACK_ICON_EMOJI", ":karandeep:")
     handover_total = recruiter_detail_available + internal_poc + linkedin_post_leads
     text = (
         f"Data ({run_date}):\n"
@@ -1131,17 +999,7 @@ def _post_daily_pipeline_final_summary(
         f"Recruiter Detail available: {recruiter_detail_available}\n"
         f"Lead Type = Linkedin Post: {linkedin_post_leads}"
     )
-    _retry(
-        action=lambda t=text: _post_slack_payload(
-            webhook_url=slack_webhook_url,
-            text=t,
-            channel=slack_channel,
-            username=slack_username,
-            icon_emoji=slack_icon_emoji,
-        ),
-        retries=3,
-        initial_delay_seconds=1.0,
-    ).raise_for_status()
+    send_slack_text(text, sleep_after=0, log_skip_message=None)
 
 
 def _pretty_platform_label(site_value: Any) -> str:
@@ -1158,26 +1016,6 @@ def _pretty_platform_label(site_value: Any) -> str:
 
 def get_pipeline_run_metrics(run_id: str) -> dict[str, Any] | None:
     return PIPELINE_RUN_METRICS.get(run_id)
-
-
-def _post_slack_payload(
-    webhook_url: str,
-    text: str,
-    channel: str,
-    username: str,
-    icon_emoji: str,
-) -> requests.Response:
-    payload = {
-        "text": text,
-        "channel": channel,
-        "username": username,
-        "icon_emoji": icon_emoji,
-    }
-    return requests.post(
-        webhook_url,
-        data={"payload": json.dumps(payload, ensure_ascii=True)},
-        timeout=20,
-    )
 
 
 def _retry(action, retries: int, initial_delay_seconds: float):

@@ -11,7 +11,7 @@ import requests
 
 from services.apify_linkedin_posts import normalize_linkedin_post_item, scrape_linkedin_posts
 from services.google_sheets import GoogleSheetsWriter
-from services.handover_owners import load_owner_rows_for_handover
+from services.slack_handover_notify import send_linkedin_post_handover_messages, slack_notify_defaults_from_env
 
 try:
     import google.generativeai as genai
@@ -572,116 +572,6 @@ Return strict JSON:
 """
 
 
-def _slack_display_field(value: Any, default: str = "-") -> str:
-    """Slack text must be built from strings; Apify fields may be dict/list."""
-    if value is None:
-        return default
-    if isinstance(value, str):
-        return value.strip() or default
-    if isinstance(value, dict):
-        for key in ("search", "query", "keyword", "text", "name", "title"):
-            inner = value.get(key)
-            if isinstance(inner, str) and inner.strip():
-                return inner.strip()
-        try:
-            return json.dumps(value, ensure_ascii=True)[:500]
-        except (TypeError, ValueError):
-            return str(value)[:500]
-    if isinstance(value, (list, tuple)):
-        try:
-            return json.dumps(value, ensure_ascii=True)[:500]
-        except (TypeError, ValueError):
-            return str(value)[:500]
-    return str(value).strip() or default
-
-
-def _deep_get(payload: Any, path: str) -> Any:
-    cur = payload
-    for part in path.split("."):
-        if not isinstance(cur, dict):
-            return None
-        cur = cur.get(part)
-        if cur is None:
-            return None
-    return cur
-
-
-def _pick_first(payload: dict[str, Any], paths: tuple[str, ...]) -> Any:
-    for path in paths:
-        value = _deep_get(payload, path)
-        if value is None:
-            continue
-        if isinstance(value, str) and not value.strip():
-            continue
-        return value
-    return None
-
-
-def _slack_author_from_row(row: dict[str, Any]) -> str:
-    direct = _slack_display_field(row.get("author_name"), default="")
-    if direct:
-        return direct
-    raw = row.get("raw_payload")
-    if not isinstance(raw, dict):
-        return "-"
-    return _slack_display_field(
-        _pick_first(
-            raw,
-            (
-                "author.name",
-                "author.fullName",
-                "authorName",
-                "profileName",
-                "name",
-                "author.info",
-            ),
-        )
-    )
-
-
-def _slack_company_from_row(row: dict[str, Any]) -> str:
-    direct = _slack_display_field(row.get("company"), default="")
-    if direct:
-        return direct
-    raw = row.get("raw_payload")
-    if not isinstance(raw, dict):
-        return "-"
-    return _slack_display_field(
-        _pick_first(
-            raw,
-            (
-                "companyName",
-                "company.name",
-                "author.company",
-                "author.info",
-                "organizationName",
-            ),
-        )
-    )
-
-
-def _slack_post_url_from_row(row: dict[str, Any]) -> str:
-    direct = _slack_display_field(row.get("post_url"), default="")
-    if direct:
-        return direct
-    raw = row.get("raw_payload")
-    if not isinstance(raw, dict):
-        return "-"
-    return _slack_display_field(
-        _pick_first(
-            raw,
-            (
-                "linkedinUrl",
-                "linkedinPostUrl",
-                "postUrl",
-                "url",
-                "activityUrl",
-                "author.linkedinUrl",
-            ),
-        )
-    )
-
-
 def post_linkedin_posts_slack_handover(
     run_date: str,
     scraped_rows: list[dict[str, Any]],
@@ -691,85 +581,11 @@ def post_linkedin_posts_slack_handover(
 
     Public so the daily pipeline can call it after all other case messages finish.
     """
-    slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL")
-    if not slack_webhook_url:
-        logger.info("linkedin-posts slack skipped: SLACK_WEBHOOK_URL not configured")
-        return
-
-    slack_channel = os.getenv("SLACK_CHANNEL", "relevant-scraped-jobs")
-    slack_username = os.getenv("SLACK_USERNAME", "Karan Bot")
-    slack_icon_emoji = os.getenv("SLACK_ICON_EMOJI", ":karandeep:")
-
     logger.info("linkedin-posts slack handover scraped=%s relevant=%s", len(scraped_rows), len(relevant_rows))
-
-    if not relevant_rows:
-        logger.info("linkedin-posts slack: no relevant posts to send")
-        return
-
-    owner_rows = load_owner_rows_for_handover()
-    if not owner_rows:
-        logger.warning(
-            "linkedin-posts handover: owner sheet unavailable; posting without owner assignment "
-            "(set GOOGLE_SPREADSHEET_ID and owner_slack_ID tab)"
-        )
-
-    def _send(text: str) -> None:
-        _retry(
-            action=lambda t=text: _post_slack_payload(
-                webhook_url=slack_webhook_url,
-                text=t,
-                channel=slack_channel,
-                username=slack_username,
-                icon_emoji=slack_icon_emoji,
-            ),
-            retries=3,
-            initial_delay_seconds=1.0,
-        ).raise_for_status()
-        sleep(1)
-
-    # 1) Case heading
-    _send(":rotating_light: *INCOMING LINKEDIN JOB POST VIA VALIDATED AUTHOR*")
-    sent = 1
-
-    # 2) Round-robin assign to owners, then send grouped by owner
-    if owner_rows:
-        owner_buckets: dict[int, list[dict[str, Any]]] = {i: [] for i in range(len(owner_rows))}
-        for idx, row in enumerate(relevant_rows):
-            owner_buckets[idx % len(owner_rows)].append(row)
-
-        for owner_idx, owner in enumerate(owner_rows):
-            bucket = owner_buckets.get(owner_idx, [])
-            if not bucket:
-                continue
-            owner_name = (owner.get("owner_name") or "Owner").strip() or "Owner"
-            owner_slack_id = (owner.get("owner_slack_id") or "").strip()
-            owner_tag = f"*{owner_name}* (<@{owner_slack_id}>)" if owner_slack_id else f"*{owner_name}*"
-
-            for row in bucket:
-                author = _slack_author_from_row(row)
-                url = _slack_post_url_from_row(row)
-                msg = (
-                    f"{owner_tag}\n"
-                    f"{url}\n"
-                    f'This is lead posted by author "{author}"\n'
-                    "Note: Please consume the lead in next 2 hours and update"
-                )
-                _send(msg)
-                sent += 1
-    else:
-        for row in relevant_rows:
-            author = _slack_author_from_row(row)
-            url = _slack_post_url_from_row(row)
-            msg = (
-                f"*Unassigned*\n"
-                f"{url}\n"
-                f'This is lead posted by author "{author}"\n'
-                "Note: Please consume the lead in next 2 hours and update"
-            )
-            _send(msg)
-            sent += 1
-
-    logger.info("linkedin-posts handover sent heading + %s individual post messages", sent)
+    send_linkedin_post_handover_messages(
+        relevant_rows,
+        defaults=slack_notify_defaults_from_env(),
+    )
 
 
 
@@ -796,23 +612,3 @@ def _chunk_slack_entries(prefix: str, entries: list[str]) -> list[str]:
     if current.strip():
         chunks.append(current)
     return chunks
-
-
-def _post_slack_payload(
-    webhook_url: str,
-    text: str,
-    channel: str,
-    username: str,
-    icon_emoji: str,
-) -> requests.Response:
-    payload = {
-        "text": text,
-        "channel": channel,
-        "username": username,
-        "icon_emoji": icon_emoji,
-    }
-    return requests.post(
-        webhook_url,
-        data={"payload": json.dumps(payload, ensure_ascii=True)},
-        timeout=20,
-    )

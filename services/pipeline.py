@@ -4,6 +4,7 @@ import math
 import os
 import uuid
 import traceback
+from concurrent.futures import ThreadPoolExecutor, Future
 from datetime import date, datetime, timedelta, timezone
 from time import perf_counter, sleep
 from typing import Any
@@ -72,69 +73,66 @@ def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
         _write_relevant_jobs_to_google_sheets(run_date=run_date, relevant_jobs=relevant)
         logger.info("pipeline[%s] relevant_jobs sheet write completed", pipeline_run_id)
 
-        recruiter_sheet_rows = 0
-        try:
-            recruiter_sheet_rows, _ = (
-                write_linkedin_recruiters_for_relevant_jobs(
+        def _recruiter_flow() -> tuple[int, int, int, int]:
+            """Run recruiter scrape + handover; returns (sheet_rows, notifs_sent, case3, case2)."""
+            sheet_rows = 0
+            try:
+                sheet_rows, _ = write_linkedin_recruiters_for_relevant_jobs(
                     run_date=run_date,
                     relevant_jobs=relevant,
                 )
-            )
-            logger.info(
-                "pipeline[%s] linkedin recruiters sheet completed rows_written=%s",
-                pipeline_run_id,
-                recruiter_sheet_rows,
-            )
-        except Exception as exc:
-            logger.warning(
-                "pipeline[%s] linkedin recruiters sheet failed but pipeline will continue: %s",
-                pipeline_run_id,
-                exc,
-            )
-
-        handover_notifications_sent = 0
-        recruiter_case3_count = 0
-        recruiter_case2_count = 0
-        try:
-            handover_notifications_sent = _post_recruiter_handover_notifications(run_date=run_date)
-            recruiter_case3_count, recruiter_case2_count = _get_recruiter_handover_case_counts(run_date=run_date)
-            logger.info(
-                "pipeline[%s] recruiter handover notifications sent=%s",
-                pipeline_run_id,
-                handover_notifications_sent,
-            )
-        except Exception as exc:
-            logger.warning(
-                "pipeline[%s] recruiter handover notifications failed but pipeline will continue: %s",
-                pipeline_run_id,
-                exc,
-            )
-
-        if run_linkedin_posts_enabled:
-            try:
-                linkedin_posts_metrics = run_linkedin_posts_pipeline()
+                logger.info(
+                    "pipeline[%s] linkedin recruiters sheet completed rows_written=%s",
+                    pipeline_run_id, sheet_rows,
+                )
             except Exception as exc:
-                linkedin_posts_error = str(exc)
+                logger.warning(
+                    "pipeline[%s] linkedin recruiters sheet failed but pipeline will continue: %s",
+                    pipeline_run_id, exc,
+                )
+
+            notifs, c3, c2 = 0, 0, 0
+            try:
+                notifs = _post_recruiter_handover_notifications(run_date=run_date)
+                c3, c2 = _get_recruiter_handover_case_counts(run_date=run_date)
+                logger.info(
+                    "pipeline[%s] recruiter handover notifications sent=%s",
+                    pipeline_run_id, notifs,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "pipeline[%s] recruiter handover notifications failed but pipeline will continue: %s",
+                    pipeline_run_id, exc,
+                )
+            return sheet_rows, notifs, c3, c2
+
+        def _linkedin_posts_flow() -> tuple[dict[str, Any] | None, str]:
+            """Run LinkedIn posts pipeline; returns (metrics, error_string)."""
+            if not run_linkedin_posts_enabled:
+                return None, ""
+            try:
+                return run_linkedin_posts_pipeline(), ""
+            except Exception as exc:
                 logger.warning("pipeline[%s] linkedin-posts pipeline failed: %s", pipeline_run_id, exc)
+                return None, str(exc)
+
+        logger.info("pipeline[%s] starting recruiter + linkedin-posts in parallel", pipeline_run_id)
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            recruiter_future: Future = executor.submit(_recruiter_flow)
+            linkedin_posts_future: Future = executor.submit(_linkedin_posts_flow)
+
+        recruiter_sheet_rows, handover_notifications_sent, recruiter_case3_count, recruiter_case2_count = (
+            recruiter_future.result()
+        )
+        linkedin_posts_metrics, linkedin_posts_error = linkedin_posts_future.result()
 
         linkedin_case1_count = (
             int(linkedin_posts_metrics.get("relevant_count", 0)) if linkedin_posts_metrics else 0
         )
-        try:
-            _post_daily_pipeline_final_summary(
-                run_date=run_date,
-                leads_scraped=len(deduped),
-                relevant=len(relevant),
-                recruiter_detail_available=recruiter_case3_count,
-                internal_poc=recruiter_case2_count,
-                linkedin_post_leads=linkedin_case1_count,
-            )
-        except Exception as exc:
-            logger.warning(
-                "pipeline[%s] final summary slack failed but pipeline will continue: %s",
-                pipeline_run_id,
-                exc,
-            )
+        logger.info(
+            "pipeline[%s] final summary: leads_scraped=%s relevant=%s recruiter_detail=%s internal_poc=%s linkedin_posts=%s",
+            pipeline_run_id, len(deduped), len(relevant), recruiter_case3_count, recruiter_case2_count, linkedin_case1_count,
+        )
 
         metrics = {
             "run_id": pipeline_run_id,
@@ -908,7 +906,7 @@ def _write_relevant_jobs_to_google_sheets(
 
 
 def _post_recruiter_handover_notifications(run_date: str) -> int:
-    """Send one Slack handover message per recruiters_info row, owner-assigned in round robin."""
+    """Group leads by case, then by owner. Send heading per case, then per-lead messages."""
     slack_webhook_url = os.getenv("SLACK_WEBHOOK_URL")
     if not slack_webhook_url:
         logger.info("handover slack skipped: SLACK_WEBHOOK_URL not configured")
@@ -942,7 +940,6 @@ def _post_recruiter_handover_notifications(run_date: str) -> int:
         logger.warning("handover slack skipped: owner sheet has no rows")
         return 0
 
-    # Keep only rows for this run date when run_date column exists.
     filtered_rows: list[dict[str, str]] = []
     for row in recruiter_rows:
         row_run_date = (row.get("run_date") or "").strip()
@@ -953,86 +950,19 @@ def _post_recruiter_handover_notifications(run_date: str) -> int:
         logger.info("handover slack skipped: no recruiter rows for run_date=%s", run_date)
         return 0
 
-    # Keep round-robin assignment, but dispatch grouped by owner so each owner's jobs
-    # are sent together in one contiguous block.
-    owner_buckets: dict[int, list[dict[str, str]]] = {idx: [] for idx in range(len(owner_rows))}
-    for idx, row in enumerate(filtered_rows):
-        owner_idx = idx % len(owner_rows)
-        owner_buckets[owner_idx].append(row)
+    case3_rows: list[dict[str, str]] = []
+    case2_rows: list[dict[str, str]] = []
+    for row in filtered_rows:
+        if (row.get("recruiter_profile_url") or "").strip():
+            case3_rows.append(row)
+        elif (row.get("recruiter_email") or "").strip():
+            case2_rows.append(row)
 
-    case_owner_entries: dict[str, dict[int, list[str]]] = {
-        "Incoming lead with recruiter details available on linkedin": {
-            idx: [] for idx in range(len(owner_rows))
-        },
-        "Incoming lead from existing company pool": {idx: [] for idx in range(len(owner_rows))},
-    }
-    for owner_idx, assigned_rows in owner_buckets.items():
-        for row_idx, row in enumerate(assigned_rows, start=1):
-            company = (row.get("company") or "-").strip() or "-"
-            title = (row.get("title") or "-").strip() or "-"
-            platform = _pretty_platform_label(row.get("site"))
-            job_url = (row.get("job_url") or "-").strip() or "-"
-            recruiter_profile_url = (row.get("recruiter_profile_url") or "").strip()
-            recruiter_email = (row.get("recruiter_email") or "").strip()
-
-            # Subheading per job for quick scanning within an owner's block.
-            subheading = f"Job {row_idx}/{len(assigned_rows)} — {company} | {title} ({platform})"
-
-            if recruiter_profile_url:
-                recruiter_line = f"Recruiter Profile: {recruiter_profile_url}"
-                case_heading = "Incoming lead with recruiter details available on linkedin"
-            else:
-                internal_line = (
-                    f"Matched Internal Recruiter Email: {recruiter_email}"
-                    if recruiter_email
-                    else "Matched Internal Recruiter Email: -"
-                )
-                recruiter_line = f"{internal_line}"
-                if not recruiter_email:
-                    continue
-                case_heading = "Incoming lead from existing company pool"
-            entry = (
-                f"{subheading}\n"
-                f"Company Name: {company}\n"
-                f"Title: {title}\n"
-                f"Platform: {platform}\n"
-                f"URL : {job_url}\n"
-                f"{recruiter_line}"
-            )
-            case_owner_entries.setdefault(case_heading, {}).setdefault(owner_idx, []).append(entry)
-
-    sent_messages = 0
-    for case_heading in (
-        "Incoming lead with recruiter details available on linkedin",
-        "Incoming lead from existing company pool",
-    ):
-        owners_for_case = case_owner_entries.get(case_heading, {})
-        owner_sections: list[str] = []
-        for owner_idx, entries in owners_for_case.items():
-            if not entries:
-                continue
-            owner = owner_rows[owner_idx]
-            owner_name = (owner.get("owner_name") or "Owner").strip() or "Owner"
-            owner_slack_id = (owner.get("owner_slack_id") or "").strip()
-            owner_email = (owner.get("owner_email") or "").strip()
-            owner_tag = f"<@{owner_slack_id}>" if owner_slack_id else owner_name
-            owner_sections.append(
-                f"*Owner : {owner_tag} ({owner_email or '-'})*\n" + "\n\n".join(entries)
-            )
-
-        if not owner_sections:
-            continue
-
-        message = (
-            f":rotating_light: *{case_heading.upper()}*\n"
-            "Note : Please consume the lead in next 2 hours\n"
-            "---\n"
-            + "\n\n".join(owner_sections)
-        )
+    def _send(text: str) -> None:
         _retry(
-            action=lambda m=message: _post_slack_payload(
+            action=lambda t=text: _post_slack_payload(
                 webhook_url=slack_webhook_url,
-                text=m,
+                text=t,
                 channel=slack_channel,
                 username=slack_username,
                 icon_emoji=slack_icon_emoji,
@@ -1040,14 +970,76 @@ def _post_recruiter_handover_notifications(run_date: str) -> int:
             retries=3,
             initial_delay_seconds=1.0,
         ).raise_for_status()
-        sent_messages += 1
         sleep(1)
+
+    def _owner_tag(owner: dict[str, str]) -> str:
+        name = (owner.get("owner_name") or "Owner").strip() or "Owner"
+        sid = (owner.get("owner_slack_id") or "").strip()
+        return f"*{name}* (<@{sid}>)" if sid else f"*{name}*"
+
+    sent = 0
+
+    if case3_rows:
+        _send(":rotating_light: *INCOMING LEAD WITH RECRUITER DETAILS AVAILABLE ON LINKEDIN*")
+        sent += 1
+
+        owner_buckets: dict[int, list[dict[str, str]]] = {i: [] for i in range(len(owner_rows))}
+        for idx, row in enumerate(case3_rows):
+            owner_buckets[idx % len(owner_rows)].append(row)
+
+        for owner_idx, owner in enumerate(owner_rows):
+            bucket = owner_buckets.get(owner_idx, [])
+            if not bucket:
+                continue
+            tag = _owner_tag(owner)
+            for row in bucket:
+                company = (row.get("company") or "-").strip() or "-"
+                role = (row.get("role_category") or row.get("matched_role") or "-").strip() or "-"
+                job_url = (row.get("job_url") or "-").strip() or "-"
+                profile_url = (row.get("recruiter_profile_url") or "-").strip() or "-"
+                msg = (
+                    f"{tag}\n\n"
+                    f"Company: {company}\n\n"
+                    f"Role: {role}\n\n"
+                    f"Job URL: {job_url}\n\n"
+                    f"Recruiter Profile: {profile_url}"
+                )
+                _send(msg)
+                sent += 1
+
+    if case2_rows:
+        _send(":rotating_light: *INCOMING LEAD FROM EXISTING INTERNAL POC*")
+        sent += 1
+
+        owner_buckets_2: dict[int, list[dict[str, str]]] = {i: [] for i in range(len(owner_rows))}
+        for idx, row in enumerate(case2_rows):
+            owner_buckets_2[idx % len(owner_rows)].append(row)
+
+        for owner_idx, owner in enumerate(owner_rows):
+            bucket = owner_buckets_2.get(owner_idx, [])
+            if not bucket:
+                continue
+            tag = _owner_tag(owner)
+            for row in bucket:
+                company = (row.get("company") or "-").strip() or "-"
+                role = (row.get("role_category") or row.get("matched_role") or "-").strip() or "-"
+                job_url = (row.get("job_url") or "-").strip() or "-"
+                poc_email = (row.get("recruiter_email") or "-").strip() or "-"
+                msg = (
+                    f"{tag}\n\n"
+                    f"Company: {company}\n\n"
+                    f"Role: {role}\n\n"
+                    f"Job URL: {job_url}\n\n"
+                    f"Internal POC Email: {poc_email}"
+                )
+                _send(msg)
+                sent += 1
+
     logger.info(
-        "handover slack posted messages=%s rows=%s",
-        sent_messages,
-        len(filtered_rows),
+        "handover slack posted messages=%s case3=%s case2=%s",
+        sent, len(case3_rows), len(case2_rows),
     )
-    return sent_messages
+    return sent
 
 
 def _get_recruiter_handover_case_counts(run_date: str) -> tuple[int, int]:

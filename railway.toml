@@ -20,8 +20,7 @@
 # Optional: APIFY_LINKEDIN_POST_QUERIES='["hiring data analyst Bangalore","hiring backend developer India"]'
 # Optional: APIFY_LINKEDIN_POSTS_MAX_POSTS=30, APIFY_LINKEDIN_POSTS_POSTED_LIMIT=24h, APIFY_LINKEDIN_POSTS_SORT_BY=date
 # Optional: AI_RELEVANCE_PROMPT_LINKEDIN_POSTS="..."
-# Optional: COMPANY_CONTACTS_SPREADSHEET_ID=<spreadsheet id containing Data_ sheet>
-# Optional: COMPANY_CONTACTS_SHEET_NAME=Data_
+# Optional: COMPANY_CONTACTS_SHEET_NAME=company_contacts  (tab inside GOOGLE_SPREADSHEET_ID)
 # Optional: COMPANY_CONTACTS_COMPANY_COLUMN=Name of company
 # Optional: COMPANY_CONTACTS_EMAIL_COLUMN=Email Address
 # Optional: OWNER_SHEET_NAME=owner_slack_ID

@@ -258,7 +258,7 @@ def write_linkedin_recruiters_for_relevant_jobs(
 
 
 def _load_company_contact_email_map() -> dict[str, list[str]]:
-    spreadsheet_id = os.getenv("COMPANY_CONTACTS_SPREADSHEET_ID")
+    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
     if not spreadsheet_id:
         return {}
     sheet_name = os.getenv("COMPANY_CONTACTS_SHEET_NAME", "Data_")
@@ -270,7 +270,7 @@ def _load_company_contact_email_map() -> dict[str, list[str]]:
         worksheet = writer.sheet.worksheet(sheet_name)
         rows = worksheet.get_all_values()
     except Exception as exc:
-        logger.warning("linkedin recruiter sheet: contacts source unavailable sheet=%s err=%s", sheet_name, exc)
+        logger.warning("linkedin recruiter sheet: contacts tab unavailable sheet=%s err=%s", sheet_name, exc)
         return {}
 
     if len(rows) <= 1:

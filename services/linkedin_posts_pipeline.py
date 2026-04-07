@@ -172,6 +172,62 @@ def _classify_relevant_posts(rows: list[dict[str, Any]]) -> tuple[list[dict[str,
 
     relevant_rows: list[dict[str, Any]] = []
     errors = 0
+    gemini_batch_size = max(1, int(os.getenv("LINKEDIN_POSTS_GEMINI_BATCH_SIZE", "60")))
+    if gemini_api_key and gemini_batch_size > 1:
+        batches = _chunk(rows, gemini_batch_size)
+        logger.info(
+            "linkedin-posts gemini batching enabled batches=%s batch_size=%s",
+            len(batches),
+            gemini_batch_size,
+        )
+        for bidx, batch in enumerate(batches, start=1):
+            logger.info(
+                "linkedin-posts classification batch=%s/%s started size=%s",
+                bidx,
+                len(batches),
+                len(batch),
+            )
+            try:
+                decisions = _classify_batch_posts_with_gemini(
+                    rows=batch,
+                    prompt=prompt_template,
+                    api_key=gemini_api_key,
+                    model_name=gemini_model,
+                )
+            except Exception as exc:
+                errors += len(batch)
+                logger.exception(
+                    "linkedin-posts classification batch error batch=%s/%s size=%s err=%s",
+                    bidx,
+                    len(batches),
+                    len(batch),
+                    exc,
+                )
+                continue
+            for row, decision in zip(batch, decisions):
+                enriched = dict(row)
+                enriched["is_relevant"] = bool(decision.get("is_relevant"))
+                enriched["role_category"] = str(decision.get("role_category", ""))
+                enriched["priority"] = str(decision.get("priority", ""))
+                enriched["reason"] = str(decision.get("reason", ""))
+                enriched["confidence"] = decision.get("confidence", 0)
+                if enriched["is_relevant"]:
+                    relevant_rows.append(enriched)
+            logger.info(
+                "linkedin-posts classification batch=%s/%s completed relevant_total=%s errors=%s",
+                bidx,
+                len(batches),
+                len(relevant_rows),
+                errors,
+            )
+        logger.info(
+            "linkedin-posts classification completed mode=%s relevant=%s errors=%s",
+            mode,
+            len(relevant_rows),
+            errors,
+        )
+        return relevant_rows, errors
+
     for idx, row in enumerate(rows, start=1):
         try:
             decision = _classify_single_post(
@@ -340,6 +396,25 @@ def _parse_json_obj(raw_text: str) -> dict[str, Any]:
     return parsed
 
 
+def _parse_json_array(raw_text: str) -> list[Any]:
+    text = raw_text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.lower().startswith("json"):
+            text = text[4:].strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("[")
+        end = text.rfind("]")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        parsed = json.loads(text[start : end + 1])
+    if not isinstance(parsed, list):
+        raise ValueError("Classifier output must be a JSON array.")
+    return parsed
+
+
 def _normalize_classifier_decision(parsed: dict[str, Any]) -> dict[str, Any]:
     if "is_relevant" in parsed:
         return parsed
@@ -352,6 +427,82 @@ def _normalize_classifier_decision(parsed: dict[str, Any]) -> dict[str, Any]:
             "confidence": parsed.get("confidence", 0),
         }
     return parsed
+
+
+def _classify_batch_posts_with_gemini(
+    *,
+    rows: list[dict[str, Any]],
+    prompt: str,
+    api_key: str,
+    model_name: str,
+) -> list[dict[str, Any]]:
+    if genai is None:
+        raise RuntimeError("google-generativeai package is not installed.")
+    genai.configure(api_key=api_key)
+    model = genai.GenerativeModel(model_name)
+
+    compact_rows: list[dict[str, Any]] = []
+    for idx, row in enumerate(rows, start=1):
+        compact_rows.append(
+            {
+                "row": idx,
+                "post_text": (row.get("post_text") or "")[:2500],
+                "job_title_hint": row.get("job_title_hint"),
+                "company": row.get("company"),
+                "author_name": row.get("author_name"),
+                "author_profile_url": row.get("author_profile_url"),
+                "post_url": row.get("post_url"),
+                "search_query": row.get("search_query"),
+                "posted_at": row.get("posted_at"),
+            }
+        )
+
+    content = (
+        f"{prompt}\n\n"
+        "Classify EACH row in the JSON array below.\n"
+        "Return ONLY a JSON array with one object per row and keys: "
+        "row, relevant, reason, role_category, priority.\n"
+        f"{json.dumps(compact_rows, ensure_ascii=True)}"
+    )
+    response = _retry(action=lambda: model.generate_content(content), retries=3, initial_delay_seconds=1.0)
+    response_text = getattr(response, "text", "") or ""
+    try:
+        parsed = _parse_json_array(response_text)
+    except Exception as exc:
+        snippet = response_text[:1000].replace("\n", " ")
+        logger.error(
+            "linkedin-posts gemini batch parse error rows=%s model=%s err=%s response_snippet=%s",
+            len(rows),
+            model_name,
+            exc,
+            snippet,
+        )
+        raise
+    by_row: dict[int, dict[str, Any]] = {}
+    for item in parsed:
+        if not isinstance(item, dict):
+            continue
+        try:
+            row_idx = int(item.get("row"))
+        except (TypeError, ValueError):
+            continue
+        by_row[row_idx] = _normalize_classifier_decision(item)
+
+    decisions: list[dict[str, Any]] = []
+    for idx in range(1, len(rows) + 1):
+        decisions.append(
+            by_row.get(
+                idx,
+                {
+                    "is_relevant": False,
+                    "role_category": "",
+                    "priority": "",
+                    "reason": "Missing row decision from batch classifier.",
+                    "confidence": 0,
+                },
+            )
+        )
+    return decisions
 
 
 def _retry(action, retries: int, initial_delay_seconds: float):
@@ -367,6 +518,10 @@ def _retry(action, retries: int, initial_delay_seconds: float):
             sleep(delay)
             delay *= 2
     raise RuntimeError(f"Operation failed after {retries} attempts: {last_error}") from last_error
+
+
+def _chunk(items: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]]:
+    return [items[i : i + size] for i in range(0, len(items), size)]
 
 
 def _default_linkedin_posts_prompt() -> str:
@@ -512,15 +667,25 @@ def _post_linkedin_posts_slack_summary(
     slack_username = os.getenv("SLACK_USERNAME", "Karan Bot")
     slack_icon_emoji = os.getenv("SLACK_ICON_EMOJI", ":karandeep:")
 
-    summary_body = (
-        f"LinkedIn posts digest ({run_date})\n"
-        f"- Scraped posts: {len(scraped_rows)}\n"
-        f"- Relevant posts: {len(relevant_rows)}"
-    )
+    logger.info("linkedin-posts slack handover scraped=%s relevant=%s", len(scraped_rows), len(relevant_rows))
+
+    if not relevant_rows:
+        logger.info("linkedin-posts slack: no relevant posts to send")
+        return
+
+    owner_rows = load_owner_rows_for_handover()
+    if not owner_rows:
+        logger.warning(
+            "linkedin-posts handover: owner sheet unavailable; posting without owner assignment "
+            "(set GOOGLE_SPREADSHEET_ID and owner_slack_ID tab)"
+        )
+
+    # 1) Send the heading message
+    heading = ":rotating_light: *INCOMING LINKEDIN JOB POST VIA VALIDATED AUTHOR*"
     _retry(
         action=lambda: _post_slack_payload(
             webhook_url=slack_webhook_url,
-            text=summary_body,
+            text=heading,
             channel=slack_channel,
             username=slack_username,
             icon_emoji=slack_icon_emoji,
@@ -528,144 +693,30 @@ def _post_linkedin_posts_slack_summary(
         retries=3,
         initial_delay_seconds=1.0,
     ).raise_for_status()
+    sleep(1)
 
-    if not relevant_rows:
-        _retry(
-            action=lambda: _post_slack_payload(
-                webhook_url=slack_webhook_url,
-                text="No relevant LinkedIn hiring posts in this run.",
-                channel=slack_channel,
-                username=slack_username,
-                icon_emoji=slack_icon_emoji,
-            ),
-            retries=3,
-            initial_delay_seconds=1.0,
-        ).raise_for_status()
-        return
+    # 2) Send one message per post with round-robin owner assignment
+    sent = 0
+    for idx, row in enumerate(relevant_rows):
+        author = _slack_author_from_row(row)
+        url = _slack_post_url_from_row(row)
 
-    use_handover = os.getenv("LINKEDIN_POSTS_OWNER_HANDOVER", "true").lower() in ("1", "true", "yes")
-    owner_rows = load_owner_rows_for_handover() if use_handover else None
-    if use_handover and not owner_rows:
-        logger.warning(
-            "linkedin-posts handover: owner sheet unavailable; posting without owner assignment "
-            "(set GOOGLE_SPREADSHEET_ID and owner_slack_ID tab)"
-        )
-
-    if owner_rows:
-        owner_buckets: dict[int, list[dict[str, Any]]] = {i: [] for i in range(len(owner_rows))}
-        for idx, row in enumerate(relevant_rows):
-            owner_buckets[idx % len(owner_rows)].append(row)
-
-        owner_sections: list[str] = []
-        for owner_idx, owner in enumerate(owner_rows):
-            bucket = owner_buckets.get(owner_idx, [])
-            if not bucket:
-                continue
+        if owner_rows:
+            owner = owner_rows[idx % len(owner_rows)]
             owner_name = (owner.get("owner_name") or "Owner").strip() or "Owner"
             owner_slack_id = (owner.get("owner_slack_id") or "").strip()
-            owner_email = (owner.get("owner_email") or "").strip()
-            owner_tag = f"<@{owner_slack_id}>" if owner_slack_id else owner_name
-            header = (
-                f"LinkedIn posts handover — {owner_name}\n"
-                f"Handover Owner: {owner_tag} ({owner_email or '-'})\n"
-                f"Posts in this block: {len(bucket)}"
-            )
-            _retry(
-                action=lambda h=header: _post_slack_payload(
-                    webhook_url=slack_webhook_url,
-                    text=h,
-                    channel=slack_channel,
-                    username=slack_username,
-                    icon_emoji=slack_icon_emoji,
-                ),
-                retries=3,
-                initial_delay_seconds=1.0,
-            ).raise_for_status()
-            sleep(1)
+            owner_tag = f"*{owner_name}* (<@{owner_slack_id}>)" if owner_slack_id else f"*{owner_name}*"
+        else:
+            owner_tag = "*Unassigned*"
 
-            entries: list[str] = []
-            for row in bucket:
-                author = _slack_author_from_row(row)
-                company = _slack_company_from_row(row)
-                role_category = _slack_display_field(row.get("role_category"))
-                priority = _slack_display_field(row.get("priority"))
-                posted_at = _slack_display_field(row.get("posted_at"))
-                query = _slack_display_field(row.get("search_query"))
-                url = _slack_post_url_from_row(row)
-                reason = _slack_display_field(row.get("reason"))
-
-                entries.append(
-                    f"Author: {author}\n"
-                    f"Company: {company}\n"
-                    f"Role Category: {role_category}\n"
-                    f"Priority: {priority}\n"
-                    f"Posted At: {posted_at}\n"
-                    f"Query: {query}\n"
-                    f"URL : {url}\n"
-                    f"Reason: {reason}"
-                )
-            owner_sections.append(
-                f"*Owner : {owner_tag} ({owner_email or '-'})*\n" + "\n\n".join(entries)
-            )
-
-        case_prefix = (
-            ":rotating_light: *INCOMING LINKEDIN JOB POST VIA VALIDATED AUTHOR*\n"
-            "Note : Please consume the lead in next 2 hours\n"
-            "---\n"
+        message = (
+            f"{owner_tag}\n"
+            f"{url}\n"
+            f'This is lead posted by author "{author}"\n'
+            "Note: Please consume the lead in next 2 hours and update"
         )
-        for chunk in _chunk_slack_entries(prefix=case_prefix, entries=owner_sections):
-            _retry(
-                action=lambda m=chunk: _post_slack_payload(
-                    webhook_url=slack_webhook_url,
-                    text=m,
-                    channel=slack_channel,
-                    username=slack_username,
-                    icon_emoji=slack_icon_emoji,
-                ),
-                retries=3,
-                initial_delay_seconds=1.0,
-            ).raise_for_status()
-            sleep(1)
-        _post_linkedin_posts_handover_data_summary(
-            webhook_url=slack_webhook_url,
-            channel=slack_channel,
-            username=slack_username,
-            icon_emoji=slack_icon_emoji,
-            leads_scraped=len(scraped_rows),
-            relevant=len(relevant_rows),
-            handover=len(relevant_rows),
-        )
-        return
-
-    entries: list[str] = []
-    for row in relevant_rows:
-        author = _slack_author_from_row(row)
-        company = _slack_company_from_row(row)
-        role_category = _slack_display_field(row.get("role_category"))
-        priority = _slack_display_field(row.get("priority"))
-        posted_at = _slack_display_field(row.get("posted_at"))
-        query = _slack_display_field(row.get("search_query"))
-        url = _slack_post_url_from_row(row)
-        reason = _slack_display_field(row.get("reason"))
-
-        entries.append(
-            f"Author: {author}\n"
-            f"Company: {company}\n"
-            f"Role Category: {role_category}\n"
-            f"Priority: {priority}\n"
-            f"Posted At: {posted_at}\n"
-            f"Query: {query}\n"
-            f"URL : {url}\n"
-            f"Reason: {reason}"
-        )
-    prefix = (
-        ":rotating_light: *INCOMING LINKEDIN JOB POST VIA VALIDATED AUTHOR*\n"
-        "Note : Please consume the lead in next 2 hours\n"
-        "---\n"
-    )
-    for chunk in _chunk_slack_entries(prefix=prefix, entries=entries):
         _retry(
-            action=lambda m=chunk: _post_slack_payload(
+            action=lambda m=message: _post_slack_payload(
                 webhook_url=slack_webhook_url,
                 text=m,
                 channel=slack_channel,
@@ -675,49 +726,11 @@ def _post_linkedin_posts_slack_summary(
             retries=3,
             initial_delay_seconds=1.0,
         ).raise_for_status()
+        sent += 1
         sleep(1)
-    _post_linkedin_posts_handover_data_summary(
-        webhook_url=slack_webhook_url,
-        channel=slack_channel,
-        username=slack_username,
-        icon_emoji=slack_icon_emoji,
-        leads_scraped=len(scraped_rows),
-        relevant=len(relevant_rows),
-        handover=len(relevant_rows),
-    )
 
+    logger.info("linkedin-posts handover sent heading + %s individual post messages", sent)
 
-def _post_linkedin_posts_handover_data_summary(
-    *,
-    webhook_url: str,
-    channel: str,
-    username: str,
-    icon_emoji: str,
-    leads_scraped: int,
-    relevant: int,
-    handover: int,
-) -> None:
-    message = (
-        "Data:\n"
-        f"Leads Scraped: {leads_scraped}\n"
-        f"Relevant: {relevant}\n"
-        f"Handover: {handover}\n"
-        "Internal POC: 0\n"
-        "Recruiter Detail available: 0\n"
-        "Lead Type = Linkedin Post"
-    )
-    _retry(
-        action=lambda m=message: _post_slack_payload(
-            webhook_url=webhook_url,
-            text=m,
-            channel=channel,
-            username=username,
-            icon_emoji=icon_emoji,
-        ),
-        retries=3,
-        initial_delay_seconds=1.0,
-    ).raise_for_status()
-    sleep(1)
 
 
 def _chunk_slack_entries(prefix: str, entries: list[str]) -> list[str]:

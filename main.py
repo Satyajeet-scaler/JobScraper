@@ -123,40 +123,53 @@ def validate_internal_trigger_token(internal_token: Optional[str]) -> None:
         )
 
 
+def _cron_today() -> str:
+    """Return today's date as YYYY-MM-DD in the cron timezone, not the server system timezone."""
+    from datetime import datetime
+    tz = ZoneInfo(os.getenv("CRON_TIMEZONE", "Asia/Kolkata"))
+    return datetime.now(tz).strftime("%Y-%m-%d")
+
+
 def _run_scrape_jobs_from_scheduler() -> None:
     run_id = str(uuid.uuid4())
-    logger.info("scheduler triggered scrape-only run_id=%s", run_id)
-    run_scrape_jobs_only(run_id=run_id, run_date=None)
+    run_date = _cron_today()
+    logger.info("scheduler triggered scrape-only run_id=%s run_date=%s", run_id, run_date)
+    run_scrape_jobs_only(run_id=run_id, run_date=run_date)
 
 
 def _run_classify_relevant_from_scheduler() -> None:
     run_id = str(uuid.uuid4())
-    logger.info("scheduler triggered classify-only run_id=%s", run_id)
-    run_classify_relevant_only(run_id=run_id, run_date=None)
+    run_date = _cron_today()
+    logger.info("scheduler triggered classify-only run_id=%s run_date=%s", run_id, run_date)
+    run_classify_relevant_only(run_id=run_id, run_date=run_date)
 
 
 def _run_recruiter_info_from_scheduler() -> None:
     run_id = str(uuid.uuid4())
-    logger.info("scheduler triggered recruiter-info run_id=%s", run_id)
-    run_recruiter_info_extraction(run_id=run_id, run_date=None)
+    run_date = _cron_today()
+    logger.info("scheduler triggered recruiter-info run_id=%s run_date=%s", run_id, run_date)
+    run_recruiter_info_extraction(run_id=run_id, run_date=run_date)
 
 
 def _run_linkedin_posts_scrape_from_scheduler() -> None:
     run_id = str(uuid.uuid4())
-    logger.info("scheduler triggered linkedin-posts-scrape run_id=%s", run_id)
-    run_linkedin_posts_scrape_only(run_id=run_id, run_date=None)
+    run_date = _cron_today()
+    logger.info("scheduler triggered linkedin-posts-scrape run_id=%s run_date=%s", run_id, run_date)
+    run_linkedin_posts_scrape_only(run_id=run_id, run_date=run_date)
 
 
 def _run_linkedin_posts_classify_from_scheduler() -> None:
     run_id = str(uuid.uuid4())
-    logger.info("scheduler triggered linkedin-posts-classify run_id=%s", run_id)
-    run_linkedin_posts_classify_only(run_id=run_id, run_date=None)
+    run_date = _cron_today()
+    logger.info("scheduler triggered linkedin-posts-classify run_id=%s run_date=%s", run_id, run_date)
+    run_linkedin_posts_classify_only(run_id=run_id, run_date=run_date)
 
 
 def _run_slack_handover_from_scheduler() -> None:
-    logger.info("scheduler triggered slack-handover")
+    run_date = _cron_today()
+    logger.info("scheduler triggered slack-handover run_date=%s", run_date)
     summary = send_handover_notifications(
-        run_date=None,
+        run_date=run_date,
         send_linkedin_post=True,
         send_recruiter_info=True,
         send_internal_poc=True,

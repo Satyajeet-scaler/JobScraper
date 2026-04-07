@@ -945,13 +945,36 @@ def _post_recruiter_handover_notifications(run_date: str) -> int:
         owner_email = (owner.get("owner_email") or "").strip()
         owner_tag = f"<@{owner_slack_id}>" if owner_slack_id else owner_name
 
-        for row in assigned_rows:
+        # Heading per owner block so Slack shows grouped context.
+        owner_header = (
+            f"Recruiter handover — {owner_name}\n"
+            f"Handover Owner: {owner_tag} ({owner_email or '-'})\n"
+            f"Rows in this block: {len(assigned_rows)}\n"
+            f"Run date: {run_date}"
+        )
+        _retry(
+            action=lambda h=owner_header: _post_slack_payload(
+                webhook_url=slack_webhook_url,
+                text=h,
+                channel=slack_channel,
+                username=slack_username,
+                icon_emoji=slack_icon_emoji,
+            ),
+            retries=3,
+            initial_delay_seconds=1.0,
+        ).raise_for_status()
+        sleep(1)
+
+        for row_idx, row in enumerate(assigned_rows, start=1):
             company = (row.get("company") or "-").strip() or "-"
             title = (row.get("title") or "-").strip() or "-"
             platform = _pretty_platform_label(row.get("site"))
             job_url = (row.get("job_url") or "-").strip() or "-"
             recruiter_profile_url = (row.get("recruiter_profile_url") or "").strip()
             recruiter_email = (row.get("recruiter_email") or "").strip()
+
+            # Subheading per job for quick scanning within an owner's block.
+            subheading = f"Job {row_idx}/{len(assigned_rows)} — {company} | {title} ({platform})"
 
             if recruiter_profile_url:
                 handover_line = f"Handover Owner: {owner_tag} ({owner_email or '-'})"
@@ -965,6 +988,7 @@ def _post_recruiter_handover_notifications(run_date: str) -> int:
                 handover_line = f"Handover Owner: {owner_tag} ({owner_email or '-'})"
                 recruiter_line = f"{internal_line}"
             message = (
+                f"{subheading}\n"
                 f"Company Name: {company}\n"
                 f"Title: {title}\n"
                 f"Platform: {platform}\n"

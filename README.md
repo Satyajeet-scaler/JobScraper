@@ -107,3 +107,27 @@ curl "http://127.0.0.1:8000/jobs?site_name=linkedin&site_name=indeed&search_term
 ### Site-specific constraints
 
 - Google: requires `google_search_term`
+
+## HireCafe Cloudflare Strategy
+
+The HireCafe scraper now uses a guarded Cloudflare flow in browser mode:
+
+- initial wait after page load
+- challenge detection using page markers
+- iframe checkbox click attempt + fallback coordinate click
+- wait for challenge clearance
+- post-verification wait so job APIs can load
+- randomized scrolling delay to avoid fixed timing patterns
+
+Tune via environment variables:
+
+- `HIRECAFE_CLOUDFLARE_WAIT_SECONDS` (default `10`)
+- `HIRECAFE_CF_CLEAR_TIMEOUT_SECONDS` (default `35`)
+- `HIRECAFE_POST_VERIFY_WAIT_SECONDS` (default `8`)
+- `HIRECAFE_CF_CLICK_X` / `HIRECAFE_CF_CLICK_Y` (default `544` / `334`)
+- `HIRECAFE_MIN_SCROLL_DELAY_SECONDS` / `HIRECAFE_MAX_SCROLL_DELAY_SECONDS` (default `0.7` / `1.8`)
+- `HIRECAFE_SCROLL_PIXELS` (default `1200`)
+- `HIRECAFE_MAX_RUNTIME_SECONDS` (default `300`)
+- `HIRECAFE_MAX_IDLE_SECONDS` (default `90`)
+- `HIRECAFE_MAX_SCROLLS` (default `500`)
+- `HIRECAFE_HEARTBEAT_EVERY_SECONDS` (default `15`)

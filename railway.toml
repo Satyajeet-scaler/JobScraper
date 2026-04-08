@@ -28,6 +28,16 @@
 # These contacts are used as fallback recruiter_email rows in recruiters_info_{date}
 # Optional: HIRECAFE_ENABLED=false — disable HireCafe in daily scrape pipeline (default: enabled)
 # Optional: HIRECAFE_MAX_SAMPLES=200 — max job payloads to capture per HireCafe run
+# Optional: HIRECAFE_CLOUDFLARE_WAIT_SECONDS=10 — initial wait after page load
+# Optional: HIRECAFE_CF_CLEAR_TIMEOUT_SECONDS=35 — max time to wait for Cloudflare challenge to clear
+# Optional: HIRECAFE_POST_VERIFY_WAIT_SECONDS=8 — extra wait after challenge clears before scrolling
+# Optional: HIRECAFE_CF_CLICK_X=544 and HIRECAFE_CF_CLICK_Y=334 — fallback click coordinates
+# Optional: HIRECAFE_MIN_SCROLL_DELAY_SECONDS=0.7 and HIRECAFE_MAX_SCROLL_DELAY_SECONDS=1.8 — randomized scroll delay window
+# Optional: HIRECAFE_SCROLL_PIXELS=1200
+# Optional: HIRECAFE_MAX_RUNTIME_SECONDS=300
+# Optional: HIRECAFE_MAX_IDLE_SECONDS=90
+# Optional: HIRECAFE_MAX_SCROLLS=500
+# Optional: HIRECAFE_HEARTBEAT_EVERY_SECONDS=15
 # Optional: HIRECAFE_GOOGLE_SPREADSHEET_ID — sheet for standalone /internal/run-hirecafe-scrape (falls back to GOOGLE_SPREADSHEET_ID)
 # Optional: HIRECAFE_SCRAPED_TAB_TEMPLATE=hirecafe_scraped_jobs_{date}
 # Optional: APP_LOG_LEVEL, Google/Slack keys used by services/pipeline.py, etc.

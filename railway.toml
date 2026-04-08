@@ -26,6 +26,10 @@
 # Optional: OWNER_SHEET_NAME=owner_slack_ID
 # Optional: LINKEDIN_POSTS_OWNER_HANDOVER=true — LinkedIn post Slack uses same owner round-robin + grouped blocks as job handover
 # These contacts are used as fallback recruiter_email rows in recruiters_info_{date}
+# Optional: HIRECAFE_ENABLED=true — include HireCafe (hiring.cafe) in the daily scrape pipeline (default: false)
+# Optional: HIRECAFE_MAX_SAMPLES=200 — max job payloads to capture per HireCafe run
+# Optional: HIRECAFE_GOOGLE_SPREADSHEET_ID — sheet for standalone /internal/run-hirecafe-scrape (falls back to GOOGLE_SPREADSHEET_ID)
+# Optional: HIRECAFE_SCRAPED_TAB_TEMPLATE=hirecafe_scraped_jobs_{date}
 # Optional: APP_LOG_LEVEL, Google/Slack keys used by services/pipeline.py, etc.
 #
 [build]

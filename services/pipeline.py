@@ -23,6 +23,7 @@ from services.slack_handover_notify import (
     send_slack_text,
 )
 from services.apify_naukri import normalize_naukri_item, scrape_naukri_jobs
+from services.hire_cafe import normalize_hirecafe_item, scrape_hirecafe_jobs
 try:
     import google.generativeai as genai
 except ImportError:  # pragma: no cover - optional dependency behavior
@@ -250,6 +251,28 @@ def _scrape_target_jobs() -> list[dict[str, Any]]:
             logger.warning("naukri scrape failed: %s", exc)
     else:
         logger.info("naukri scrape skipped (APIFY_TOKEN not set)")
+
+    # HireCafe via undetected-chromedriver (requires xvfb virtual display)
+    if os.getenv("HIRECAFE_ENABLED", "false").lower() in ("1", "true", "yes"):
+        hirecafe_max = int(os.getenv("HIRECAFE_MAX_SAMPLES", "200"))
+        logger.info("hirecafe scrape starting max_samples=%s", hirecafe_max)
+        try:
+            hirecafe_raw = _retry(
+                action=lambda: scrape_hirecafe_jobs(max_samples=hirecafe_max),
+                retries=2,
+                initial_delay_seconds=5.0,
+            )
+            hirecafe_items: list[dict[str, Any]] = []
+            for raw in hirecafe_raw:
+                normalized = normalize_hirecafe_item(raw)
+                normalized["role_query"] = "hire.cafe"
+                hirecafe_items.append(normalized)
+            logger.info("hirecafe scrape completed fetched=%s", len(hirecafe_items))
+            all_jobs.extend(hirecafe_items)
+        except Exception as exc:
+            logger.warning("hirecafe scrape failed: %s", exc)
+    else:
+        logger.info("hirecafe scrape skipped (HIRECAFE_ENABLED not set)")
 
     for role in TARGET_ROLES:
         logger.info(

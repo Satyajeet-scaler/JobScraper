@@ -15,6 +15,9 @@ from typing import Any, Optional
 
 import undetected_chromedriver as uc
 from bs4 import BeautifulSoup
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 logger = logging.getLogger(__name__)
 
@@ -60,18 +63,48 @@ def scrape_hirecafe_jobs(max_samples: int = 200) -> list[dict[str, Any]]:
         driver.get(HIRECAFE_SEARCH_URL)
 
         logger.info("hirecafe waiting %ss for Cloudflare validation", CLOUDFLARE_WAIT_SECONDS)
-        time.sleep(CLOUDFLARE_WAIT_SECONDS)
+        time.sleep(5)
+
+        try:
+            iframes = driver.find_elements(By.TAG_NAME, "iframe")
+            for iframe in iframes:
+                src = iframe.get_attribute("src")
+                if src and "cloudflare" in src.lower():
+                    logger.info("Found Cloudflare iframe, attempting to click checkbox")
+                    driver.switch_to.frame(iframe)
+                    checkbox = WebDriverWait(driver, 5).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='checkbox'], .ctp-checkbox-container, .mark"))
+                    )
+                    checkbox.click()
+                    logger.info("Clicked Cloudflare checkbox")
+                    driver.switch_to.default_content()
+                    time.sleep(5)
+                    break
+        except Exception as e:
+            logger.info("No Cloudflare checkbox found or failed to click: %s", type(e).__name__)
+            driver.switch_to.default_content()
+
+        time.sleep(max(0, CLOUDFLARE_WAIT_SECONDS - 5))
 
         job_samples: list[dict[str, Any]] = []
         logger.info("hirecafe starting scroll loop")
 
+        empty_scrolls = 0
+        MAX_EMPTY_SCROLLS = 15
+        loop_start_time = time.time()
+
         while len(job_samples) < max_samples:
+            if time.time() - loop_start_time > 60:
+                logger.warning("hirecafe stopping scroll: exceeded 1 minute timeout, captured=%d", len(job_samples))
+                break
+
             try:
                 driver.execute_script("window.scrollBy(0, %d);" % SCROLL_PIXELS)
             except Exception:
                 pass
 
             logs = driver.get_log("performance")
+            found_new = False
             for log_entry in logs:
                 try:
                     message = json.loads(log_entry["message"])["message"]
@@ -88,6 +121,7 @@ def scrape_hirecafe_jobs(max_samples: int = 200) -> list[dict[str, Any]]:
                     body = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": req_id})
                     job_data = json.loads(body["body"])
                     job_samples.append(job_data)
+                    found_new = True
                     logger.debug(
                         "hirecafe captured %s/%s url=%s",
                         len(job_samples), max_samples, url.split("/")[-1][:30],
@@ -99,6 +133,15 @@ def scrape_hirecafe_jobs(max_samples: int = 200) -> list[dict[str, Any]]:
 
             if len(job_samples) >= max_samples:
                 break
+            
+            if not found_new:
+                empty_scrolls += 1
+                if empty_scrolls >= MAX_EMPTY_SCROLLS:
+                    logger.warning("hirecafe stopping scroll: %d empty scrolls, captured=%d", empty_scrolls, len(job_samples))
+                    break
+            else:
+                empty_scrolls = 0
+
             time.sleep(SCROLL_PAUSE_SECONDS)
 
         logger.info("hirecafe scroll loop finished captured=%s", len(job_samples))

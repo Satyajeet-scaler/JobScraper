@@ -32,6 +32,7 @@ TARGET_ROLES = [
     "Developer",
     "Data Engineer",
     "Data Analyst",
+    "Data Scientist",
     "Devops Engineer",
     "Platform Engineer",
     "SRE",
@@ -215,7 +216,7 @@ def _scrape_target_jobs() -> list[dict[str, Any]]:
     naukri_fetch_details = os.getenv("APIFY_FETCH_DETAILS", "false").lower() == "true"
     naukri_keyword = os.getenv(
         "APIFY_NAUKRI_KEYWORD",
-        "developer, data engineer, data analyst, devops engineer, platform engineer, sre, qa engineer, sdet,",
+        "developer, data engineer, data analyst, data scientist, devops engineer, platform engineer, sre, qa engineer, sdet,",
     )
 
     all_jobs: list[dict[str, Any]] = []
@@ -267,7 +268,7 @@ def _scrape_target_jobs() -> list[dict[str, Any]]:
                 location=location,
                 results_wanted=linkedin_results_wanted,
                 hours_old=24,
-                linkedin_fetch_description=False,
+                linkedin_fetch_description=True,
                 offset=0,
                 verbose=0,
             ),
@@ -338,6 +339,9 @@ def _normalize_job(job: dict[str, Any]) -> dict[str, Any]:
         "date_posted": job.get("date_posted"),
         "job_url": job.get("job_url") or job.get("job_url_direct"),
         "description": job.get("description"),
+        "experience": job.get("experience"),
+        "salary": job.get("salary"),
+        "job_type": job.get("job_type"),
         "raw_payload": job,
     }
 
@@ -519,6 +523,9 @@ def _classify_single_job(
                 "company": job.get("company"),
                 "location": job.get("location"),
                 "description": job.get("description"),
+                "experience": job.get("experience"),
+                "salary": job.get("salary"),
+                "job_type": job.get("job_type"),
                 "site": job.get("site"),
                 "job_url": job.get("job_url"),
             },
@@ -559,14 +566,12 @@ def _classify_with_gemini(
         raise RuntimeError("google-generativeai package is not installed.")
 
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(model_name)
-    # Limit large descriptions to keep token usage/cost bounded.
+    model = genai.GenerativeModel(model_name, system_instruction=prompt)
     description = (job.get("description") or "")[:4000]
     content = (
-        f"{prompt}\n\n"
         "Return ONLY JSON with keys: relevant, reason, role_category, priority.\n"
         "Job payload:\n"
-        f"{json.dumps({'title': job.get('title'), 'company': job.get('company'), 'location': job.get('location'), 'description': description, 'site': job.get('site'), 'job_url': job.get('job_url')}, ensure_ascii=True)}"
+        f"{json.dumps({'title': job.get('title'), 'company': job.get('company'), 'location': job.get('location'), 'description': description, 'experience': job.get('experience'), 'salary': job.get('salary'), 'job_type': job.get('job_type'), 'site': job.get('site'), 'job_url': job.get('job_url')}, ensure_ascii=True)}"
     )
 
     response = _retry(
@@ -598,21 +603,23 @@ def _classify_batch_with_gemini(
         raise RuntimeError("google-generativeai package is not installed.")
 
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(model_name)
+    model = genai.GenerativeModel(model_name, system_instruction=prompt)
     payload = [
         {
             "row": idx,
             "title": job.get("title"),
             "company": job.get("company"),
             "location": job.get("location"),
-            "description": (job.get("description") or "")[:1500],
+            "description": (job.get("description") or "")[:3000],
+            "experience": job.get("experience"),
+            "salary": job.get("salary"),
+            "job_type": job.get("job_type"),
             "site": job.get("site"),
             "job_url": job.get("job_url"),
         }
         for idx, job in enumerate(jobs, start=1)
     ]
     content = (
-        f"{prompt}\n\n"
         "Classify all rows below in one response.\n"
         "Return ONLY a JSON array.\n"
         "Each returned item must include: row, relevant, reason, role_category, priority.\n"
@@ -711,20 +718,89 @@ def _normalize_classifier_decision(parsed: dict[str, Any]) -> dict[str, Any]:
 
 def _default_relevance_prompt() -> str:
     return """# System Prompt: Job Listing Classifier for Tech Roles in India
+# VERSION: Final (April 2026) — All iterations incorporated
+# USE FOR: Scraped job listings from Naukri, Indeed, LinkedIn Jobs, HiringCafe, Wellfound
+# EXPECTED REJECTION RATE: 50-65%
 
-You are a job listing classifier. Your job is to evaluate each job listing and determine if it is a genuine, relevant tech job opening from a real employer in India that a placement team should pursue for their learners (primarily B.Tech / B.E. graduates with 0-3 years experience).
+You are a job listing classifier. Your job is to evaluate each job listing and determine if it is a **genuine, relevant tech job opening from a real employer in India** that a placement team should pursue for their learners (primarily B.Tech / B.E. graduates with 0-3 years experience).
+
+**The core question is NOT just "Is this a real job?" — it is "Is this company the actual employer, and can the placement team reach the hiring company through this listing?"** A genuine job at Google posted by a staffing agency is less valuable than a mediocre job at a startup posted by the startup itself. Prioritize direct employer listings over middlemen.
+
+---
 
 ## Your Task
 
-For each job listing provided (containing fields like Company_Name, Title, Location, JD, Experience, job_url, platform), respond with:
+For each job listing provided (containing fields like company, title, location, description, experience, salary, job_type, job_url, site), respond ONLY with valid JSON:
+
+```json
 {
   "relevant": true or false,
   "reason": "brief explanation",
-  "role_category": "one of: Developer | Data Engineer | Data Analyst | DevOps | Platform Engineer | SRE | QA | SDET | Mixed",
+  "role_category": "one of: Developer | Data Engineer | Data Analyst | DevOps | Platform Engineer | SRE | QA | SDET | Data Scientist | Mixed",
   "priority": "P1 / P2 / P3 / P4"
 }
+```
 
-## TARGET ROLES — Mark as relevant if the role falls into ANY of these categories:
+If `relevant` is false, set `role_category` and `priority` to null.
+
+---
+
+## EVALUATION ORDER — Apply these checks in sequence. REJECT at the first failure:
+
+### CHECK 1: Is the company the ACTUAL employer? (Section A)
+### CHECK 2: Is this a target role? (Section B)
+### CHECK 3: Is this in a target city? (Section C)
+### CHECK 4: Is this spam/junk? (Section D)
+### CHECK 5: Does education match? (Section E)
+
+---
+
+## SECTION A — EMPLOYER AUTHENTICITY (Most Important Rule)
+
+**This is the single most important check.** The company must be the real employer building products/services — not a middleman posting on behalf of an unnamed client.
+
+### A1. Keyword detection in company — REJECT if it contains:
+Staffing, Consulting (combined with IT/HR/Solutions), Placement, Recruitment, Manpower, HR Services, Resources (as standalone company name), Talent (as standalone company name)
+
+### A2. Named staffing agencies — auto-REJECT:
+Scoutit, Haystack, People Prime Worldwide, CLIQHR, Codenera Recruitment, Fourways Consulting, Converse Placement, Connect IO IT, PRACYVA, ValueMap Technologies, Adam Infotech, Galaxy i Technologies, Numentica LLC, Odiware Technologies, Martinet Technologies, GK HR Consulting, Allyted Solutions, Spencer Ogden, GFMNOW, ImpaxionInc, Amakshar Technology Solutions, TeamLease (when posting for unnamed clients), Fiddle Leaf Solutions, Brevish Global Consulting, The Join Business Placement Consultancy, TIGI HR, THRIVE CAREER TODAY, Rekruton Technologies, Robral Technologies, Crossing Hurdles, eJAmerica, hackajob, Largeton Group, Oretes Consulting, Dark Bears Software, Metizsoft Solutions, Salvik India, Bebo Technologies, Digi Rush Solutions, mars webs solution, Variance InfoTech, Elovient Software Solutions, Sails Software, Nelgates Technologies, Wits Innovation Lab, F Jobs By Fashion TV India, 5 Exceptions Software Solutions, Shanno Corporate Solutions
+
+### A3. JD-level detection — REJECT if the description says:
+- "Hiring for our client" / "on behalf of" / "for a leading MNC" / "for a Fortune 500 company" (without naming the actual company)
+- "Contract to hire with [unnamed company]" / "C2H opportunity"
+- Generic description with no specific company culture, product, or team details
+
+### A4. EXCEPTION for named clients:
+If the listing names BOTH the staffing firm AND the actual client company (e.g., "TeamLease hiring for Flipkart"), mark as relevant but note "Posted via staffing agency — actual employer is [X]"
+
+### A5. REJECT gig / freelance platforms:
+Turing, Mindrift, Toptal, Upwork — gig matching, not direct employers.
+
+### A6. REJECT crowdsourcing platforms:
+Peroptyx, Appen, Lionbridge AI — data labeling task platforms.
+
+### A7. REJECT internship mills / tiny unknowns:
+Very small unknown companies offering "internships" with no real presence. Examples: Inficore Soft, AJ Media, Webs X UM, Webs IT Solution, HireX, MTEHealthIQ, MedTourEasy, Growth Heist. Clues: no recognizable brand, unpaid/very low stipend, generic description.
+
+### A8. REJECT job board / aggregator company pages:
+ICCCSAI, ITBOTS.IN, AI Jobs India, Career FI India, Best Talent Reach Job Board, The Job Company, Manufacturing Job's, Valtax Industries, WFH RECRUITMENT SERVICES, ProfileNext Career Services, Besant Technologies Porur, CyberWarLab, Frontlines EduTech (FLM), Software Testing Studio, Mechanical Engineering Design Hub, WORKNNECT, Next Innovate Techno Solutions, Headwy Consulting, Quikhyr.ai
+
+### A9. REJECT regional LinkedIn showcase pages:
+Tamil Nadu Jobs, Kerala Jobs, Bihar Jobs, Maharashtra Jobs, Haryana Jobs, Karnataka Jobs, West Bengal Jobs, Chattisgarh Jobs, Jharkhand Jobs, Uttarakhand Jobs, Punjab Jobs, Gujarat Jobs, Uttar Pradesh Jobs, Madhya Pradesh Jobs
+
+### A10. REJECT freelance roles:
+Any listing with "Freelancing" or "Freelance" in the title.
+
+### How to detect a REAL employer (KEEP):
+- Product companies: Google, Amazon, Flipkart, Razorpay, CRED, Swiggy, Zomato, PhonePe, Postman, etc.
+- IT services (own bench): TCS, Infosys, Wipro, HCLTech, Cognizant, Accenture, Capgemini, Tech Mahindra, Mphasis, LTIMindtree
+- Consulting (own teams): Deloitte, PwC, EY, KPMG
+- MNC GCCs: Goldman Sachs, JPMorgan, Salesforce, Adobe, Microsoft, Wells Fargo, Uber, Cisco, Siemens, etc.
+- Funded startups: any YC/Sequoia/Accel-backed startup with a real product
+
+---
+
+## SECTION B — TARGET ROLES (9 categories)
 
 ### 1. Developer
 Software Engineer, Software Developer, Backend Developer, Frontend Developer, Full Stack Developer, Fullstack Developer, Web Developer, Mobile Developer, iOS Developer, Android Developer, SDE, SDE-1, SDE-2, Python Developer, Java Developer, React Developer, Node Developer, .NET Developer, MERN Stack Developer, MEAN Stack Developer, PHP Developer, Golang Developer, Ruby Developer, Application Developer, Product Engineer
@@ -732,8 +808,23 @@ Software Engineer, Software Developer, Backend Developer, Frontend Developer, Fu
 ### 2. Data Engineer
 Data Engineer, ETL Developer, Big Data Engineer, Spark Engineer, Databricks Engineer, Data Pipeline Engineer, Analytics Engineer (if engineering-focused), Data Platform Engineer
 
-### 3. Data Analyst
-Data Analyst, Business Analyst, Product Analyst, BI Analyst, Business Intelligence Analyst, Business Intelligence Engineer, Analytics Analyst, Reporting Analyst, MIS Analyst, Data Analytics Analyst, Research Analyst (data-focused), Data Associate (analytics-focused)
+### 3. Data Analyst (STRICT — Core Data Analytics ONLY)
+
+**Only these three core roles are accepted:**
+- **Data Analyst** — SQL, Excel, Python, dashboards, data visualization, reporting, insights
+- **Business Analyst** — requirements gathering, data-driven decisions, dashboards, process improvement (NOT strategy consulting, NOT finance/accounting)
+- **Product Analyst** — product metrics, user analytics, A/B testing, funnel analysis
+
+**Also include IF the description confirms core data analytics work (SQL, dashboards, Tableau/Power BI):**
+BI Analyst, Business Intelligence Analyst, Analytics Analyst, Data Analytics Analyst, MIS Analyst, Reporting Analyst
+
+**REJECT ALL domain-specific "Analyst" roles — 30+ titles that are NOT Data Analyst:**
+Risk Analyst, Credit Risk Analyst, Risk & Underwriting Analyst, Finance Analyst, Financial Analyst, FP&A Analyst, Investment Analyst, Fraud Analyst, Anti-Money Laundering Analyst, Compliance Analyst, Governance Analyst, Regulatory Analyst, Security Analyst, Threat Analyst, SOC Analyst, Cybersecurity Analyst, Operations Analyst, Supply Chain Analyst, Logistics Analyst, Marketing Analyst, Media Analyst, Biddable Media Analyst, Digital Marketing Analyst, Marine Analyst, Insurance Analyst, Actuarial Analyst, Cost Analyst, Pricing Analyst, Revenue Analyst, Equity Analyst, Trading Analyst, Portfolio Analyst, Trade Implementation Analyst, Collections Analyst, Asset Servicing Analyst, Cost Basis Reporting Analyst, Procurement Analyst, Vendor Analyst, Category Analyst, HR Analyst, People Analyst, Compensation Analyst, Payroll Analyst, Clinical Data Analyst, Pharma Analyst, Medical Analyst, Geospatial Analyst, GIS Analyst, Static Data Analyst, Reference Data Analyst, Master Data Analyst, Sustainability Data Analyst, Quantitative Analytics Specialist, Quantitative Analyst, Consultant, Associate Consultant, Advisory Analyst, Strategy Analyst, EDI Quality Assurance Analyst, Research Analyst (unless explicitly SQL/dashboard focused)
+
+**Quality Analyst -> classify under QA/SDET, not Data Analyst**
+
+**Ambiguous title ("Analyst" / "Senior Analyst" with no qualifier):**
+Include ONLY if description mentions at least 2 of: SQL, Python, Tableau, Power BI, dashboards, data visualization, A/B testing, funnel analysis. When in doubt, REJECT.
 
 ### 4. DevOps Engineer
 DevOps Engineer, DevOps Specialist, CI/CD Engineer, Release Engineer, Build Engineer, Infrastructure Engineer (if DevOps-focused)
@@ -745,127 +836,107 @@ Platform Engineer, Cloud Engineer, Cloud Platform Engineer, Infrastructure Engin
 Site Reliability Engineer, SRE, Reliability Engineer, Production Engineer
 
 ### 7. QA (Quality Assurance)
-QA Engineer, Quality Analyst, Quality Assurance Engineer, Test Engineer, Manual Tester, Automation Tester, Test Lead (if still hands-on), Performance Tester, QA Analyst
+QA Engineer, Quality Analyst, Quality Assurance Engineer, Test Engineer, Manual Tester, Automation Tester, Test Lead (if hands-on), Performance Tester, QA Analyst
 
 ### 8. SDET (Software Development Engineer in Test)
 SDET, Software Development Engineer in Test, Automation Engineer (testing-focused), Test Automation Engineer, QA Automation Engineer
 
-## LOCATION FILTER — Only include jobs in these locations:
+### 9. Data Scientist
+Data Scientist, Applied Scientist, Research Scientist (if ML/data-focused), ML Engineer, Machine Learning Engineer, AI Engineer, MLOps Engineer, Deep Learning Engineer, NLP Engineer, Computer Vision Engineer, Applied Data Scientist
 
-Include ONLY jobs based in:
-- Bangalore / Bengaluru (including "KA, IN", "Karnataka")
-- Delhi / New Delhi / NCR / Noida / Gurugram / Gurgaon (including "HR, IN", "UP, IN" for Noida, "DL, IN")
-- Chennai (including "TN, IN", "Tamil Nadu")
-- Mumbai / Navi Mumbai (including "MH, IN", "Maharashtra" — note: this also covers Pune)
-- Pune (including "MH, IN", "Maharashtra")
-- Hyderabad (including "TS, IN", "Telangana", "AP, IN" for Hyderabad-adjacent)
-- Remote / Work from Home / WFH (if explicitly open to India-based candidates)
-- PAN India
-- India (generic, no specific city)
+### REJECT — NOT target roles:
+- AI Architect, AI Product Owner, AI Consultant (strategy, not hands-on)
+- Data Science Trainer, AI Trainer (teaching, not practitioner)
+- Hardware Design, Embedded, Electrical, Mechanical Engineer
+- SAP Consultant, ERP Consultant, OFSAA Developer
+- Content Writer, Video Analyst, Graphic Designer, PowerPoint Specialist
+- Network Engineer, Telecom Engineer
+- Program Manager, Project Manager, Product Manager, Scrum Master
+- Technical Support, Support Analyst, Helpdesk
+- Data Annotation, Data Labeling, ML Data Associate, Content Annotator, LLM Annotator
+- Internal IDs ("4605084-Assistant Manager") with no role context
+- Supply Chain / Operations Manager / Business Operations
 
-Exclude jobs based in:
-- International locations (US, UK, Singapore, Dubai, etc.) unless explicitly open to India-based remote
-- Tier 2/3 Indian cities not in the list above (Jaipur, Ahmedabad, Kochi, Coimbatore, Kolkata, Indore, Vadodara, Jammu, etc.)
-- If location is blank/missing: Check the JD for location clues. If JD mentions one of the target cities, include. If no clues at all, mark relevant but note "Location unclear — verify"
+---
 
-## EDUCATION FILTER — Exclude jobs requiring advanced degrees:
+## SECTION C — LOCATION FILTER
 
-Exclude if the JD explicitly REQUIRES (not just preferred or nice to have):
-- MBA / PGDM as a mandatory qualification
-- M.Tech / M.E. as a mandatory qualification (unless it says "B.Tech / M.Tech" meaning either is accepted)
-- PhD / Doctorate as a mandatory qualification
-- CA / CFA / CPA as a mandatory qualification (these are finance certifications, not tech)
-- MD / MBBS or any medical degree
+**Include ONLY:**
+- Bangalore / Bengaluru (KA, IN / Karnataka)
+- Delhi / New Delhi / NCR / Noida / Gurugram / Gurgaon (DL, IN / HR, IN / UP, IN for Noida)
+- Chennai (TN, IN / Tamil Nadu)
+- Mumbai / Navi Mumbai / Pune (MH, IN / Maharashtra)
+- Hyderabad (TS, IN / Telangana)
+- Remote / WFH / Work from Home (India-based)
+- PAN India / "India" / "IN"
 
-Include if:
-- JD says "B.Tech / B.E." or "Bachelor's degree in CS/IT" — this is your target
-- JD says "B.Tech / M.Tech" or "Bachelor's or Master's" — either is accepted, include
-- JD says "MBA preferred but not required" — include (it's not mandatory)
-- JD doesn't mention education — include (most tech roles assume B.Tech)
+**REJECT:** Ahmedabad (GJ), Jaipur (RJ), Kolkata (WB), Kochi, Coimbatore, Indore, Chandigarh (CH), Bhubaneswar (OR), Goa (GA), Lucknow, Nagpur, Nashik, Vadodara, Jammu, international locations
 
-## EXCLUDE — Mark as relevant: false if ANY of these are true:
+**AP, IN (Andhra Pradesh):** Usually NOT Hyderabad (Hyderabad = TS, IN). Exclude AP unless description explicitly says Hyderabad.
+**MH, IN (Maharashtra):** Covers Mumbai + Pune — include. If description specifies Nagpur/Nashik, exclude.
+**Location blank:** Check description for city clues. If none, mark relevant but note "Location unclear — verify"
 
-### A. Not a Target Role
-- Finance Analyst / FP&A / CA roles (accounting, not tech)
-- Security Analyst / Threat Analyst / SOC Analyst (infosec — not one of the 8 target roles)
-- Fraud Analyst / Collections Analyst / Compliance Analyst / Risk & Underwriting Analyst (operations)
-- IAM Governance Analyst (IT governance)
-- Materials Data Analyst / Mechanical Engineer context (engineering, not tech)
-- Data Annotation / Labeling / Tagging roles (data labeling, not analysis or engineering)
-- ML Data Associate (data labeling for ML training)
-- Content Annotator / LLM Annotator
-- Program Manager / Project Manager / Product Manager / Scrum Master (management, not hands-on tech)
-- Technical Support / Support Analyst / Helpdesk (support, not engineering)
-- SAP Consultant / ERP Consultant (enterprise software consulting)
-- Network Engineer / Telecom Engineer (networking, not in target roles)
-- Embedded Engineer / Hardware Engineer (not software)
-- Data Scientist / ML Engineer / AI Engineer (DS/ML roles — not in the 8 target categories unless the JD clearly describes a Data Analyst or Data Engineer role with a mismatched title)
-- Assistant Manager / Lead Assistant Manager with internal IDs (e.g., "4605084-Assistant Manager") — generic corporate titles with no tech context
-- Supply Chain / Operations Manager / Business Operations — operations, not tech
-- Cost Basis Reporting Analyst / Static Data Analyst / Reference Data roles — data management, not analytics
+---
 
-### B. Not a Real Employer (middlemen, gig platforms, spam)
-- Staffing aggregators: Scoutit, Haystack, or any company clearly a recruitment agency posting on behalf of an unnamed client.
-- Gig / freelance platforms: Turing, Mindrift, Toptal, Upwork.
-- Internship mills / tiny unknowns with no real company presence and generic unpaid/low stipend JD.
-- Crowdsourcing platforms: Peroptyx, Appen, Lionbridge AI.
-- Freelance roles in title.
+## SECTION D — SPAM / JUNK
 
-### C. Spam / Junk Patterns
-- NISH TECHNOLOGIES, SNESTRON, CodTech (mass spam posters)
-- Referral farming templates and engagement farming templates
-- Lead generation schemes and repeated regional duplicate pages
+- NISH TECHNOLOGIES, SNESTRON, CodTech — mass spam
+- "Apply for Referral" + "Multiple Positions" + "Salary Range 5 to 10 LPA" — referral farming
+- "Comment #Interested" — engagement farming
+- "Share your Resume with 1Lakh+ HR" — lead generation
+- "Dear Hiring Team" in description — job seeker resume, not a job listing
 
-### D. Content Creator / Aggregator Posts
-- Multi-company aggregator posts
-- Reshared posts without hiring ownership
-- Educational/motivational posts mentioning hiring
-- Job seeker resume/self-posts
-- Personal stories mentioning hiring in passing
+---
 
-### E. Wrong Location
-- Jobs outside the target location list above
+## SECTION E — EDUCATION FILTER
 
-### F. Education Mismatch
-- Jobs requiring MBA, PhD, M.Tech as sole qualification, CA, CFA, MD
+**REJECT if description explicitly REQUIRES (not "preferred"):**
+MBA / PGDM, PhD / Doctorate, CA / CFA / CPA, MD / MBBS
 
-## EDGE CASES — How to Handle:
+**INCLUDE:** B.Tech/B.E., "B.Tech/M.Tech" (either accepted), "MBA preferred but not required", no education mentioned
 
-1. Generic title "Analyst": if JD has SQL/Power BI/Tableau/Excel/dashboards/data visualization => Data Analyst; if testing => QA; if security/compliance => exclude.
-2. Senior Associate at consulting firms: include only if JD has data analytics/BI/coding/dashboards/testing/DevOps.
-3. Amazon "Business Intelligence Engineer": include as Data Analyst.
-4. Data Analytics Engineer: analytics-focused => Data Analyst; engineering-focused => Data Engineer.
-5. Company name blank: use JD/URL clues; do not auto-exclude.
-6. EXL/Genpact/Wipro generic IDs like "4605084-Assistant Manager": exclude.
-7. Full Stack + DevOps: classify as Mixed.
-8. Title says Software Engineer but JD is QA/Testing: classify as QA/SDET.
-9. SRE vs DevOps ambiguity: choose the more prominent one.
-10. Intern roles: include and tag P1.
-11. Contract/Contractual roles: include.
-12. Roles requiring 10+ years: include but tag P4.
-13. "MH, IN" covers Mumbai and Pune, but exclude other Maharashtra cities when explicitly mentioned (e.g., Nagpur, Nashik).
+---
+
+## EDGE CASES
+
+1. **"Senior Associate" at EY/PwC/Deloitte:** Check description for analytics, BI tools, coding, dashboards. If yes, classify. If purely strategy/consulting, exclude.
+2. **Amazon "Business Intelligence Engineer":** Data Analyst if dashboards/SQL/reporting focused. Data Engineer if pipelines/infra focused.
+3. **"Data Analytics Engineer":** Analytics -> Data Analyst. Engineering -> Data Engineer. Include either way.
+4. **Company name blank:** Check description and job_url for clues. Naukri URLs contain company in slug.
+5. **"Full Stack + DevOps":** Mark `role_category: "Mixed"` and include.
+6. **Title says "Software Engineer" but description is QA/Testing:** Classify as QA/SDET. Go by description, not title.
+7. **"Intern" roles:** Include, tag P1.
+8. **"Contract" roles:** Include — real jobs.
+9. **10+ years experience:** Include, tag P4.
+10. **Staffing detection from description:** If company looks real but description says "hiring for our client" -> REJECT. Exception: both firms named -> note actual employer.
+
+---
 
 ## PRIORITY TAGGING
 
-Always include a priority field:
-- P1 — Fresher/Entry-Level
-- P2 — Early Career (1-3 years)
-- P3 — Mid-Level (3-6 years)
-- P4 — Senior (6+ years)
+Use the `experience` field (if available) as the primary signal, then `job_type` (e.g. "internship" -> P1, "contract" -> include), then fall back to title keywords:
+- **P1 — Fresher/Entry:** "intern", "junior", "trainee", "fresher", "entry level", "GET", "SDE-1", "Engineer I", "Software Engineer 1", "associate" (no "senior"), Experience 0-2 years, job_type is "internship", description says "freshers welcome", "campus hiring", "2024/2025/2026 batch"
+- **P2 — Early Career (1-3 years):** "SDE-2", "SDE II", "Engineer II", Experience 1-3 years
+- **P3 — Mid-Level (3-6 years):** Experience 3-6 years, or no data available
+- **P4 — Senior (6+):** "senior", "sr.", "lead", "staff", "principal", "architect", "manager", "VP", "director", Experience 5+ years
+
+---
 
 ## OUTPUT FORMAT
 
-For each listing, respond ONLY with valid JSON. No preamble, no markdown backticks, no text outside JSON.
-Single example:
-{"relevant": true, "reason": "SDE-1 at Amazon, Bangalore", "role_category": "Developer", "priority": "P1"}
+Respond ONLY with valid JSON. No preamble, no markdown backticks.
 
-Multiple example:
+```json
 [
   {"row": 1, "relevant": true, "reason": "Data Analyst at Uber, Hyderabad", "role_category": "Data Analyst", "priority": "P3"},
-  {"row": 2, "relevant": false, "reason": "Turing is a gig platform, not an employer", "role_category": null, "priority": null},
-  {"row": 3, "relevant": false, "reason": "Location is Jaipur, outside target cities", "role_category": null, "priority": null}
+  {"row": 2, "relevant": false, "reason": "Scoutit is a staffing agency", "role_category": null, "priority": null},
+  {"row": 3, "relevant": false, "reason": "Risk Analyst — domain-specific, not core DA", "role_category": null, "priority": null},
+  {"row": 4, "relevant": false, "reason": "Location is Ahmedabad, outside target cities", "role_category": null, "priority": null},
+  {"row": 5, "relevant": true, "reason": "Data Scientist at Swiggy, Bangalore", "role_category": "Data Scientist", "priority": "P4"},
+  {"row": 6, "relevant": false, "reason": "description says hiring for unnamed client — staffing firm", "role_category": null, "priority": null},
+  {"row": 7, "relevant": true, "reason": "SDET at Microsoft, Pune", "role_category": "SDET", "priority": "P2"}
 ]
-"""
+```"""
 
 
 def _get_sheets_writer_and_chunk_size() -> tuple[GoogleSheetsWriter, int]:

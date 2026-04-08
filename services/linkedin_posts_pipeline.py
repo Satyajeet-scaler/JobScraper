@@ -130,6 +130,9 @@ def _build_actor_input() -> dict[str, Any]:
                     "hiring backend developer India",
                     "hiring data engineer Bangalore",
                     "hiring data engineer India",
+                    "hiring data scientist Bangalore",
+                    "hiring data scientist India",
+                    "hiring ML engineer India",
                     "hiring DevOps engineer Bangalore",
                     "hiring DevOps engineer India",
                     "hiring QA engineer Bangalore",
@@ -291,7 +294,7 @@ def _classify_single_post(
         if genai is None:
             raise RuntimeError("google-generativeai package is not installed.")
         genai.configure(api_key=gemini_api_key)
-        model = genai.GenerativeModel(gemini_model)
+        model = genai.GenerativeModel(gemini_model, system_instruction=prompt)
         payload = {
             "post_text": (row.get("post_text") or "")[:3000],
             "job_title_hint": row.get("job_title_hint"),
@@ -303,7 +306,6 @@ def _classify_single_post(
             "posted_at": row.get("posted_at"),
         }
         content = (
-            f"{prompt}\n\n"
             "Return ONLY JSON with keys: relevant, reason, role_category, priority.\n"
             f"{json.dumps(payload, ensure_ascii=True)}"
         )
@@ -469,7 +471,7 @@ def _classify_batch_posts_with_gemini(
     if genai is None:
         raise RuntimeError("google-generativeai package is not installed.")
     genai.configure(api_key=api_key)
-    model = genai.GenerativeModel(model_name)
+    model = genai.GenerativeModel(model_name, system_instruction=prompt)
 
     compact_rows: list[dict[str, Any]] = []
     for idx, row in enumerate(rows, start=1):
@@ -488,7 +490,6 @@ def _classify_batch_posts_with_gemini(
         )
 
     content = (
-        f"{prompt}\n\n"
         "Classify EACH row in the JSON array below.\n"
         "Return ONLY a JSON array with one object per row and keys: "
         "row, relevant, reason, role_category, priority.\n"
@@ -558,7 +559,7 @@ def _default_linkedin_posts_prompt() -> str:
     return """You are a classifier for LinkedIn hiring posts.
 
 Mark as relevant only when post content clearly indicates active hiring for technical roles in India,
-preferably one of: Developer, Data Engineer, Data Analyst, DevOps, Platform Engineer, SRE, QA, SDET.
+preferably one of: Developer, Data Engineer, Data Analyst, Data Scientist, DevOps, Platform Engineer, SRE, QA, SDET.
 
 Exclude motivational posts, generic engagement posts, course ads, agency spam, and non-job posts.
 
@@ -566,7 +567,7 @@ Return strict JSON:
 {
   "relevant": true or false,
   "reason": "short reason",
-  "role_category": "Developer|Data Engineer|Data Analyst|DevOps|Platform Engineer|SRE|QA|SDET|Mixed|Unknown",
+  "role_category": "Developer|Data Engineer|Data Analyst|Data Scientist|DevOps|Platform Engineer|SRE|QA|SDET|Mixed|Unknown",
   "priority": "P1|P2|P3|P4|"
 }
 """

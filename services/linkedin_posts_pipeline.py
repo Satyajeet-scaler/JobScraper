@@ -135,9 +135,6 @@ def _build_actor_input() -> dict[str, Any]:
                     "hiring ML engineer India",
                     "hiring DevOps engineer Bangalore",
                     "hiring DevOps engineer India",
-                    "hiring QA engineer Bangalore",
-                    "hiring SDET India",
-                    "hiring SRE Bangalore",
                     "hiring platform engineer India",
                     "hiring freshers engineer India",
                     "hiring freshers data analyst India",
@@ -559,7 +556,9 @@ def _default_linkedin_posts_prompt() -> str:
     return """You are a classifier for LinkedIn hiring posts.
 
 Mark as relevant only when post content clearly indicates active hiring for technical roles in India,
-preferably one of: Developer, Data Engineer, Data Analyst, Data Scientist, DevOps, Platform Engineer, SRE, QA, SDET.
+preferably one of: Developer, Data Engineer, Data Analyst, Data Scientist, DevOps, Platform Engineer.
+
+Treat SRE, QA, and SDET hiring as out-of-scope and mark those posts as irrelevant.
 
 Exclude motivational posts, generic engagement posts, course ads, agency spam, and non-job posts.
 
@@ -567,7 +566,7 @@ Return strict JSON:
 {
   "relevant": true or false,
   "reason": "short reason",
-  "role_category": "Developer|Data Engineer|Data Analyst|Data Scientist|DevOps|Platform Engineer|SRE|QA|SDET|Mixed|Unknown",
+  "role_category": "Developer|Data Engineer|Data Analyst|Data Scientist|DevOps|Platform Engineer|Mixed|Unknown",
   "priority": "P1|P2|P3|P4|"
 }
 """

@@ -29,7 +29,7 @@ def run_naukri_scrape_only_pipeline(run_id: str | None = None) -> dict[str, Any]
 
     keyword = os.getenv(
         "APIFY_NAUKRI_KEYWORD",
-        "developer, data engineer, data analyst, data scientist, devops engineer, platform engineer, sre, qa engineer, sdet,",
+        "developer, data engineer, data analyst, data scientist, devops engineer, platform engineer,",
     )
     max_jobs = int(os.getenv("APIFY_MAX_JOBS_NAUKRI", "100"))
     freshness = os.getenv("APIFY_FRESHNESS", "1")

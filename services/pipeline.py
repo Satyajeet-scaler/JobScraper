@@ -36,9 +36,6 @@ TARGET_ROLES = [
     "Data Scientist",
     "Devops Engineer",
     "Platform Engineer",
-    "SRE",
-    "QA",
-    "SDET",
 ]
 TARGET_SITES = ["linkedin", "indeed"]
 PIPELINE_RUN_METRICS: dict[str, dict[str, Any]] = {}
@@ -217,7 +214,7 @@ def _scrape_target_jobs() -> list[dict[str, Any]]:
     naukri_fetch_details = os.getenv("APIFY_FETCH_DETAILS", "false").lower() == "true"
     naukri_keyword = os.getenv(
         "APIFY_NAUKRI_KEYWORD",
-        "developer, data engineer, data analyst, data scientist, devops engineer, platform engineer, sre, qa engineer, sdet,",
+        "developer, data engineer, data analyst, data scientist, devops engineer, platform engineer,",
     )
 
     all_jobs: list[dict[str, Any]] = []
@@ -760,7 +757,7 @@ For each job listing provided (containing fields like company, title, location, 
 {
   "relevant": true or false,
   "reason": "brief explanation",
-  "role_category": "one of: Developer | Data Engineer | Data Analyst | DevOps | Platform Engineer | SRE | QA | SDET | Data Scientist | Mixed",
+  "role_category": "one of: Developer | Data Engineer | Data Analyst | DevOps | Platform Engineer | Data Scientist | Mixed",
   "priority": "P1 / P2 / P3 / P4"
 }
 ```
@@ -824,7 +821,7 @@ Any listing with "Freelancing" or "Freelance" in the title.
 
 ---
 
-## SECTION B — TARGET ROLES (9 categories)
+## SECTION B — TARGET ROLES (6 categories)
 
 ### 1. Developer
 Software Engineer, Software Developer, Backend Developer, Frontend Developer, Full Stack Developer, Fullstack Developer, Web Developer, Mobile Developer, iOS Developer, Android Developer, SDE, SDE-1, SDE-2, Python Developer, Java Developer, React Developer, Node Developer, .NET Developer, MERN Stack Developer, MEAN Stack Developer, PHP Developer, Golang Developer, Ruby Developer, Application Developer, Product Engineer
@@ -845,7 +842,7 @@ BI Analyst, Business Intelligence Analyst, Analytics Analyst, Data Analytics Ana
 **REJECT ALL domain-specific "Analyst" roles — 30+ titles that are NOT Data Analyst:**
 Risk Analyst, Credit Risk Analyst, Risk & Underwriting Analyst, Finance Analyst, Financial Analyst, FP&A Analyst, Investment Analyst, Fraud Analyst, Anti-Money Laundering Analyst, Compliance Analyst, Governance Analyst, Regulatory Analyst, Security Analyst, Threat Analyst, SOC Analyst, Cybersecurity Analyst, Operations Analyst, Supply Chain Analyst, Logistics Analyst, Marketing Analyst, Media Analyst, Biddable Media Analyst, Digital Marketing Analyst, Marine Analyst, Insurance Analyst, Actuarial Analyst, Cost Analyst, Pricing Analyst, Revenue Analyst, Equity Analyst, Trading Analyst, Portfolio Analyst, Trade Implementation Analyst, Collections Analyst, Asset Servicing Analyst, Cost Basis Reporting Analyst, Procurement Analyst, Vendor Analyst, Category Analyst, HR Analyst, People Analyst, Compensation Analyst, Payroll Analyst, Clinical Data Analyst, Pharma Analyst, Medical Analyst, Geospatial Analyst, GIS Analyst, Static Data Analyst, Reference Data Analyst, Master Data Analyst, Sustainability Data Analyst, Quantitative Analytics Specialist, Quantitative Analyst, Consultant, Associate Consultant, Advisory Analyst, Strategy Analyst, EDI Quality Assurance Analyst, Research Analyst (unless explicitly SQL/dashboard focused)
 
-**Quality Analyst -> classify under QA/SDET, not Data Analyst**
+**Quality Analyst roles are OUT OF SCOPE for this pipeline — reject them.**
 
 **Ambiguous title ("Analyst" / "Senior Analyst" with no qualifier):**
 Include ONLY if description mentions at least 2 of: SQL, Python, Tableau, Power BI, dashboards, data visualization, A/B testing, funnel analysis. When in doubt, REJECT.
@@ -856,16 +853,7 @@ DevOps Engineer, DevOps Specialist, CI/CD Engineer, Release Engineer, Build Engi
 ### 5. Platform Engineer
 Platform Engineer, Cloud Engineer, Cloud Platform Engineer, Infrastructure Engineer (if platform/cloud-focused)
 
-### 6. SRE (Site Reliability Engineer)
-Site Reliability Engineer, SRE, Reliability Engineer, Production Engineer
-
-### 7. QA (Quality Assurance)
-QA Engineer, Quality Analyst, Quality Assurance Engineer, Test Engineer, Manual Tester, Automation Tester, Test Lead (if hands-on), Performance Tester, QA Analyst
-
-### 8. SDET (Software Development Engineer in Test)
-SDET, Software Development Engineer in Test, Automation Engineer (testing-focused), Test Automation Engineer, QA Automation Engineer
-
-### 9. Data Scientist
+### 6. Data Scientist
 Data Scientist, Applied Scientist, Research Scientist (if ML/data-focused), ML Engineer, Machine Learning Engineer, AI Engineer, MLOps Engineer, Deep Learning Engineer, NLP Engineer, Computer Vision Engineer, Applied Data Scientist
 
 ### REJECT — NOT target roles:
@@ -880,6 +868,9 @@ Data Scientist, Applied Scientist, Research Scientist (if ML/data-focused), ML E
 - Data Annotation, Data Labeling, ML Data Associate, Content Annotator, LLM Annotator
 - Internal IDs ("4605084-Assistant Manager") with no role context
 - Supply Chain / Operations Manager / Business Operations
+- SRE / Site Reliability Engineer roles
+- QA / Testing / Quality Analyst roles
+- SDET / Test Automation Engineer roles
 
 ---
 
@@ -928,7 +919,7 @@ MBA / PGDM, PhD / Doctorate, CA / CFA / CPA, MD / MBBS
 3. **"Data Analytics Engineer":** Analytics -> Data Analyst. Engineering -> Data Engineer. Include either way.
 4. **Company name blank:** Check description and job_url for clues. Naukri URLs contain company in slug.
 5. **"Full Stack + DevOps":** Mark `role_category: "Mixed"` and include.
-6. **Title says "Software Engineer" but description is QA/Testing:** Classify as QA/SDET. Go by description, not title.
+6. **Title says "Software Engineer" but description is QA/Testing/SDET:** REJECT as out of scope.
 7. **"Intern" roles:** Include, tag P1.
 8. **"Contract" roles:** Include — real jobs.
 9. **10+ years experience:** Include, tag P4.
@@ -958,7 +949,7 @@ Respond ONLY with valid JSON. No preamble, no markdown backticks.
   {"row": 4, "relevant": false, "reason": "Location is Ahmedabad, outside target cities", "role_category": null, "priority": null},
   {"row": 5, "relevant": true, "reason": "Data Scientist at Swiggy, Bangalore", "role_category": "Data Scientist", "priority": "P4"},
   {"row": 6, "relevant": false, "reason": "description says hiring for unnamed client — staffing firm", "role_category": null, "priority": null},
-  {"row": 7, "relevant": true, "reason": "SDET at Microsoft, Pune", "role_category": "SDET", "priority": "P2"}
+  {"row": 7, "relevant": false, "reason": "SDET role is out of scope for this pipeline", "role_category": null, "priority": null}
 ]
 ```"""
 

@@ -585,6 +585,7 @@ def post_linkedin_posts_slack_handover(
     logger.info("linkedin-posts slack handover scraped=%s relevant=%s", len(scraped_rows), len(relevant_rows))
     send_linkedin_post_handover_messages(
         relevant_rows,
+        run_date=run_date,
         defaults=slack_notify_defaults_from_env(),
     )
 

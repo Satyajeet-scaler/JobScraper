@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from typing import Any
 
@@ -6,6 +7,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+logger = logging.getLogger(__name__)
 
 
 class GoogleSheetsWriter:
@@ -101,8 +103,23 @@ class GoogleSheetsWriter:
         if isinstance(value, (dict, list)):
             # Job payloads may include date/datetime objects from pandas/JobSpy.
             # `default=str` keeps sheet writes resilient instead of failing serialization.
-            return json.dumps(value, ensure_ascii=True, default=str)
-        return str(value)
+            text = json.dumps(value, ensure_ascii=True, default=str)
+        else:
+            text = str(value)
+
+        # Google Sheets rejects any cell > 50,000 characters.
+        # Keep a small safety buffer and truncate consistently.
+        max_cell_chars = int(os.getenv("GOOGLE_SHEETS_MAX_CELL_CHARS", "48000"))
+        if len(text) > max_cell_chars:
+            logger.warning(
+                "google sheets cell value truncated original_len=%s max_len=%s",
+                len(text),
+                max_cell_chars,
+            )
+            truncated_notice = " ... [TRUNCATED: exceeded Google Sheets cell limit]"
+            keep = max(0, max_cell_chars - len(truncated_notice))
+            return text[:keep] + truncated_notice
+        return text
 
     @staticmethod
     def _column_letter(index: int) -> str:

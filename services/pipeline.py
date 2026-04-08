@@ -252,8 +252,9 @@ def _scrape_target_jobs() -> list[dict[str, Any]]:
     else:
         logger.info("naukri scrape skipped (APIFY_TOKEN not set)")
 
-    # HireCafe via undetected-chromedriver (requires xvfb virtual display)
-    if os.getenv("HIRECAFE_ENABLED", "false").lower() in ("1", "true", "yes"):
+    # HireCafe via undetected-chromedriver (requires xvfb virtual display).
+    # Default behavior is enabled; only skip when explicitly set to false/0/no.
+    if os.getenv("HIRECAFE_ENABLED", "true").lower() not in ("0", "false", "no"):
         hirecafe_max = int(os.getenv("HIRECAFE_MAX_SAMPLES", "200"))
         logger.info("hirecafe scrape starting max_samples=%s", hirecafe_max)
         try:
@@ -272,7 +273,7 @@ def _scrape_target_jobs() -> list[dict[str, Any]]:
         except Exception as exc:
             logger.warning("hirecafe scrape failed: %s", exc)
     else:
-        logger.info("hirecafe scrape skipped (HIRECAFE_ENABLED not set)")
+        logger.info("hirecafe scrape skipped (HIRECAFE_ENABLED=false)")
 
     for role in TARGET_ROLES:
         logger.info(

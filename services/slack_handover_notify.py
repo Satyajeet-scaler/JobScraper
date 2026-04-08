@@ -141,6 +141,7 @@ def send_recruiter_handover_case(
     owner_rows: list[dict[str, str]],
     case: HandoverSlackCase,
     *,
+    run_date: str,
     defaults: SlackNotifyDefaults,
 ) -> int:
     """One case heading + round-robin owner assignment. Returns Slack POST count (0 if none)."""
@@ -172,12 +173,18 @@ def send_recruiter_handover_case(
                 msg = format_internal_poc_lead(tag, company, role, job_url, poc_email)
             if send_slack_text(msg, defaults=defaults, sleep_after=1.0):
                 sent += 1
+    _persist_recruiter_assigned_owner(
+        run_date=run_date,
+        owner_rows=owner_rows,
+        case=case,
+    )
     return sent
 
 
 def send_linkedin_post_handover_messages(
     relevant_rows: list[dict[str, Any]],
     *,
+    run_date: str | None = None,
     defaults: SlackNotifyDefaults | None = None,
 ) -> int:
     """Heading + per-post messages (owners round-robin or Unassigned). Returns POST count."""
@@ -202,6 +209,10 @@ def send_linkedin_post_handover_messages(
     sent += 1
 
     if owner_rows_opt:
+        _persist_linkedin_posts_assigned_owner(
+            run_date=run_date,
+            owner_rows=owner_rows_opt,
+        )
         owner_buckets: dict[int, list[dict[str, Any]]] = {i: [] for i in range(len(owner_rows_opt))}
         for idx, row in enumerate(relevant_rows):
             owner_buckets[idx % len(owner_rows_opt)].append(row)
@@ -281,18 +292,18 @@ def send_handover_notifications(
     if owner_rows:
         if send_recruiter_info and case3:
             result["recruiter_messages_sent"] += send_recruiter_handover_case(
-                case3, owner_rows, HandoverSlackCase.RECRUITER_DETAIL, defaults=defaults
+                case3, owner_rows, HandoverSlackCase.RECRUITER_DETAIL, run_date=rd, defaults=defaults
             )
         if send_internal_poc and case2:
             result["recruiter_messages_sent"] += send_recruiter_handover_case(
-                case2, owner_rows, HandoverSlackCase.INTERNAL_POC, defaults=defaults
+                case2, owner_rows, HandoverSlackCase.INTERNAL_POC, run_date=rd, defaults=defaults
             )
 
     if send_linkedin_post:
         linkedin_rows = load_linkedin_relevant_posts_from_sheet(rd)
         result["linkedin_post_leads"] = len(linkedin_rows)
         result["linkedin_messages_sent"] = send_linkedin_post_handover_messages(
-            linkedin_rows, defaults=defaults
+            linkedin_rows, run_date=rd, defaults=defaults
         )
 
     logger.info(
@@ -448,4 +459,144 @@ def send_handover_case_batch(
         if send_slack_text(body, defaults=d, sleep_after=sleep_between):
             sent += 1
     return sent
+
+
+def _owner_display_name(owner: dict[str, str]) -> str:
+    name = (owner.get("owner_name") or "").strip()
+    if name:
+        return name
+    owner_email = (owner.get("owner_email") or "").strip()
+    if owner_email:
+        return owner_email
+    sid = (owner.get("owner_slack_id") or "").strip()
+    return sid or "Owner"
+
+
+def _column_letter(index: int) -> str:
+    letters = ""
+    current = index
+    while current > 0:
+        current, remainder = divmod(current - 1, 26)
+        letters = chr(65 + remainder) + letters
+    return letters
+
+
+def _persist_recruiter_assigned_owner(
+    *,
+    run_date: str,
+    owner_rows: list[dict[str, str]],
+    case: HandoverSlackCase,
+) -> None:
+    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
+    if not spreadsheet_id or not owner_rows:
+        return
+    tab = os.getenv("RECRUITERS_INFO_WORKSHEET") or f"recruiters_info_{run_date}"
+    case_value = HandoverSlackCase(case) if isinstance(case, str) else case
+
+    def selector(row: dict[str, str]) -> bool:
+        row_run_date = (row.get("run_date") or "").strip()
+        if row_run_date and row_run_date != run_date:
+            return False
+        has_profile = bool((row.get("recruiter_profile_url") or "").strip())
+        has_email = bool((row.get("recruiter_email") or "").strip())
+        if case_value == HandoverSlackCase.RECRUITER_DETAIL:
+            return has_profile
+        return (not has_profile) and has_email
+
+    _persist_assigned_owner_column(
+        spreadsheet_id=spreadsheet_id,
+        worksheet_title=tab,
+        owner_rows=owner_rows,
+        selector=selector,
+    )
+
+
+def _persist_linkedin_posts_assigned_owner(
+    *,
+    run_date: str | None,
+    owner_rows: list[dict[str, str]],
+) -> None:
+    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
+    if not spreadsheet_id or not owner_rows:
+        return
+    rd = (run_date or date.today().isoformat()).strip()
+    tab = f"linkedin_posts_relevant_{rd}"
+
+    def selector(row: dict[str, str]) -> bool:
+        row_run_date = (row.get("run_date") or "").strip()
+        return not row_run_date or row_run_date == rd
+
+    _persist_assigned_owner_column(
+        spreadsheet_id=spreadsheet_id,
+        worksheet_title=tab,
+        owner_rows=owner_rows,
+        selector=selector,
+    )
+
+
+def _persist_assigned_owner_column(
+    *,
+    spreadsheet_id: str,
+    worksheet_title: str,
+    owner_rows: list[dict[str, str]],
+    selector: Callable[[dict[str, str]], bool],
+) -> None:
+    try:
+        writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
+        ws = writer.sheet.worksheet(worksheet_title)
+        values = ws.get_all_values()
+        if not values:
+            return
+        headers = [str(h or "").strip() for h in values[0]]
+        data_rows = [list(r) for r in values[1:]]
+
+        normalized_headers = [h.lower() for h in headers]
+        assigned_header = "assigned owner"
+        if assigned_header in normalized_headers:
+            assigned_col_idx = normalized_headers.index(assigned_header)
+        else:
+            headers.append(assigned_header)
+            assigned_col_idx = len(headers) - 1
+            normalized_headers.append(assigned_header)
+
+        for row in data_rows:
+            while len(row) < len(headers):
+                row.append("")
+
+        selected_row_positions: list[int] = []
+        for pos, row in enumerate(data_rows):
+            row_dict: dict[str, str] = {}
+            for idx, header in enumerate(normalized_headers):
+                row_dict[header] = row[idx].strip() if idx < len(row) else ""
+            if selector(row_dict):
+                selected_row_positions.append(pos)
+
+        if not selected_row_positions:
+            return
+
+        owner_names = [_owner_display_name(owner) for owner in owner_rows]
+        for idx, row_pos in enumerate(selected_row_positions):
+            data_rows[row_pos][assigned_col_idx] = owner_names[idx % len(owner_names)]
+
+        # Ensure header exists before writing column values.
+        ws.update("A1", [headers])
+
+        col_letter = _column_letter(assigned_col_idx + 1)
+        end_row = len(data_rows) + 1
+        if end_row >= 2:
+            col_values = [[row[assigned_col_idx]] for row in data_rows]
+            ws.update(f"{col_letter}2:{col_letter}{end_row}", col_values)
+        logger.info(
+            "assigned owner persisted sheet=%s tab=%s updated_rows=%s",
+            spreadsheet_id,
+            worksheet_title,
+            len(selected_row_positions),
+        )
+    except Exception as exc:
+        logger.warning(
+            "failed to persist assigned owner sheet=%s tab=%s err=%s",
+            spreadsheet_id,
+            worksheet_title,
+            exc,
+        )
 

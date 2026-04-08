@@ -23,12 +23,13 @@ logger = logging.getLogger(__name__)
 
 HIRECAFE_SEARCH_URL = (
     "https://hiring.cafe/?searchState="
-    "%7B%22locations%22%3A%5B%7B%22id%22%3A%22lhY1yZQBoEtHp_8UEq3V%22%2C%22types%22"
-    "%3A%5B%22country%22%5D%2C%22address_components%22%3A%5B%7B%22long_name%22%3A%22India"
-    "%22%2C%22short_name%22%3A%22IN%22%2C%22types%22%3A%5B%22country%22%5D%7D%5D%2C%22"
-    "formatted_address%22%3A%22India%22%2C%22population%22%3A1352617328%2C%22workplace_types"
-    "%22%3A%5B%5D%2C%22options%22%3A%7B%22flexible_regions%22%3A%5B%22anywhere_in_continent"
-    "%22%2C%22anywhere_in_world%22%5D%7D%7D%5D%2C%22dateFetchedPastNDays%22%3A2%7D"
+    "%7B%22dateFetchedPastNDays%22%3A2%2C%22locations%22%3A%5B%7B%22id%22%3A%22lhY1yZQBoEtHp_8UEq3V%22"
+    "%2C%22types%22%3A%5B%22country%22%5D%2C%22address_components%22%3A%5B%7B%22long_name%22%3A%22India%22"
+    "%2C%22short_name%22%3A%22IN%22%2C%22types%22%3A%5B%22country%22%5D%7D%5D%2C%22formatted_address%22%3A%22India"
+    "%22%2C%22population%22%3A1352617328%2C%22workplace_types%22%3A%5B%5D%2C%22options%22%3A%7B%22flexible_regions%22"
+    "%3A%5B%22anywhere_in_continent%22%2C%22anywhere_in_world%22%5D%7D%7D%5D%2C%22jobTitleQuery%22%3A%22%5C%22developer%5C%22"
+    "%2C+%5C%22data+engineer%5C%22%2C+%5C%22data+scientist%5C%22%2C+%5C%22data+analyst%5C%22%2C+%5C%22devops+engineer%5C%22"
+    "%2C+%5C%22platform+engineer%5C%22%22%7D"
 )
 
 CLOUDFLARE_WAIT_SECONDS = 10

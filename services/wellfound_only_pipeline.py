@@ -26,23 +26,23 @@ TARGET_ROLES = [
 
 def run_wellfound_scrape_only_pipeline(run_id: str | None = None) -> dict[str, Any]:
     """
-    Scrape Wellfound (India), optionally apply role and time filters, then write to wellfound_jobs_{date}.
+    Scrape Wellfound for each target role and write to wellfound_jobs_{date}.
     """
     return _run_wellfound_scrape_only_pipeline(
         run_id=run_id,
-        role_filter_enabled=True,
         time_filter_enabled=True,
         hours_old=24,
         target_roles=None,
+        per_role_jobs=50,
     )
 
 
 def _run_wellfound_scrape_only_pipeline(
     run_id: str | None = None,
-    role_filter_enabled: bool = True,
     time_filter_enabled: bool = True,
     hours_old: int = 24,
     target_roles: list[str] | None = None,
+    per_role_jobs: int = 50,
 ) -> dict[str, Any]:
     pipeline_run_id = run_id or str(uuid.uuid4())
     run_date = date.today().isoformat()
@@ -57,43 +57,39 @@ def _run_wellfound_scrape_only_pipeline(
     resolved_hours_old = max(1, int(hours_old))
 
     location = os.getenv("APIFY_WELLFOUND_LOCATION", "india")
-    results_wanted = int(os.getenv("APIFY_MAX_JOBS_WELLFOUND", "100"))
+    resolved_per_role_jobs = max(1, int(per_role_jobs))
     max_pages = int(os.getenv("APIFY_WELLFOUND_MAX_PAGES", "20"))
     use_proxy = os.getenv("APIFY_WELLFOUND_USE_PROXY", "true").lower() in ("1", "true", "yes")
     proxy_groups = _parse_csv_env(os.getenv("APIFY_WELLFOUND_PROXY_GROUPS", "RESIDENTIAL"))
 
     try:
         logger.info(
-            "wellfound-only pipeline[%s] started location=%s results_wanted=%s max_pages=%s role_filter=%s time_filter=%s hours_old=%s roles=%s",
+            "wellfound-only pipeline[%s] started location=%s per_role_jobs=%s max_pages=%s time_filter=%s hours_old=%s roles=%s",
             pipeline_run_id,
             location,
-            results_wanted,
+            resolved_per_role_jobs,
             max_pages,
-            role_filter_enabled,
             time_filter_enabled,
             resolved_hours_old,
             selected_roles,
         )
-        raw_rows = scrape_wellfound_jobs(
-            location=location,
-            results_wanted=results_wanted,
-            max_pages=max_pages,
-            use_apify_proxy=use_proxy,
-            apify_proxy_groups=proxy_groups,
-        )
-
+        raw_count = 0
         normalized_rows: list[dict[str, Any]] = []
-        for raw in raw_rows:
-            normalized = normalize_wellfound_item(raw)
-            matched_role = _match_target_role(
-                title=str(normalized.get("title") or ""),
-                description=str(normalized.get("description") or ""),
-                allowed_roles=selected_roles,
+        for role in selected_roles:
+            role_raw_rows = scrape_wellfound_jobs(
+                location=location,
+                results_wanted=resolved_per_role_jobs,
+                max_pages=max_pages,
+                keyword=role,
+                use_apify_proxy=use_proxy,
+                apify_proxy_groups=proxy_groups,
             )
-            if role_filter_enabled and not matched_role:
-                continue
-            normalized["role_query"] = matched_role or "wellfound"
-            normalized_rows.append(normalized)
+            raw_count += len(role_raw_rows)
+
+            for raw in role_raw_rows:
+                normalized = normalize_wellfound_item(raw)
+                normalized["role_query"] = role
+                normalized_rows.append(normalized)
 
         filtered_rows = (
             _filter_jobs_last_n_hours(normalized_rows, hours_old=resolved_hours_old)
@@ -122,10 +118,11 @@ def _run_wellfound_scrape_only_pipeline(
             "status": "completed",
             "run_date": run_date,
             "tab_name": tab_name,
-            "raw_count": len(raw_rows),
-            "role_filtered_count": len(normalized_rows),
+            "raw_count": raw_count,
+            "collected_count": len(normalized_rows),
+            "roles_scraped": selected_roles,
+            "per_role_jobs": resolved_per_role_jobs,
             "time_filtered_count": len(filtered_rows),
-            "role_filter_enabled": role_filter_enabled,
             "time_filter_enabled": time_filter_enabled,
             "hours_old": resolved_hours_old,
             "target_roles": selected_roles,
@@ -134,10 +131,9 @@ def _run_wellfound_scrape_only_pipeline(
         }
         WELLFOUND_RUN_METRICS[pipeline_run_id] = metrics
         logger.info(
-            "wellfound-only pipeline[%s] completed raw=%s post_role=%s post_time=%s written=%s",
+            "wellfound-only pipeline[%s] completed raw=%s post_time=%s written=%s",
             pipeline_run_id,
-            len(raw_rows),
-            len(normalized_rows),
+            raw_count,
             len(filtered_rows),
             len(enriched_rows),
         )
@@ -162,17 +158,17 @@ def get_wellfound_run_metrics(run_id: str) -> dict[str, Any] | None:
 
 def run_wellfound_scrape_only_pipeline_with_filters(
     run_id: str | None = None,
-    role_filter_enabled: bool = True,
     time_filter_enabled: bool = True,
     hours_old: int = 24,
     target_roles: list[str] | None = None,
+    per_role_jobs: int = 50,
 ) -> dict[str, Any]:
     return _run_wellfound_scrape_only_pipeline(
         run_id=run_id,
-        role_filter_enabled=role_filter_enabled,
         time_filter_enabled=time_filter_enabled,
         hours_old=hours_old,
         target_roles=target_roles,
+        per_role_jobs=per_role_jobs,
     )
 
 
@@ -209,73 +205,6 @@ def _resolve_target_roles(target_roles: list[str] | None) -> list[str]:
         )
 
     return resolved or list(TARGET_ROLES)
-
-
-def _match_target_role(title: str, description: str, allowed_roles: list[str] | None = None) -> str | None:
-    text = f"{title} {description}".lower()
-    excluded_tokens = (
-        "qa",
-        "quality assurance",
-        "sdet",
-        "test engineer",
-        "tester",
-        "support engineer",
-        "technical support",
-    )
-    if any(token in text for token in excluded_tokens):
-        return None
-
-    role_keywords: dict[str, tuple[str, ...]] = {
-        "Developer": (
-            "developer",
-            "software engineer",
-            "software developer",
-            "backend engineer",
-            "frontend engineer",
-            "full stack",
-            "fullstack",
-            "sde",
-        ),
-        "Data Engineer": (
-            "data engineer",
-            "etl",
-            "data pipeline",
-            "analytics engineer",
-            "databricks",
-            "big data",
-        ),
-        "Data Analyst": (
-            "data analyst",
-            "business analyst",
-            "product analyst",
-            "bi analyst",
-            "business intelligence",
-        ),
-        "Data Scientist": (
-            "data scientist",
-            "machine learning engineer",
-            "ml engineer",
-            "ai engineer",
-            "nlp engineer",
-            "computer vision",
-        ),
-        "Devops Engineer": (
-            "devops",
-            "ci/cd",
-            "release engineer",
-            "infrastructure engineer",
-        ),
-        "Platform Engineer": (
-            "platform engineer",
-            "cloud platform",
-            "cloud engineer",
-        ),
-    }
-
-    for role_name in (allowed_roles or TARGET_ROLES):
-        if any(keyword in text for keyword in role_keywords.get(role_name, ())):
-            return role_name
-    return None
 
 
 def _filter_jobs_last_n_hours(jobs: list[dict[str, Any]], hours_old: int) -> list[dict[str, Any]]:

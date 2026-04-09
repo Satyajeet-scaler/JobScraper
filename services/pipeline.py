@@ -220,7 +220,7 @@ def _scrape_target_jobs() -> list[dict[str, Any]]:
 
     wellfound_enabled = os.getenv("APIFY_WELLFOUND_ENABLED", "true").lower() in ("1", "true", "yes")
     wellfound_location = os.getenv("APIFY_WELLFOUND_LOCATION", "india")
-    wellfound_results_wanted = int(os.getenv("APIFY_MAX_JOBS_WELLFOUND", str(default_results_wanted)))
+    wellfound_results_per_role = int(os.getenv("APIFY_MAX_JOBS_WELLFOUND_PER_ROLE", "50"))
     wellfound_max_pages = int(os.getenv("APIFY_WELLFOUND_MAX_PAGES", "20"))
     wellfound_use_proxy = os.getenv("APIFY_WELLFOUND_USE_PROXY", "true").lower() in ("1", "true", "yes")
     wellfound_proxy_groups = _parse_csv_env(
@@ -259,43 +259,42 @@ def _scrape_target_jobs() -> list[dict[str, Any]]:
     else:
         logger.info("naukri scrape skipped (APIFY_TOKEN not set)")
 
-    # Wellfound via Apify (single call by location; role-filter in code).
+    # Wellfound via Apify (one call per role query).
     if os.getenv("APIFY_TOKEN") and wellfound_enabled:
         logger.info(
-            "wellfound scrape location=%s results_wanted=%s max_pages=%s use_proxy=%s",
+            "wellfound scrape location=%s roles=%s results_per_role=%s max_pages=%s use_proxy=%s",
             wellfound_location,
-            wellfound_results_wanted,
+            TARGET_ROLES,
+            wellfound_results_per_role,
             wellfound_max_pages,
             wellfound_use_proxy,
         )
         try:
-            wellfound_raw = _retry(
-                action=lambda: scrape_wellfound_jobs(
-                    location=wellfound_location,
-                    results_wanted=wellfound_results_wanted,
-                    max_pages=wellfound_max_pages,
-                    use_apify_proxy=wellfound_use_proxy,
-                    apify_proxy_groups=wellfound_proxy_groups,
-                ),
-                retries=2,
-                initial_delay_seconds=2.0,
-            )
-
+            wellfound_raw_total = 0
             wellfound_items: list[dict[str, Any]] = []
-            for raw in wellfound_raw:
-                normalized = normalize_wellfound_item(raw)
-                matched_role = _match_target_role(
-                    title=str(normalized.get("title") or ""),
-                    description=str(normalized.get("description") or ""),
+            for role in TARGET_ROLES:
+                wellfound_raw = _retry(
+                    action=lambda role_query=role: scrape_wellfound_jobs(
+                        location=wellfound_location,
+                        results_wanted=wellfound_results_per_role,
+                        max_pages=wellfound_max_pages,
+                        keyword=role_query,
+                        use_apify_proxy=wellfound_use_proxy,
+                        apify_proxy_groups=wellfound_proxy_groups,
+                    ),
+                    retries=2,
+                    initial_delay_seconds=2.0,
                 )
-                if not matched_role:
-                    continue
-                normalized["role_query"] = matched_role
-                wellfound_items.append(normalized)
+                wellfound_raw_total += len(wellfound_raw)
+
+                for raw in wellfound_raw:
+                    normalized = normalize_wellfound_item(raw)
+                    normalized["role_query"] = role
+                    wellfound_items.append(normalized)
 
             logger.info(
-                "wellfound scrape completed raw=%s role_filtered=%s",
-                len(wellfound_raw),
+                "wellfound scrape completed raw_total=%s collected=%s",
+                wellfound_raw_total,
                 len(wellfound_items),
             )
             all_jobs.extend(wellfound_items)
@@ -410,74 +409,6 @@ def _parse_csv_env(raw_value: str | None) -> list[str]:
     if not raw_value:
         return []
     return [part.strip() for part in raw_value.split(",") if part.strip()]
-
-
-def _match_target_role(title: str, description: str) -> str | None:
-    text = f"{title} {description}".lower()
-    # Exclude obvious non-target testing/support families first.
-    excluded_tokens = (
-        "qa",
-        "quality assurance",
-        "sdet",
-        "test engineer",
-        "tester",
-        "support engineer",
-        "technical support",
-    )
-    if any(token in text for token in excluded_tokens):
-        return None
-
-    role_keywords: dict[str, tuple[str, ...]] = {
-        "Developer": (
-            "developer",
-            "software engineer",
-            "software developer",
-            "backend engineer",
-            "frontend engineer",
-            "full stack",
-            "fullstack",
-            "sde",
-        ),
-        "Data Engineer": (
-            "data engineer",
-            "etl",
-            "data pipeline",
-            "analytics engineer",
-            "databricks",
-            "big data",
-        ),
-        "Data Analyst": (
-            "data analyst",
-            "business analyst",
-            "product analyst",
-            "bi analyst",
-            "business intelligence",
-        ),
-        "Data Scientist": (
-            "data scientist",
-            "machine learning engineer",
-            "ml engineer",
-            "ai engineer",
-            "nlp engineer",
-            "computer vision",
-        ),
-        "Devops Engineer": (
-            "devops",
-            "ci/cd",
-            "release engineer",
-            "infrastructure engineer",
-        ),
-        "Platform Engineer": (
-            "platform engineer",
-            "cloud platform",
-            "cloud engineer",
-        ),
-    }
-
-    for role_name in TARGET_ROLES:
-        if any(keyword in text for keyword in role_keywords.get(role_name, ())):
-            return role_name
-    return None
 
 
 def _normalize_job(job: dict[str, Any]) -> dict[str, Any]:

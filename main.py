@@ -472,13 +472,13 @@ def get_naukri_run_status(
 @app.post("/internal/run-wellfound-scrape")
 def run_wellfound_scrape(
     background_tasks: BackgroundTasks,
-    role_filter: bool = Query(default=True, description="Apply role filter before writing sheet."),
     time_filter: bool = Query(default=True, description="Apply posted-within-hours filter before writing sheet."),
     hours_old: int = Query(default=24, ge=1, le=720, description="Keep jobs posted in last N hours when time_filter=true."),
+    per_role_jobs: int = Query(default=50, ge=1, le=200, description="Jobs to request from Wellfound for each selected role."),
     target_roles: Optional[str] = Query(
         default=None,
         description=(
-            "Comma-separated role names to match when role_filter=true. "
+            "Comma-separated role names to scrape. "
             "Allowed: Developer, Data Engineer, Data Analyst, Data Scientist, Devops Engineer, Platform Engineer"
         ),
     ),
@@ -495,19 +495,19 @@ def run_wellfound_scrape(
     background_tasks.add_task(
         run_wellfound_scrape_only_pipeline_with_filters,
         run_id,
-        role_filter,
         time_filter,
         hours_old,
         selected_roles,
+        per_role_jobs,
     )
     return JSONResponse(
         status_code=status.HTTP_202_ACCEPTED,
         content={
             "run_id": run_id,
             "status": "accepted",
-            "role_filter": role_filter,
             "time_filter": time_filter,
             "hours_old": hours_old,
+            "per_role_jobs": per_role_jobs,
             "target_roles": selected_roles,
         },
     )

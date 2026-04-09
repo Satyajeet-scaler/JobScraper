@@ -14,6 +14,7 @@ def scrape_wellfound_jobs(
     location: str = DEFAULT_WELLFOUND_LOCATION,
     results_wanted: int = 20,
     max_pages: int = 20,
+    keyword: str | None = None,
     *,
     use_apify_proxy: bool = True,
     apify_proxy_groups: list[str] | None = None,
@@ -38,6 +39,8 @@ def scrape_wellfound_jobs(
         "results_wanted": int(results_wanted),
         "max_pages": int(max_pages),
     }
+    if keyword and keyword.strip():
+        run_input["keyword"] = keyword.strip()
     if use_apify_proxy:
         run_input["proxyConfiguration"] = {
             "useApifyProxy": True,

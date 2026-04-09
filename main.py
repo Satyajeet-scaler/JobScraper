@@ -22,7 +22,10 @@ from services.linkedin_session import (
 )
 from services.pipeline import get_pipeline_run_metrics, run_daily_jobs_pipeline
 from services.naukri_only_pipeline import get_naukri_run_metrics, run_naukri_scrape_only_pipeline
-from services.wellfound_only_pipeline import get_wellfound_run_metrics, run_wellfound_scrape_only_pipeline
+from services.wellfound_only_pipeline import (
+    get_wellfound_run_metrics,
+    run_wellfound_scrape_only_pipeline_with_filters,
+)
 from services.wellfound_classify_pipeline import (
     get_wellfound_classify_run_metrics,
     run_wellfound_classify_only_pipeline,
@@ -469,15 +472,44 @@ def get_naukri_run_status(
 @app.post("/internal/run-wellfound-scrape")
 def run_wellfound_scrape(
     background_tasks: BackgroundTasks,
+    role_filter: bool = Query(default=True, description="Apply role filter before writing sheet."),
+    time_filter: bool = Query(default=True, description="Apply posted-within-hours filter before writing sheet."),
+    hours_old: int = Query(default=24, ge=1, le=720, description="Keep jobs posted in last N hours when time_filter=true."),
+    target_roles: Optional[str] = Query(
+        default=None,
+        description=(
+            "Comma-separated role names to match when role_filter=true. "
+            "Allowed: Developer, Data Engineer, Data Analyst, Data Scientist, Devops Engineer, Platform Engineer"
+        ),
+    ),
     x_internal_token: Optional[str] = Header(default=None),
 ) -> JSONResponse:
     validate_internal_trigger_token(x_internal_token)
 
     run_id = str(uuid.uuid4())
-    background_tasks.add_task(run_wellfound_scrape_only_pipeline, run_id)
+    selected_roles = (
+        [part.strip() for part in (target_roles or "").split(",") if part.strip()]
+        if target_roles
+        else None
+    )
+    background_tasks.add_task(
+        run_wellfound_scrape_only_pipeline_with_filters,
+        run_id,
+        role_filter,
+        time_filter,
+        hours_old,
+        selected_roles,
+    )
     return JSONResponse(
         status_code=status.HTTP_202_ACCEPTED,
-        content={"run_id": run_id, "status": "accepted"},
+        content={
+            "run_id": run_id,
+            "status": "accepted",
+            "role_filter": role_filter,
+            "time_filter": time_filter,
+            "hours_old": hours_old,
+            "target_roles": selected_roles,
+        },
     )
 
 

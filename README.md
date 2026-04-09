@@ -131,3 +131,21 @@ Tune via environment variables:
 - `HIRECAFE_MAX_IDLE_SECONDS` (default `90`)
 - `HIRECAFE_MAX_SCROLLS` (default `500`)
 - `HIRECAFE_HEARTBEAT_EVERY_SECONDS` (default `15`)
+
+## Wellfound Actor Probe
+
+Use the probe script to test which Wellfound actor inputs are accepted and what output keys are returned.
+
+```bash
+APIFY_TOKEN=... python wellfound_actor_probe.py --location india --results-wanted 3 --max-pages 1
+```
+
+What it tests:
+
+- valid baseline input (`location`, `results_wanted`, `max_pages`, `proxyConfiguration`)
+- valid input without `proxyConfiguration`
+- valid input without `location` (uses actor default)
+- invalid unknown key (should fail validation)
+- invalid type for `results_wanted` (should fail validation)
+
+The script prints a JSON summary with accepted/rejected cases and the union of observed output keys.

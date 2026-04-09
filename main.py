@@ -22,6 +22,11 @@ from services.linkedin_session import (
 )
 from services.pipeline import get_pipeline_run_metrics, run_daily_jobs_pipeline
 from services.naukri_only_pipeline import get_naukri_run_metrics, run_naukri_scrape_only_pipeline
+from services.wellfound_only_pipeline import get_wellfound_run_metrics, run_wellfound_scrape_only_pipeline
+from services.wellfound_classify_pipeline import (
+    get_wellfound_classify_run_metrics,
+    run_wellfound_classify_only_pipeline,
+)
 from services.hirecafe_only_pipeline import get_hirecafe_run_metrics, run_hirecafe_scrape_only_pipeline
 from services.linkedin_posts_pipeline import get_linkedin_posts_run_metrics, run_linkedin_posts_pipeline
 from services.scrape_relevance_service import (
@@ -456,6 +461,61 @@ def get_naukri_run_status(
 ) -> JSONResponse:
     validate_internal_trigger_token(x_internal_token)
     metrics = get_naukri_run_metrics(run_id)
+    if not metrics:
+        raise HTTPException(status_code=404, detail="Run ID not found.")
+    return JSONResponse(content=metrics)
+
+
+@app.post("/internal/run-wellfound-scrape")
+def run_wellfound_scrape(
+    background_tasks: BackgroundTasks,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+
+    run_id = str(uuid.uuid4())
+    background_tasks.add_task(run_wellfound_scrape_only_pipeline, run_id)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={"run_id": run_id, "status": "accepted"},
+    )
+
+
+@app.get("/internal/run-wellfound-scrape/{run_id}")
+def get_wellfound_run_status(
+    run_id: str,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    metrics = get_wellfound_run_metrics(run_id)
+    if not metrics:
+        raise HTTPException(status_code=404, detail="Run ID not found.")
+    return JSONResponse(content=metrics)
+
+
+@app.post("/internal/run-wellfound-classify")
+def run_wellfound_classify(
+    background_tasks: BackgroundTasks,
+    run_date: Optional[str] = Query(default=None, description="Optional date YYYY-MM-DD"),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+
+    run_id = str(uuid.uuid4())
+    background_tasks.add_task(run_wellfound_classify_only_pipeline, run_id, run_date)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={"run_id": run_id, "status": "accepted", "run_date": run_date or _cron_today()},
+    )
+
+
+@app.get("/internal/run-wellfound-classify/{run_id}")
+def get_wellfound_classify_run_status(
+    run_id: str,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    metrics = get_wellfound_classify_run_metrics(run_id)
     if not metrics:
         raise HTTPException(status_code=404, detail="Run ID not found.")
     return JSONResponse(content=metrics)

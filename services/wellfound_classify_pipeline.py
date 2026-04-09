@@ -36,7 +36,8 @@ def run_wellfound_classify_only_pipeline(
         scraped_rows = _read_wellfound_rows(resolved_run_date)
         deduped_rows = _dedupe_jobs(scraped_rows)
         relevant_rows, classifier_metrics = _classify_relevant_jobs(deduped_rows)
-        _write_wellfound_relevant_rows(run_date=resolved_run_date, relevant_rows=relevant_rows)
+        relevant_rows_deduped = _dedupe_jobs(relevant_rows)
+        _write_wellfound_relevant_rows(run_date=resolved_run_date, relevant_rows=relevant_rows_deduped)
 
         metrics = {
             "run_id": pipeline_run_id,
@@ -44,7 +45,7 @@ def run_wellfound_classify_only_pipeline(
             "run_date": resolved_run_date,
             "scraped_input_count": len(scraped_rows),
             "deduped_input_count": len(deduped_rows),
-            "relevant_count": len(relevant_rows),
+            "relevant_count": len(relevant_rows_deduped),
             "classification_errors": classifier_metrics.get("classification_errors", 0),
             "source_scraped_tab": f"wellfound_jobs_{resolved_run_date}",
             "relevant_tab": f"wellfound_relevant_jobs_{resolved_run_date}",
@@ -57,7 +58,7 @@ def run_wellfound_classify_only_pipeline(
             resolved_run_date,
             len(scraped_rows),
             len(deduped_rows),
-            len(relevant_rows),
+            len(relevant_rows_deduped),
         )
         return metrics
     except Exception as exc:

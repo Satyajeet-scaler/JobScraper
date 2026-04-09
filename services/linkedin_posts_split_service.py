@@ -13,6 +13,7 @@ from services.linkedin_posts_pipeline import (
     _build_actor_input,
     _classify_relevant_posts,
     _collect_source_columns,
+    _dedupe_linkedin_relevant_rows,
     _write_linkedin_posts_relevant_only,
     _write_linkedin_posts_scraped_only,
 )
@@ -77,13 +78,14 @@ def run_linkedin_posts_classify_only(run_id: str | None = None, run_date: str | 
     try:
         scraped_rows = _read_scraped_rows(resolved_run_date)
         relevant_rows, classification_errors = _classify_relevant_posts(scraped_rows)
-        _write_linkedin_posts_relevant_only(run_date=resolved_run_date, relevant_rows=relevant_rows)
+        relevant_rows_deduped = _dedupe_linkedin_relevant_rows(relevant_rows)
+        _write_linkedin_posts_relevant_only(run_date=resolved_run_date, relevant_rows=relevant_rows_deduped)
         metrics = {
             "run_id": pipeline_run_id,
             "status": "completed",
             "run_date": resolved_run_date,
             "scraped_input_count": len(scraped_rows),
-            "relevant_count": len(relevant_rows),
+            "relevant_count": len(relevant_rows_deduped),
             "classification_errors": classification_errors,
             "source_scraped_tab": f"linkedin_posts_scraped_{resolved_run_date}",
             "relevant_tab": f"linkedin_posts_relevant_{resolved_run_date}",

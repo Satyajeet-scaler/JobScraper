@@ -78,7 +78,8 @@ def run_classify_relevant_only(run_id: str | None = None, run_date: str | None =
         scraped_rows = _read_scraped_rows(resolved_run_date)
         deduped = _dedupe_jobs(scraped_rows)
         relevant, classifier_metrics = _classify_relevant_jobs(deduped)
-        _write_relevant_jobs_to_google_sheets(run_date=resolved_run_date, relevant_jobs=relevant)
+        relevant_deduped = _dedupe_jobs(relevant)
+        _write_relevant_jobs_to_google_sheets(run_date=resolved_run_date, relevant_jobs=relevant_deduped)
 
         metrics = {
             "run_id": pipeline_run_id,
@@ -86,7 +87,7 @@ def run_classify_relevant_only(run_id: str | None = None, run_date: str | None =
             "run_date": resolved_run_date,
             "scraped_input_count": len(scraped_rows),
             "deduped_input_count": len(deduped),
-            "relevant_count": len(relevant),
+            "relevant_count": len(relevant_deduped),
             "classification_errors": classifier_metrics.get("classification_errors", 0),
             "source_scraped_tab": f"scraped_jobs_{resolved_run_date}",
             "relevant_tab": f"relevant_jobs_{resolved_run_date}",

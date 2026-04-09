@@ -69,13 +69,15 @@ def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
         logger.info("pipeline[%s] scraped_jobs sheet write completed", pipeline_run_id)
 
         relevant, classifier_metrics = _classify_relevant_jobs(deduped)
+        relevant_deduped = _dedupe_jobs(relevant)
         logger.info(
-            "pipeline[%s] classification completed relevant_count=%s classification_errors=%s",
+            "pipeline[%s] classification completed relevant_count=%s relevant_deduped_count=%s classification_errors=%s",
             pipeline_run_id,
             len(relevant),
+            len(relevant_deduped),
             classifier_metrics["classification_errors"],
         )
-        _write_relevant_jobs_to_google_sheets(run_date=run_date, relevant_jobs=relevant)
+        _write_relevant_jobs_to_google_sheets(run_date=run_date, relevant_jobs=relevant_deduped)
         logger.info("pipeline[%s] relevant_jobs sheet write completed", pipeline_run_id)
 
         # --- Phase 1: scrape + classify + write sheets in PARALLEL ---
@@ -84,7 +86,7 @@ def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
             try:
                 rows_written, _ = write_linkedin_recruiters_for_relevant_jobs(
                     run_date=run_date,
-                    relevant_jobs=relevant,
+                    relevant_jobs=relevant_deduped,
                 )
                 logger.info(
                     "pipeline[%s] linkedin recruiters sheet completed rows_written=%s",
@@ -154,7 +156,12 @@ def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
         )
         logger.info(
             "pipeline[%s] final summary: leads_scraped=%s relevant=%s recruiter_detail=%s internal_poc=%s linkedin_posts=%s",
-            pipeline_run_id, len(deduped), len(relevant), recruiter_case3_count, recruiter_case2_count, linkedin_case1_count,
+            pipeline_run_id,
+            len(deduped),
+            len(relevant_deduped),
+            recruiter_case3_count,
+            recruiter_case2_count,
+            linkedin_case1_count,
         )
 
         metrics = {
@@ -163,7 +170,7 @@ def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
             "run_date": run_date,
             "scraped_count": len(scraped),
             "deduped_count": len(deduped),
-            "relevant_count": len(relevant),
+            "relevant_count": len(relevant_deduped),
             "classification_errors": classifier_metrics["classification_errors"],
             "recruiter_sheet_rows": recruiter_sheet_rows,
             "handover_notifications_sent": handover_notifications_sent,

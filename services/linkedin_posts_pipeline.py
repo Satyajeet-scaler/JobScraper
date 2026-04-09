@@ -63,6 +63,7 @@ def run_linkedin_posts_pipeline(
             len(normalized),
         )
         relevant_rows, classification_errors = _classify_relevant_posts(normalized)
+        relevant_rows = _dedupe_linkedin_relevant_rows(relevant_rows)
         logger.info(
             "linkedin-posts pipeline[%s] classification ended relevant=%s errors=%s",
             pipeline_run_id,
@@ -380,7 +381,8 @@ def _write_linkedin_posts_relevant_only(
     writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
     chunk_size = max(1, int(os.getenv("GOOGLE_SHEETS_WRITE_CHUNK_SIZE", "200")))
     relevant_tab = os.getenv("LINKEDIN_POSTS_RELEVANT_TAB_TEMPLATE", "linkedin_posts_relevant_{date}").format(date=run_date)
-    writer.write_rows(relevant_tab, _with_run_date(relevant_rows, run_date), chunk_size=chunk_size)
+    deduped_relevant_rows = _dedupe_linkedin_relevant_rows(relevant_rows)
+    writer.write_rows(relevant_tab, _with_run_date(deduped_relevant_rows, run_date), chunk_size=chunk_size)
 
 
 def _with_run_date(rows: list[dict[str, Any]], run_date: str) -> list[dict[str, Any]]:
@@ -390,6 +392,26 @@ def _with_run_date(rows: list[dict[str, Any]], run_date: str) -> list[dict[str, 
         copy["run_date"] = run_date
         output.append(copy)
     return output
+
+
+def _dedupe_linkedin_relevant_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    seen_post_urls: set[str] = set()
+    deduped: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        post_url = str(row.get("post_url") or "").strip()
+        if not post_url:
+            deduped.append(row)
+            continue
+
+        if post_url in seen_post_urls:
+            continue
+        seen_post_urls.add(post_url)
+        deduped.append(row)
+
+    return deduped
 
 
 def _collect_source_columns(rows: list[dict[str, Any]]) -> list[str]:

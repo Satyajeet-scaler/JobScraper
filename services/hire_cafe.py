@@ -17,6 +17,7 @@ from typing import Any, Optional
 import undetected_chromedriver as uc
 from bs4 import BeautifulSoup
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
@@ -60,86 +61,23 @@ HEARTBEAT_EVERY_SECONDS = int(os.getenv("HIRECAFE_HEARTBEAT_EVERY_SECONDS", "15"
 CAROUSEL_CLICK_DELAY = float(os.getenv("HIRECAFE_CAROUSEL_CLICK_DELAY", "1.5"))
 BOTTOM_IDLE_SCROLLS = int(os.getenv("HIRECAFE_BOTTOM_IDLE_SCROLLS", "5"))
 CAROUSEL_ENABLED = os.getenv("HIRECAFE_CAROUSEL_ENABLED", "true").lower() not in ("false", "0", "no")
+PRE_SCROLL_ESCAPE = os.getenv("HIRECAFE_PRE_SCROLL_ESCAPE", "true").lower() not in ("false", "0", "no")
 
-def _is_hirecafe_app_shell_visible(driver) -> bool:
-    """
-    True when the real HiringCafe / Next.js app has rendered — not a CF interstitial.
-
-    If this is True, we must **not** treat incidental ``cloudflare`` mentions (footer, scripts)
-    as an active challenge.
-    """
-    try:
-        return bool(
-            driver.execute_script(
-                """
-                if (document.getElementById('__NEXT_DATA__')) return true;
-                if (document.querySelector('div.infinite-scroll-component')) return true;
-                return document.querySelectorAll('a[href*="/viewjob/"]').length >= 1;
-                """
-            )
-        )
-    except Exception:
-        return False
+CLOUDFLARE_MARKERS = (
+    "just a moment",
+    "performing security verification",
+    "verify you are human",
+    "cloudflare",
+)
 
 
 def _is_cloudflare_challenge_active(driver) -> bool:
-    """
-    Detect Cloudflare **challenge / interstitial** pages without scanning the entire HTML for
-    the substring ``cloudflare`` (false positives on the live app).
-
-    Order:
-    1. If the HiringCafe app shell is visible, challenge is **not** active.
-    2. Otherwise use challenge-specific DOM (iframes to challenges CDN, CF challenge nodes),
-       title heuristics, and short-body text heuristics.
-    """
     try:
-        if _is_hirecafe_app_shell_visible(driver):
-            return False
-        return bool(
-            driver.execute_script(
-                """
-                const t = (document.title || '').toLowerCase();
-                if (t.includes('just a moment')) return true;
-                if (t.includes('attention required')) return true;
-                if (t.includes('please wait') && t.length < 80) return true;
-
-                for (const sel of [
-                  '#cf-challenge-running',
-                  '#challenge-stage',
-                  '#challenge-body-text',
-                  'div.cf-browser-verification',
-                  '#cf-wrapper',
-                ]) {
-                  if (document.querySelector(sel)) return true;
-                }
-
-                for (const f of document.querySelectorAll('iframe')) {
-                  const s = (f.getAttribute('src') || '').toLowerCase();
-                  if (s.includes('challenges.cloudflare.com')) return true;
-                  if (s.includes('cloudflare.com') && s.includes('turnstile')) return true;
-                  if (s.includes('/cdn-cgi/challenge')) return true;
-                }
-
-                const body = (document.body && document.body.innerText)
-                  ? document.body.innerText : '';
-                const bl = body.toLowerCase();
-                const shortPage = body.length < 12000;
-                if (shortPage && bl.includes('checking your browser')) return true;
-                if (shortPage && bl.includes('verify you are human')) return true;
-                if (shortPage && bl.includes('enable javascript and cookies')) return true;
-                if (shortPage && /\\bray id\\b/i.test(body) && body.length < 4000) return true;
-
-                return false;
-                """
-            )
-        )
+        title = (driver.title or "").lower()
+        page = (driver.page_source or "").lower()
+        content = f"{title}\n{page}"
+        return any(marker in content for marker in CLOUDFLARE_MARKERS)
     except Exception:
-        try:
-            title = (driver.title or "").lower()
-            if "just a moment" in title or "attention required" in title:
-                return True
-        except Exception:
-            pass
         return False
 
 
@@ -150,6 +88,22 @@ def _wait_for_cloudflare_clearance(driver, timeout_seconds: int, poll_interval_s
             return True
         time.sleep(max(0.1, poll_interval_seconds))
     return not _is_cloudflare_challenge_active(driver)
+
+
+def _press_escape_before_scroll(driver) -> None:
+    """Dismiss overlays / blur focused inputs so the feed receives scroll events."""
+    if not PRE_SCROLL_ESCAPE:
+        return
+    try:
+        driver.switch_to.default_content()
+    except Exception:
+        pass
+    try:
+        body = driver.find_element(By.TAG_NAME, "body")
+        body.send_keys(Keys.ESCAPE)
+        time.sleep(0.15)
+    except Exception as exc:
+        logger.debug("hirecafe pre-scroll Escape: %s", type(exc).__name__)
 
 
 def _click_viewport_coordinate(driver, x: int, y: int) -> bool:
@@ -417,6 +371,7 @@ def scrape_hirecafe_jobs(max_samples: int = 200) -> list[dict[str, Any]]:
         # =============================================================
         # PHASE 1 — Scroll to bottom, capturing viewjob JSON
         # =============================================================
+        _press_escape_before_scroll(driver)
         logger.info("hirecafe phase-1: starting scroll-to-bottom")
         scroll_root = _infinite_scroll_root(driver)
         if scroll_root:

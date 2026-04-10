@@ -2,9 +2,10 @@ import logging
 import os
 import traceback
 import uuid
-from datetime import date
+from datetime import datetime
 from time import perf_counter
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from services.google_sheets import GoogleSheetsWriter
 from services.hire_cafe import normalize_hirecafe_item, scrape_hirecafe_jobs
@@ -13,13 +14,19 @@ logger = logging.getLogger(__name__)
 HIRECAFE_RUN_METRICS: dict[str, dict[str, Any]] = {}
 
 
+def _sheet_run_date_ist() -> str:
+    """YYYY-MM-DD in ``CRON_TIMEZONE`` (default Asia/Kolkata / IST), not the host system date."""
+    tz = ZoneInfo(os.getenv("CRON_TIMEZONE", "Asia/Kolkata"))
+    return datetime.now(tz).strftime("%Y-%m-%d")
+
+
 def run_hirecafe_scrape_only_pipeline(run_id: str | None = None) -> dict[str, Any]:
     """
     Scrape only HireCafe and write normalized rows to a dedicated sheet tab.
     No classification and no Slack delivery.
     """
     pipeline_run_id = run_id or str(uuid.uuid4())
-    run_date = date.today().isoformat()
+    run_date = _sheet_run_date_ist()
     started_at = perf_counter()
     HIRECAFE_RUN_METRICS[pipeline_run_id] = {
         "run_id": pipeline_run_id,

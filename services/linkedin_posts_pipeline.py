@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import re
 import traceback
 import uuid
 from datetime import date
@@ -221,6 +222,9 @@ def _classify_relevant_posts(rows: list[dict[str, Any]]) -> tuple[list[dict[str,
                 enriched["is_relevant"] = bool(decision.get("is_relevant"))
                 enriched["role_category"] = str(decision.get("role_category", ""))
                 enriched["priority"] = str(decision.get("priority", ""))
+                enriched["tier"] = str(decision.get("tier", ""))
+                enriched["author_company"] = str(decision.get("author_company", ""))
+                enriched["hiring_company"] = str(decision.get("hiring_company", ""))
                 enriched["reason"] = str(decision.get("reason", ""))
                 enriched["confidence"] = decision.get("confidence", 0)
                 if enriched["is_relevant"]:
@@ -267,6 +271,9 @@ def _classify_relevant_posts(rows: list[dict[str, Any]]) -> tuple[list[dict[str,
         enriched["is_relevant"] = bool(decision.get("is_relevant"))
         enriched["role_category"] = str(decision.get("role_category", ""))
         enriched["priority"] = str(decision.get("priority", ""))
+        enriched["tier"] = str(decision.get("tier", ""))
+        enriched["author_company"] = str(decision.get("author_company", ""))
+        enriched["hiring_company"] = str(decision.get("hiring_company", ""))
         enriched["reason"] = str(decision.get("reason", ""))
         enriched["confidence"] = decision.get("confidence", 0)
         if enriched["is_relevant"]:
@@ -304,7 +311,8 @@ def _classify_single_post(
             "posted_at": row.get("posted_at"),
         }
         content = (
-            "Return ONLY JSON with keys: relevant, reason, role_category, priority.\n"
+            "Return ONLY JSON with keys: relevant, reason, tier, role_category, "
+            "author_company, hiring_company (optional: priority if legacy).\n"
             f"{json.dumps(payload, ensure_ascii=True)}"
         )
         response = _retry(action=lambda: model.generate_content(content), retries=3, initial_delay_seconds=1.0)
@@ -335,13 +343,28 @@ def _classify_single_post(
         response.raise_for_status()
         return _normalize_classifier_decision(response.json())
 
-    text = f"{row.get('search_query', '')} {row.get('post_text', '')}".lower()
+    text = f"{row.get('search_query', '')} {row.get('post_text', '')}"
+    text_lower = text.lower()
+    if re.search(r"\breferral\b", text_lower):
+        return {
+            "is_relevant": False,
+            "role_category": "",
+            "priority": "",
+            "tier": "",
+            "author_company": "",
+            "hiring_company": "",
+            "reason": "Keyword fallback: post contains referral (out of scope).",
+            "confidence": 0.1,
+        }
     keep_tokens = ("hiring", "opening", "vacancy", "apply", "job", "engineer", "analyst", "developer", "sdet")
-    is_relevant = any(token in text for token in keep_tokens)
+    is_relevant = any(token in text_lower for token in keep_tokens)
     return {
         "is_relevant": is_relevant,
         "role_category": "",
         "priority": "",
+        "tier": "",
+        "author_company": "",
+        "hiring_company": "",
         "reason": "Keyword fallback classifier used.",
         "confidence": 0.4 if is_relevant else 0.1,
     }
@@ -468,13 +491,25 @@ def _parse_json_array(raw_text: str) -> list[Any]:
 
 def _normalize_classifier_decision(parsed: dict[str, Any]) -> dict[str, Any]:
     if "is_relevant" in parsed:
-        return parsed
+        return {
+            "is_relevant": bool(parsed.get("is_relevant")),
+            "role_category": str(parsed.get("role_category", "")),
+            "priority": str(parsed.get("priority", "")),
+            "tier": str(parsed.get("tier", "")),
+            "author_company": str(parsed.get("author_company", "")),
+            "hiring_company": str(parsed.get("hiring_company", "")),
+            "reason": str(parsed.get("reason", "")),
+            "confidence": parsed.get("confidence", 0),
+        }
     if "relevant" in parsed:
         return {
             "is_relevant": bool(parsed.get("relevant")),
-            "role_category": parsed.get("role_category", ""),
-            "priority": parsed.get("priority", ""),
-            "reason": parsed.get("reason", ""),
+            "role_category": str(parsed.get("role_category", "")),
+            "priority": str(parsed.get("priority", "")),
+            "tier": str(parsed.get("tier", "")),
+            "author_company": str(parsed.get("author_company", "")),
+            "hiring_company": str(parsed.get("hiring_company", "")),
+            "reason": str(parsed.get("reason", "")),
             "confidence": parsed.get("confidence", 0),
         }
     return parsed
@@ -511,7 +546,8 @@ def _classify_batch_posts_with_gemini(
     content = (
         "Classify EACH row in the JSON array below.\n"
         "Return ONLY a JSON array with one object per row and keys: "
-        "row, relevant, reason, role_category, priority.\n"
+        "row, relevant, reason, tier, role_category, author_company, hiring_company "
+        "(optional: priority for backward compatibility).\n"
         f"{json.dumps(compact_rows, ensure_ascii=True)}"
     )
     response = _retry(action=lambda: model.generate_content(content), retries=3, initial_delay_seconds=1.0)
@@ -547,6 +583,9 @@ def _classify_batch_posts_with_gemini(
                     "is_relevant": False,
                     "role_category": "",
                     "priority": "",
+                    "tier": "",
+                    "author_company": "",
+                    "hiring_company": "",
                     "reason": "Missing row decision from batch classifier.",
                     "confidence": 0,
                 },
@@ -575,22 +614,148 @@ def _chunk(items: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]]
 
 
 def _default_linkedin_posts_prompt() -> str:
-    return """You are a classifier for LinkedIn hiring posts.
+    return """# System Prompt: LinkedIn Hiring Post Classifier
+# VERSION: Final (April 2026) — SRE/QA/SDET excluded; referral posts hard-rejected
+# USE FOR: Scraped LinkedIn posts from harvestapi/linkedin-post-search Apify actor
+# EXPECTED REJECTION RATE: 90-96%
 
-Mark as relevant only when post content clearly indicates active hiring for technical roles in India,
-preferably one of: Developer, Data Engineer, Data Analyst, Data Scientist, DevOps, Platform Engineer.
+You are a LinkedIn hiring post classifier for a placement team. Your job is to evaluate each LinkedIn post and determine if it is a high-value lead — meaning the placement team can reach the hiring company through this author.
 
-Treat SRE, QA, and SDET hiring as out-of-scope and mark those posts as irrelevant.
+Core question: Can the placement team reach the hiring company through this author?
 
-Exclude motivational posts, generic engagement posts, course ads, agency spam, and non-job posts.
+---
 
-Return strict JSON:
+## Your Task
+
+For each post provided (content, author/name, author/info, author/type, author/linkedinUrl, linkedinUrl), respond ONLY with valid JSON:
+
 {
   "relevant": true or false,
-  "reason": "short reason",
-  "role_category": "Developer|Data Engineer|Data Analyst|Data Scientist|DevOps|Platform Engineer|Mixed|Unknown",
-  "priority": "P1|P2|P3|P4|"
+  "reason": "brief explanation",
+  "tier": "T1 or T2",
+  "role_category": "Developer | Data Engineer | Data Analyst | DevOps | Platform Engineer | Data Scientist | Mixed",
+  "author_company": "extracted company name where author works",
+  "hiring_company": "extracted company being hired for"
 }
+
+If relevant is false, set tier, role_category, author_company, hiring_company to null.
+
+---
+
+## EVALUATION ORDER (reject at first failure)
+
+1) Is author from hiring company?
+2) Is author page a real employer page (not job board/aggregator)?
+3) Is role in target role list?
+4) Is location in target set?
+5) Referral / referral-farming (HARD REJECT — see Rule 5)
+6) Is post spam/template/aggregator?
+7) Education mismatch filter
+
+---
+
+## RULE 1 — AUTHOR MUST BE FROM HIRING COMPANY
+
+Keep:
+- Employee/leader/founder at company X posting hiring for company X (T1)
+- Internal recruiter/TA/HR at company X posting hiring for company X (T2)
+- Company page of the actual hiring company posting its own role (T1)
+
+Reject:
+- Reshares by people not employed at hiring company
+- Third-party recruiters/staffing agencies posting for clients
+- Influencers/content creators/job-alert pages/students/job-seekers
+
+If author employer does not match hiring company, reject.
+
+---
+
+## RULE 2 — PAGE MUST BE ACTUAL EMPLOYER
+
+Reject company/job-board pages that post other companies' jobs.
+Reject regional showcase pages (e.g., "Tamil Nadu Jobs", etc.).
+If page name != hiring company and acts as aggregator, reject.
+
+---
+
+## RULE 3 — TARGET ROLES (ONLY 6 CATEGORIES)
+
+1) Developer
+2) Data Engineer
+3) Data Analyst (strict core analytics only)
+4) DevOps
+5) Platform Engineer
+6) Data Scientist
+
+### HARD OUT-OF-SCOPE (ALWAYS REJECT EVEN IF AUTHOR/COMPANY IS PERFECT)
+- SRE / Site Reliability Engineer / Reliability Engineer / Production Engineer
+- QA / Quality Assurance / Test Engineer / Manual Tester / Automation Tester / Performance Tester / Quality Analyst
+- SDET / Software Development Engineer in Test / Test Automation Engineer / QA Automation Engineer
+
+If post is only SRE/QA/SDET hiring, return relevant=false.
+If post has mixed roles and only non-target in-scope role is absent, reject.
+If post includes at least one target role AND other out-of-scope roles, keep only when clearly not bulk-aggregator and set role_category=Mixed.
+
+---
+
+## RULE 4 — TARGET CITIES
+
+Include only:
+Bangalore/Bengaluru, Delhi/NCR/Noida/Gurugram/Gurgaon, Chennai, Mumbai/Navi Mumbai/Pune, Hyderabad, Remote India/WFH, PAN India/India.
+
+Reject non-target/international locations.
+
+If location missing: keep only if all other rules strongly pass.
+
+---
+
+## RULE 5 — REFERRAL LEADS (HARD REJECT)
+
+**Always reject** (relevant=false) if the post text contains the word **referral** as a whole word (case-insensitive), including:
+- "Referral", "referral", "#referral", "DM for referral", "employee referral", "referral available", "looking for referral", referral-only hiring threads
+
+This filters referral-farming leads; the placement team wants direct hiring posts, not referral solicitation.
+
+Do not treat unrelated substrings that are not the word "referral" as a hit.
+
+---
+
+## RULE 6 — SPAM / TEMPLATE / AGGREGATOR
+
+Reject:
+- "Comment interested", WhatsApp/Telegram group pushes
+- Bulk posts with many unrelated companies/roles
+- Repetitive copy-paste template hiring spam
+- Lead generation/job seeker posts
+
+---
+
+## RULE 7 — EDUCATION FILTER
+
+Reject only when sole mandatory qualification is MBA/PhD/CA/CFA etc and role is otherwise not in target pipeline intent.
+
+---
+
+## TIER (for relevant posts only)
+
+T1:
+- Employee/leader/founder/company page at hiring company
+
+T2:
+- Internal recruiter/TA at hiring company
+
+---
+
+## OUTPUT FORMAT
+
+Return ONLY valid JSON (no markdown, no prose):
+
+[
+  {"row": 1, "relevant": true, "reason": "Author is employee at hiring company posting company role", "tier": "T1", "role_category": "Developer", "author_company": "Nike", "hiring_company": "Nike"},
+  {"row": 2, "relevant": false, "reason": "Author not from hiring company", "tier": null, "role_category": null, "author_company": null, "hiring_company": null},
+  {"row": 3, "relevant": false, "reason": "SDET role is out of scope for this pipeline", "tier": null, "role_category": null, "author_company": null, "hiring_company": null},
+  {"row": 4, "relevant": false, "reason": "Referral solicitation — post contains referral keyword", "tier": null, "role_category": null, "author_company": null, "hiring_company": null}
+]
 """
 
 

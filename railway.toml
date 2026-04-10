@@ -27,6 +27,7 @@
 # Optional: LINKEDIN_POSTS_OWNER_HANDOVER=true — LinkedIn post Slack uses same owner round-robin + grouped blocks as job handover
 # These contacts are used as fallback recruiter_email rows in recruiters_info_{date}
 # Optional: HIRECAFE_ENABLED=false — disable HireCafe in daily scrape pipeline (default: enabled)
+# Optional: HIRECAFE_SEARCH_URL — full hiring.cafe URL with encoded searchState (overrides default India + role keywords)
 # Optional: HIRECAFE_MAX_SAMPLES=200 — max job payloads to capture per HireCafe run
 # Optional: HIRECAFE_CLOUDFLARE_WAIT_SECONDS=10 — initial wait after page load
 # Optional: HIRECAFE_CF_CLEAR_TIMEOUT_SECONDS=35 — max time to wait for Cloudflare challenge to clear

@@ -46,6 +46,7 @@ from services.linkedin_posts_split_service import (
     run_linkedin_posts_scrape_only,
 )
 from services.slack_handover_notify import send_handover_notifications
+from services.slack_handover_summary import send_handover_summary_to_slack
 
 
 app = FastAPI(
@@ -184,6 +185,13 @@ def _run_slack_handover_from_scheduler() -> None:
         send_internal_poc=True,
     )
     logger.info("scheduler slack-handover summary=%s", summary)
+    summary_counts = send_handover_summary_to_slack(
+        run_date=run_date,
+        send_linkedin_post=True,
+        send_recruiter_info=True,
+        send_internal_poc=True,
+    )
+    logger.info("scheduler slack-handover summary-counts=%s", summary_counts)
 
 
 def _run_linkedin_auto_login_and_log(job_id: str) -> None:
@@ -695,6 +703,49 @@ def internal_send_slack_handover(
 
     result = send_handover_notifications(
         run_date,
+        send_linkedin_post=_bool_flag("send_linkedin_post", True),
+        send_recruiter_info=_bool_flag("send_recruiter_info", True),
+        send_internal_poc=_bool_flag("send_internal_poc", True),
+        webhook_url=body.get("webhook_url") if isinstance(body.get("webhook_url"), str) else None,
+        channel=body.get("channel") if isinstance(body.get("channel"), str) else None,
+        username=body.get("username") if isinstance(body.get("username"), str) else None,
+        icon_emoji=body.get("icon_emoji") if isinstance(body.get("icon_emoji"), str) else None,
+    )
+    return JSONResponse(content=jsonable_encoder(result))
+
+
+@app.post("/internal/send-slack-handover-summary")
+def internal_send_slack_handover_summary(
+    body: dict[str, Any] = Body(default_factory=dict),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """
+    Send Slack handover summary counts.
+
+    JSON body (all optional):
+    - ``run_date``: YYYY-MM-DD (default: today in cron timezone)
+    - ``send_linkedin_post``: bool (default true)
+    - ``send_recruiter_info``: bool (default true)
+    - ``send_internal_poc``: bool (default true)
+    - Optional Slack overrides: ``webhook_url``, ``channel``, ``username``, ``icon_emoji``
+    """
+    validate_internal_trigger_token(x_internal_token)
+    run_date = body.get("run_date")
+    if run_date is not None and not isinstance(run_date, str):
+        raise HTTPException(status_code=400, detail="run_date must be a string YYYY-MM-DD or omitted.")
+    if run_date is None:
+        run_date = _cron_today()
+
+    def _bool_flag(key: str, default: bool = True) -> bool:
+        if key not in body:
+            return default
+        v = body[key]
+        if isinstance(v, bool):
+            return v
+        raise HTTPException(status_code=400, detail=f"{key} must be a boolean.")
+
+    result = send_handover_summary_to_slack(
+        run_date=run_date,
         send_linkedin_post=_bool_flag("send_linkedin_post", True),
         send_recruiter_info=_bool_flag("send_recruiter_info", True),
         send_internal_poc=_bool_flag("send_internal_poc", True),

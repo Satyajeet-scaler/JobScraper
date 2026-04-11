@@ -14,7 +14,11 @@ from typing import Any, Callable, TypeVar
 import requests
 
 from services.google_sheets import GoogleSheetsWriter
-from services.handover_owners import load_owner_rows_for_handover, worksheet_row_dicts
+from services.handover_owners import (
+    load_internal_poc_tag_rows,
+    load_owner_rows_for_handover,
+    worksheet_row_dicts,
+)
 from services.linkedin_posts_slack_row import slack_author_from_row, slack_post_url_from_row
 
 logger = logging.getLogger(__name__)
@@ -84,6 +88,31 @@ def owner_tag_for_handover(owner: dict[str, str]) -> str:
     return f"*{name}* (<@{sid}>)" if sid else f"*{name}*"
 
 
+def normalize_email(value: str | None) -> str:
+    """Strip and lowercase for matching ``recruiter_email`` to internal POC sheet rows."""
+    if not value:
+        return ""
+    return value.strip().lower()
+
+
+def _poc_tag_row_email(row: dict[str, str]) -> str:
+    return (row.get("owner_email") or row.get("email") or "").strip()
+
+
+def internal_poc_email_owner_map(rows: list[dict[str, str]]) -> dict[str, dict[str, str]]:
+    """Map normalized email -> owner row; first row wins; log duplicates."""
+    out: dict[str, dict[str, str]] = {}
+    for row in rows:
+        key = normalize_email(_poc_tag_row_email(row))
+        if not key:
+            continue
+        if key in out:
+            logger.warning("internal POC tag sheet: duplicate email %s (extra row ignored)", key)
+            continue
+        out[key] = row
+    return out
+
+
 def load_recruiter_rows_split_for_handover(
     run_date: str,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]], list[dict[str, str]]]:
@@ -139,16 +168,17 @@ def load_linkedin_relevant_posts_from_sheet(run_date: str) -> list[dict[str, Any
 def send_recruiter_handover_case(
     rows: list[dict[str, str]],
     owner_rows: list[dict[str, str]],
-    case: HandoverSlackCase,
     *,
     run_date: str,
     defaults: SlackNotifyDefaults,
 ) -> int:
-    """One case heading + round-robin owner assignment. Returns Slack POST count (0 if none)."""
+    """Case 3: heading + round-robin owners from ``owner_slack_ID``. Returns Slack POST count."""
     if not rows or not owner_rows:
         return 0
     sent = 0
-    if not send_slack_text(heading_for_case(case), defaults=defaults, sleep_after=1.0):
+    if not send_slack_text(
+        heading_for_case(HandoverSlackCase.RECRUITER_DETAIL), defaults=defaults, sleep_after=1.0
+    ):
         return 0
     sent += 1
 
@@ -165,19 +195,56 @@ def send_recruiter_handover_case(
             company = (row.get("company") or "-").strip() or "-"
             role = (row.get("role_category") or row.get("matched_role") or "-").strip() or "-"
             job_url = (row.get("job_url") or "-").strip() or "-"
-            if case == HandoverSlackCase.RECRUITER_DETAIL:
-                profile_url = (row.get("recruiter_profile_url") or "-").strip() or "-"
-                msg = format_recruiter_detail_lead(tag, company, role, job_url, profile_url)
-            else:
-                poc_email = (row.get("recruiter_email") or "-").strip() or "-"
-                msg = format_internal_poc_lead(tag, company, role, job_url, poc_email)
+            profile_url = (row.get("recruiter_profile_url") or "-").strip() or "-"
+            msg = format_recruiter_detail_lead(tag, company, role, job_url, profile_url)
             if send_slack_text(msg, defaults=defaults, sleep_after=1.0):
                 sent += 1
-    _persist_recruiter_assigned_owner(
-        run_date=run_date,
-        owner_rows=owner_rows,
-        case=case,
-    )
+    _persist_recruiter_detail_assigned_owner(run_date=run_date, owner_rows=owner_rows)
+    return sent
+
+
+def send_internal_poc_handover_case(
+    rows: list[dict[str, str]],
+    *,
+    run_date: str,
+    defaults: SlackNotifyDefaults,
+) -> int:
+    """
+    Case 2: heading + per-lead tag from ``INTERNAL_POC_TAG_SHEET_NAME`` email map, else *Unassigned*.
+    Does not use the main owner round-robin sheet.
+    """
+    if not rows:
+        return 0
+    poc_sheet_rows = load_internal_poc_tag_rows()
+    email_map = internal_poc_email_owner_map(poc_sheet_rows)
+    sent = 0
+    if not send_slack_text(
+        heading_for_case(HandoverSlackCase.INTERNAL_POC), defaults=defaults, sleep_after=1.0
+    ):
+        return 0
+    sent += 1
+
+    for row in rows:
+        poc_email = (row.get("recruiter_email") or "-").strip() or "-"
+        nk = normalize_email(poc_email) if poc_email != "-" else ""
+        matched = email_map.get(nk) if nk else None
+        if matched:
+            tag = owner_tag_for_handover(matched)
+        else:
+            if nk:
+                logger.warning(
+                    "internal POC handover: no Slack tag mapping for recruiter_email=%s",
+                    poc_email,
+                )
+            tag = "*Unassigned*"
+        company = (row.get("company") or "-").strip() or "-"
+        role = (row.get("role_category") or row.get("matched_role") or "-").strip() or "-"
+        job_url = (row.get("job_url") or "-").strip() or "-"
+        msg = format_internal_poc_lead(tag, company, role, job_url, poc_email)
+        if send_slack_text(msg, defaults=defaults, sleep_after=1.0):
+            sent += 1
+
+    _persist_internal_poc_assigned_owner(run_date=run_date, email_map=email_map)
     return sent
 
 
@@ -285,19 +352,20 @@ def send_handover_notifications(
     owner_rows_opt = load_owner_rows_for_handover()
     owner_rows = owner_rows_opt if owner_rows_opt else []
 
-    need_recruiter_owners = (send_recruiter_info and case3) or (send_internal_poc and case2)
-    if need_recruiter_owners and not owner_rows:
-        logger.warning("handover slack skipped: owner sheet has no rows (required for recruiter handovers)")
+    if send_recruiter_info and case3 and not owner_rows:
+        logger.warning(
+            "handover slack: owner sheet has no rows; Case 3 (recruiter detail) handover skipped"
+        )
 
-    if owner_rows:
-        if send_recruiter_info and case3:
-            result["recruiter_messages_sent"] += send_recruiter_handover_case(
-                case3, owner_rows, HandoverSlackCase.RECRUITER_DETAIL, run_date=rd, defaults=defaults
-            )
-        if send_internal_poc and case2:
-            result["recruiter_messages_sent"] += send_recruiter_handover_case(
-                case2, owner_rows, HandoverSlackCase.INTERNAL_POC, run_date=rd, defaults=defaults
-            )
+    if owner_rows and send_recruiter_info and case3:
+        result["recruiter_messages_sent"] += send_recruiter_handover_case(
+            case3, owner_rows, run_date=rd, defaults=defaults
+        )
+
+    if send_internal_poc and case2:
+        result["recruiter_messages_sent"] += send_internal_poc_handover_case(
+            case2, run_date=rd, defaults=defaults
+        )
 
     if send_linkedin_post:
         linkedin_rows = load_linkedin_relevant_posts_from_sheet(rd)
@@ -481,27 +549,22 @@ def _column_letter(index: int) -> str:
     return letters
 
 
-def _persist_recruiter_assigned_owner(
+def _persist_recruiter_detail_assigned_owner(
     *,
     run_date: str,
     owner_rows: list[dict[str, str]],
-    case: HandoverSlackCase,
 ) -> None:
+    """Round-robin ``assigned owner`` for Case 3 rows (recruiter profile URL present)."""
     spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
     if not spreadsheet_id or not owner_rows:
         return
     tab = os.getenv("RECRUITERS_INFO_WORKSHEET") or f"recruiters_info_{run_date}"
-    case_value = HandoverSlackCase(case) if isinstance(case, str) else case
 
     def selector(row: dict[str, str]) -> bool:
         row_run_date = (row.get("run_date") or "").strip()
         if row_run_date and row_run_date != run_date:
             return False
-        has_profile = bool((row.get("recruiter_profile_url") or "").strip())
-        has_email = bool((row.get("recruiter_email") or "").strip())
-        if case_value == HandoverSlackCase.RECRUITER_DETAIL:
-            return has_profile
-        return (not has_profile) and has_email
+        return bool((row.get("recruiter_profile_url") or "").strip())
 
     _persist_assigned_owner_column(
         spreadsheet_id=spreadsheet_id,
@@ -509,6 +572,85 @@ def _persist_recruiter_assigned_owner(
         owner_rows=owner_rows,
         selector=selector,
     )
+
+
+def _persist_internal_poc_assigned_owner(
+    *,
+    run_date: str,
+    email_map: dict[str, dict[str, str]],
+) -> None:
+    """Set ``assigned owner`` per Case 2 row from ``INTERNAL_POC_TAG_SHEET_NAME`` email match."""
+    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
+    if not spreadsheet_id:
+        return
+    tab = os.getenv("RECRUITERS_INFO_WORKSHEET") or f"recruiters_info_{run_date}"
+
+    def selector_case2(row: dict[str, str]) -> bool:
+        row_run_date = (row.get("run_date") or "").strip()
+        if row_run_date and row_run_date != run_date:
+            return False
+        has_profile = bool((row.get("recruiter_profile_url") or "").strip())
+        has_email = bool((row.get("recruiter_email") or "").strip())
+        return (not has_profile) and has_email
+
+    try:
+        writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
+        ws = writer.sheet.worksheet(tab)
+        values = ws.get_all_values()
+        if not values:
+            return
+        headers = [str(h or "").strip() for h in values[0]]
+        data_rows = [list(r) for r in values[1:]]
+
+        normalized_headers = [h.lower() for h in headers]
+        assigned_header = "assigned owner"
+        if assigned_header in normalized_headers:
+            assigned_col_idx = normalized_headers.index(assigned_header)
+        else:
+            headers.append(assigned_header)
+            assigned_col_idx = len(headers) - 1
+            normalized_headers.append(assigned_header)
+
+        for row in data_rows:
+            while len(row) < len(headers):
+                row.append("")
+
+        updated = 0
+        for row in data_rows:
+            row_dict: dict[str, str] = {}
+            for idx, header in enumerate(normalized_headers):
+                row_dict[header] = row[idx].strip() if idx < len(row) else ""
+            if not selector_case2(row_dict):
+                continue
+            rec_email = normalize_email((row_dict.get("recruiter_email") or "").strip())
+            if rec_email and rec_email in email_map:
+                row[assigned_col_idx] = _owner_display_name(email_map[rec_email])
+            else:
+                row[assigned_col_idx] = "Unassigned"
+            updated += 1
+
+        if not updated:
+            return
+
+        ws.update("A1", [headers])
+        col_letter = _column_letter(assigned_col_idx + 1)
+        end_row = len(data_rows) + 1
+        if end_row >= 2:
+            col_values = [[row[assigned_col_idx]] for row in data_rows]
+            ws.update(f"{col_letter}2:{col_letter}{end_row}", col_values)
+        logger.info(
+            "internal POC assigned owner persisted sheet=%s tab=%s updated_rows=%s",
+            spreadsheet_id,
+            tab,
+            updated,
+        )
+    except Exception as exc:
+        logger.warning(
+            "failed to persist internal POC assigned owner sheet=%s tab=%s err=%s",
+            spreadsheet_id,
+            tab,
+            exc,
+        )
 
 
 def _persist_linkedin_posts_assigned_owner(

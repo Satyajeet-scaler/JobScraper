@@ -44,3 +44,27 @@ def load_owner_rows_for_handover() -> list[dict[str, str]] | None:
         return None
     rows = worksheet_row_dicts(owners_ws)
     return rows if rows else None
+
+
+def load_internal_poc_tag_rows() -> list[dict[str, str]]:
+    """
+    Read ``INTERNAL_POC_TAG_SHEET_NAME`` from ``GOOGLE_SPREADSHEET_ID``.
+
+    Tab maps ``owner_email`` / ``email`` to ``owner_slack_id`` for Slack tagging (Case 2).
+    Returns an empty list if env tab name is unset, spreadsheet missing, or sheet unreadable.
+    """
+    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
+    tab = (os.getenv("INTERNAL_POC_TAG_SHEET_NAME") or "").strip()
+    if not spreadsheet_id:
+        return []
+    if not tab:
+        logger.info("internal POC tag sheet skipped: INTERNAL_POC_TAG_SHEET_NAME not set")
+        return []
+    try:
+        writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
+        ws = writer.sheet.worksheet(tab)
+    except Exception as exc:
+        logger.warning("internal POC tag sheet unavailable tab=%s err=%s", tab, exc)
+        return []
+    rows = worksheet_row_dicts(ws)
+    return rows

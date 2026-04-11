@@ -28,6 +28,7 @@
 # Optional: COMPANY_CONTACTS_COMPANY_COLUMN=Name of company
 # Optional: COMPANY_CONTACTS_EMAIL_COLUMN=Email Address
 # Optional: OWNER_SHEET_NAME=owner_slack_ID
+# Optional: INTERNAL_POC_TAG_SHEET_NAME=internal_poc_slack — tab in GOOGLE_SPREADSHEET_ID mapping owner_email (or email) + owner_slack_id for Case 2 Slack tags (no round-robin)
 # Optional: LINKEDIN_POSTS_OWNER_HANDOVER=true — LinkedIn post Slack uses same owner round-robin + grouped blocks as job handover
 # These contacts are used as fallback recruiter_email rows in recruiters_info_{date}
 # Optional: HIRECAFE_ENABLED=false — disable HireCafe in daily scrape pipeline (default: enabled)

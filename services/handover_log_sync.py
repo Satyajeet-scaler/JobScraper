@@ -65,12 +65,9 @@ def _linkedin_row_to_log_cells(row: dict[str, Any]) -> list[str]:
     link = slack_post_url_from_row(row).strip()
     if link in ("", "-"):
         link = str(row.get("post_url") or "").strip()
-    company = str(row.get("company") or "").strip()
-    jth = str(row.get("job_title_hint") or "").strip()
-    role_cat = str(row.get("role_category") or "").strip()
-    title = jth or role_cat
     owner = str(row.get("assigned owner") or "").strip()
-    return [run_date, link, company, title, owner, "", "", ""]
+    # Company name + Title are not used for LinkedIn post leads; sheet convention is NA.
+    return [run_date, link, "NA", "NA", owner, "", "", ""]
 
 
 def sync_handover_log_to_sheet(run_date: str) -> dict[str, Any]:

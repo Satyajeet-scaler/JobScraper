@@ -1,6 +1,9 @@
+import ctypes
+import gc
 import json
 import math
 import os
+import sys
 import uuid
 import logging
 from pathlib import Path
@@ -214,6 +217,93 @@ def _run_linkedin_auto_login_and_log(job_id: str) -> None:
         logger.exception("linkedin_auto_login[%s] failed: %s", job_id, exc)
 
 
+def _get_rss_mb() -> float:
+    """Current RSS in MiB (Linux /proc, fallback to resource module)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("VmRSS:"):
+                    return int(line.split()[1]) / 1024
+    except OSError:
+        pass
+    try:
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    except Exception:
+        return 0.0
+
+
+def _malloc_trim() -> bool:
+    """Ask glibc to return free heap pages to the OS. Linux-only, no-op elsewhere."""
+    if sys.platform != "linux":
+        return False
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        return libc.malloc_trim(0) != 0
+    except (OSError, AttributeError):
+        return False
+
+
+def free_memory() -> dict[str, Any]:
+    """
+    Aggressively free process memory after heavy cron workloads.
+    1. Clear all in-process run-metrics dicts (stale data that grows unbounded).
+    2. Full GC sweep.
+    3. malloc_trim to release freed heap pages back to the OS.
+    """
+    rss_before = _get_rss_mb()
+
+    from services.pipeline import PIPELINE_RUN_METRICS
+    from services.scrape_relevance_service import SCRAPE_ONLY_RUN_METRICS, CLASSIFY_ONLY_RUN_METRICS
+    from services.recruiter_info_service import RECRUITER_INFO_RUN_METRICS
+    from services.linkedin_posts_pipeline import LINKEDIN_POSTS_RUN_METRICS
+    from services.linkedin_posts_split_service import (
+        LINKEDIN_POSTS_SCRAPE_ONLY_RUN_METRICS,
+        LINKEDIN_POSTS_CLASSIFY_ONLY_RUN_METRICS,
+    )
+    from services.naukri_only_pipeline import NAUKRI_RUN_METRICS
+    from services.wellfound_only_pipeline import WELLFOUND_RUN_METRICS
+    from services.wellfound_classify_pipeline import WELLFOUND_CLASSIFY_RUN_METRICS
+    from services.hirecafe_only_pipeline import HIRECAFE_RUN_METRICS
+
+    all_metrics = [
+        PIPELINE_RUN_METRICS,
+        SCRAPE_ONLY_RUN_METRICS,
+        CLASSIFY_ONLY_RUN_METRICS,
+        RECRUITER_INFO_RUN_METRICS,
+        LINKEDIN_POSTS_RUN_METRICS,
+        LINKEDIN_POSTS_SCRAPE_ONLY_RUN_METRICS,
+        LINKEDIN_POSTS_CLASSIFY_ONLY_RUN_METRICS,
+        NAUKRI_RUN_METRICS,
+        WELLFOUND_RUN_METRICS,
+        WELLFOUND_CLASSIFY_RUN_METRICS,
+        HIRECAFE_RUN_METRICS,
+    ]
+    entries_cleared = sum(len(m) for m in all_metrics)
+    for m in all_metrics:
+        m.clear()
+
+    gc.collect()
+    trimmed = _malloc_trim()
+
+    rss_after = _get_rss_mb()
+    result = {
+        "rss_before_mb": round(rss_before, 1),
+        "rss_after_mb": round(rss_after, 1),
+        "freed_mb": round(rss_before - rss_after, 1),
+        "metrics_entries_cleared": entries_cleared,
+        "gc_collected": True,
+        "malloc_trimmed": trimmed,
+    }
+    logger.info("free_memory result=%s", result)
+    return result
+
+
+def _run_free_memory_from_scheduler() -> None:
+    logger.info("scheduler triggered post-cron memory cleanup")
+    free_memory()
+
+
 def _build_scheduler() -> BackgroundScheduler:
     timezone_name = os.getenv("CRON_TIMEZONE", "Asia/Kolkata")
     timezone = ZoneInfo(timezone_name)
@@ -273,6 +363,15 @@ def _build_scheduler() -> BackgroundScheduler:
         coalesce=True,
         misfire_grace_time=1800,
     )
+    scheduler.add_job(
+        _run_free_memory_from_scheduler,
+        trigger=CronTrigger(hour=9, minute=45, timezone=timezone),
+        id="daily-post-cron-memory-cleanup",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=1800,
+    )
     return scheduler
 
 
@@ -293,7 +392,7 @@ def startup_event() -> None:
     logger.info(
         (
             "internal scheduler started timezone=%s "
-            "scrape=%s classify=%s recruiter=%s linkedin_scrape=%s linkedin_classify=%s slack=%s"
+            "scrape=%s classify=%s recruiter=%s linkedin_scrape=%s linkedin_classify=%s slack=%s memory_cleanup=%s"
         ),
         os.getenv("CRON_TIMEZONE", "Asia/Kolkata"),
         "00:10",
@@ -302,6 +401,7 @@ def startup_event() -> None:
         "04:00",
         "05:00",
         "09:30",
+        "09:45",
     )
 
 
@@ -331,6 +431,16 @@ def debug_time() -> dict:
         "now_utc": datetime.now(utc).isoformat(),
         "cron_timezone": os.getenv("CRON_TIMEZONE", "Asia/Kolkata"),
     }
+
+
+@app.post("/internal/free-memory")
+def trigger_free_memory(
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """Force garbage collection and release heap memory back to the OS."""
+    validate_internal_trigger_token(x_internal_token)
+    result = free_memory()
+    return JSONResponse(content=jsonable_encoder(result))
 
 
 @app.get("/")

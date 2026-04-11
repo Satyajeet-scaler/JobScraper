@@ -15,6 +15,10 @@
 # Optional: LINKEDIN_RECRUITER_RETRY_BASE_DELAY_S=1
 # Optional: LINKEDIN_RECRUITER_LAUNCH_RETRY_COUNT=1 (retry whole recruiter scrape on Chromium launch crash)
 # Optional: LINKEDIN_RECRUITER_LAUNCH_RETRY_DELAY_S=3
+# Optional: LINKEDIN_RECRUITER_BETWEEN_JOBS_MIN_S=1.2 LINKEDIN_RECRUITER_BETWEEN_JOBS_MAX_S=3.8 — random pause before each job URL (after the first)
+# Optional: LINKEDIN_RECRUITER_RECYCLE_EXTRA_MIN_S=1.5 LINKEDIN_RECRUITER_RECYCLE_EXTRA_MAX_S=4.0 — extra pause after browser recycle
+# Optional: LINKEDIN_RECRUITER_HYDRATION_JITTER=0.18 — randomize post-load wait (fraction of base hydration wait)
+# Optional: LINKEDIN_RECRUITER_MICRO_PAUSE_MAX_S=0.45 — max seconds for tiny random pause after navigation (before hydration)
 # Optional: LINKEDIN_POSTS_PIPELINE_ENABLED=true — run LinkedIn-posts Apify pipeline in parallel with /internal/run-daily-jobs
 # Optional: APIFY_LINKEDIN_POSTS_ACTOR_ID=buIWk2uOUzTmcLsuB
 # Optional: APIFY_LINKEDIN_POST_QUERIES='["hiring data analyst Bangalore","hiring backend developer India"]'

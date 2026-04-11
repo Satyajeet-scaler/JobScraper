@@ -113,6 +113,50 @@ def internal_poc_email_owner_map(rows: list[dict[str, str]]) -> dict[str, dict[s
     return out
 
 
+def split_recruiter_email_field(raw: str | None) -> list[str]:
+    """
+    ``recruiters_info.recruiter_email`` may list multiple addresses (comma or semicolon).
+    Returns stripped tokens in order; drops empties.
+    """
+    if not raw:
+        return []
+    parts: list[str] = []
+    for chunk in raw.replace(";", ",").split(","):
+        t = chunk.strip()
+        if t:
+            parts.append(t)
+    return parts
+
+
+def match_internal_poc_owners_ordered(
+    raw_recruiter_email: str,
+    email_map: dict[str, dict[str, str]],
+) -> list[dict[str, str]]:
+    """
+    Every distinct token that appears in ``email_map`` becomes one tagged owner, in field order.
+    Duplicate tokens (same email twice) are only tagged once.
+    """
+    seen_matched: set[str] = set()
+    out: list[dict[str, str]] = []
+    for token in split_recruiter_email_field(raw_recruiter_email):
+        key = normalize_email(token)
+        if not key or key in seen_matched:
+            continue
+        if key in email_map:
+            seen_matched.add(key)
+            out.append(email_map[key])
+    return out
+
+
+def internal_poc_owner_tag_line(matched_owners: list[dict[str, str]]) -> str:
+    """Slack tag line: one owner or several joined with `` · ``."""
+    if not matched_owners:
+        return "*Unassigned*"
+    if len(matched_owners) == 1:
+        return owner_tag_for_handover(matched_owners[0])
+    return " · ".join(owner_tag_for_handover(o) for o in matched_owners)
+
+
 def load_recruiter_rows_split_for_handover(
     run_date: str,
 ) -> tuple[list[dict[str, str]], list[dict[str, str]], list[dict[str, str]]]:
@@ -210,7 +254,7 @@ def send_internal_poc_handover_case(
     defaults: SlackNotifyDefaults,
 ) -> int:
     """
-    Case 2: heading + per-lead tag from ``INTERNAL_POC_TAG_SHEET_NAME`` email map, else *Unassigned*.
+    Case 2: heading + per-lead tag(s) from ``INTERNAL_POC_TAG_SHEET_NAME`` (all matching emails), else *Unassigned*.
     Does not use the main owner round-robin sheet.
     """
     if not rows:
@@ -226,17 +270,30 @@ def send_internal_poc_handover_case(
 
     for row in rows:
         poc_email = (row.get("recruiter_email") or "-").strip() or "-"
-        nk = normalize_email(poc_email) if poc_email != "-" else ""
-        matched = email_map.get(nk) if nk else None
-        if matched:
-            tag = owner_tag_for_handover(matched)
-        else:
-            if nk:
-                logger.warning(
-                    "internal POC handover: no Slack tag mapping for recruiter_email=%s",
-                    poc_email,
-                )
-            tag = "*Unassigned*"
+        raw_for_match = "" if poc_email == "-" else poc_email
+        tokens = split_recruiter_email_field(raw_for_match)
+        matched_owners = match_internal_poc_owners_ordered(raw_for_match, email_map)
+        unmatched_nk: set[str] = set()
+        unmatched_tokens: list[str] = []
+        for t in tokens:
+            nk = normalize_email(t)
+            if not nk:
+                continue
+            if nk not in email_map and nk not in unmatched_nk:
+                unmatched_nk.add(nk)
+                unmatched_tokens.append(t)
+        if unmatched_tokens:
+            logger.warning(
+                "internal POC handover: no Slack tag mapping for email(s) %s (recruiter_email=%s)",
+                ", ".join(unmatched_tokens),
+                poc_email,
+            )
+        elif tokens and not matched_owners:
+            logger.warning(
+                "internal POC handover: no Slack tag mapping for recruiter_email=%s",
+                poc_email,
+            )
+        tag = internal_poc_owner_tag_line(matched_owners)
         company = (row.get("company") or "-").strip() or "-"
         role = (row.get("role_category") or row.get("matched_role") or "-").strip() or "-"
         job_url = (row.get("job_url") or "-").strip() or "-"
@@ -622,9 +679,10 @@ def _persist_internal_poc_assigned_owner(
                 row_dict[header] = row[idx].strip() if idx < len(row) else ""
             if not selector_case2(row_dict):
                 continue
-            rec_email = normalize_email((row_dict.get("recruiter_email") or "").strip())
-            if rec_email and rec_email in email_map:
-                row[assigned_col_idx] = _owner_display_name(email_map[rec_email])
+            raw_rec = (row_dict.get("recruiter_email") or "").strip()
+            matched_owners = match_internal_poc_owners_ordered(raw_rec, email_map)
+            if matched_owners:
+                row[assigned_col_idx] = "; ".join(_owner_display_name(o) for o in matched_owners)
             else:
                 row[assigned_col_idx] = "Unassigned"
             updated += 1

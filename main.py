@@ -48,6 +48,7 @@ from services.linkedin_posts_split_service import (
     run_linkedin_posts_classify_only,
     run_linkedin_posts_scrape_only,
 )
+from services.handover_log_sync import sync_handover_log_to_sheet
 from services.slack_handover_notify import send_handover_notifications
 from services.slack_handover_summary import send_handover_summary_to_slack
 
@@ -195,6 +196,11 @@ def _run_slack_handover_from_scheduler() -> None:
         send_internal_poc=True,
     )
     logger.info("scheduler slack-handover summary-counts=%s", summary_counts)
+    try:
+        log_sync = sync_handover_log_to_sheet(run_date)
+        logger.info("scheduler handover-log-sync result=%s", log_sync)
+    except Exception as exc:
+        logger.exception("scheduler handover-log-sync failed: %s", exc)
 
 
 def _run_linkedin_auto_login_and_log(job_id: str) -> None:
@@ -821,6 +827,11 @@ def internal_send_slack_handover(
         username=body.get("username") if isinstance(body.get("username"), str) else None,
         icon_emoji=body.get("icon_emoji") if isinstance(body.get("icon_emoji"), str) else None,
     )
+    try:
+        result["handover_log_sync"] = sync_handover_log_to_sheet(run_date)
+    except Exception as exc:
+        logger.exception("handover_log_sync after internal send-slack-handover failed: %s", exc)
+        result["handover_log_sync"] = {"error": str(exc)}
     return JSONResponse(content=jsonable_encoder(result))
 
 
@@ -864,6 +875,28 @@ def internal_send_slack_handover_summary(
         username=body.get("username") if isinstance(body.get("username"), str) else None,
         icon_emoji=body.get("icon_emoji") if isinstance(body.get("icon_emoji"), str) else None,
     )
+    return JSONResponse(content=jsonable_encoder(result))
+
+
+@app.post("/internal/sync-handover-log")
+def internal_sync_handover_log(
+    run_date: Optional[str] = Query(
+        default=None,
+        description="Pipeline date YYYY-MM-DD (tabs recruiters_info_{date}, linkedin_posts_relevant_{date}). Defaults to today in cron timezone.",
+    ),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """
+    Append rows to ``HANDOVER_LOG_SPREADSHEET_ID`` from recruiter + LinkedIn relevant sheets for ``run_date``.
+    Requires Slack handover to have run first so ``assigned owner`` is populated (unless backfilling manually).
+    """
+    validate_internal_trigger_token(x_internal_token)
+    if run_date is not None:
+        run_date = run_date.strip()
+        if not run_date:
+            raise HTTPException(status_code=400, detail="run_date must be a non-empty YYYY-MM-DD string.")
+    resolved = run_date or _cron_today()
+    result = sync_handover_log_to_sheet(resolved)
     return JSONResponse(content=jsonable_encoder(result))
 
 

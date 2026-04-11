@@ -63,6 +63,48 @@ class GoogleSheetsWriter:
             worksheet.update(f"A{start_row}:{end_col_letter}{end_row}", chunk)
             start_row = end_row + 1
 
+    def append_to_worksheet(
+        self,
+        worksheet_title: str,
+        data_rows: list[list[str]],
+        *,
+        header_row: list[str] | None = None,
+        chunk_size: int = 200,
+    ) -> None:
+        """
+        Append rows to an existing worksheet, or create the tab if missing.
+        If the worksheet is empty, writes ``header_row`` first (if provided), then data.
+        """
+        if not data_rows and not header_row:
+            return
+
+        try:
+            ws = self.sheet.worksheet(worksheet_title)
+        except gspread.WorksheetNotFound:
+            col_n = max(
+                len(header_row) if header_row else 0,
+                max((len(r) for r in data_rows), default=0),
+                8,
+            )
+            row_n = max(len(data_rows) + (2 if header_row else 1) + 10, 100)
+            ws = self.sheet.add_worksheet(title=worksheet_title, rows=row_n, cols=col_n)
+
+        existing = ws.get_all_values()
+        if not existing:
+            if header_row:
+                ws.append_rows([header_row], value_input_option="USER_ENTERED")
+
+        if not data_rows:
+            return
+
+        for idx in range(0, len(data_rows), chunk_size):
+            chunk = data_rows[idx : idx + chunk_size]
+            safe_chunk: list[list[str]] = []
+            for row in chunk:
+                safe_row = [self._stringify(c) for c in row]
+                safe_chunk.append(safe_row)
+            ws.append_rows(safe_chunk, value_input_option="USER_ENTERED")
+
     def _replace_worksheet(
         self,
         worksheet_title: str,

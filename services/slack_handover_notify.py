@@ -192,12 +192,19 @@ def load_recruiter_rows_split_for_handover(
     return filtered, case3, case2
 
 
+def linkedin_posts_relevant_tab_name(run_date: str) -> str:
+    """Tab name for relevant LinkedIn posts (matches ``LINKEDIN_POSTS_RELEVANT_TAB_TEMPLATE``)."""
+    return os.getenv("LINKEDIN_POSTS_RELEVANT_TAB_TEMPLATE", "linkedin_posts_relevant_{date}").format(
+        date=run_date
+    )
+
+
 def load_linkedin_relevant_posts_from_sheet(run_date: str) -> list[dict[str, Any]]:
     """Read ``linkedin_posts_relevant_{run_date}`` tab."""
     spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
     if not spreadsheet_id:
         return []
-    tab = f"linkedin_posts_relevant_{run_date}"
+    tab = linkedin_posts_relevant_tab_name(run_date)
     try:
         writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
         ws = writer.sheet.worksheet(tab)
@@ -720,7 +727,7 @@ def _persist_linkedin_posts_assigned_owner(
     if not spreadsheet_id or not owner_rows:
         return
     rd = (run_date or date.today().isoformat()).strip()
-    tab = f"linkedin_posts_relevant_{rd}"
+    tab = linkedin_posts_relevant_tab_name(rd)
 
     def selector(row: dict[str, str]) -> bool:
         row_run_date = (row.get("run_date") or "").strip()

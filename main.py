@@ -2,6 +2,7 @@ import ctypes
 import gc
 import json
 import math
+import multiprocessing
 import os
 import sys
 import uuid
@@ -144,43 +145,55 @@ def _cron_today() -> str:
     return datetime.now(tz).strftime("%Y-%m-%d")
 
 
-def _run_scrape_jobs_from_scheduler() -> None:
-    run_id = str(uuid.uuid4())
-    run_date = _cron_today()
+def _run_in_subprocess(func, *args, **kwargs) -> None:
+    """
+    Run func(*args, **kwargs) in a forked child process.
+    When the child exits, the OS reclaims ALL its memory instantly --
+    no heap fragmentation, no malloc_trim needed.
+    The parent (FastAPI) process stays at baseline RSS.
+    """
+    name = getattr(func, "__name__", str(func))
+    proc = multiprocessing.Process(target=func, args=args, kwargs=kwargs)
+    proc.start()
+    proc.join()
+    if proc.exitcode == 0:
+        logger.info("subprocess %s pid=%d completed successfully", name, proc.pid)
+    else:
+        logger.error("subprocess %s pid=%d exited with code %d", name, proc.pid, proc.exitcode or -1)
+
+
+def _scrape_jobs_work(run_id: str, run_date: str) -> None:
+    _configure_logging()
     logger.info("scheduler triggered scrape-only run_id=%s run_date=%s", run_id, run_date)
     run_scrape_jobs_only(run_id=run_id, run_date=run_date)
 
 
-def _run_classify_relevant_from_scheduler() -> None:
-    run_id = str(uuid.uuid4())
-    run_date = _cron_today()
+def _classify_relevant_work(run_id: str, run_date: str) -> None:
+    _configure_logging()
     logger.info("scheduler triggered classify-only run_id=%s run_date=%s", run_id, run_date)
     run_classify_relevant_only(run_id=run_id, run_date=run_date)
 
 
-def _run_recruiter_info_from_scheduler() -> None:
-    run_id = str(uuid.uuid4())
-    run_date = _cron_today()
+def _recruiter_info_work(run_id: str, run_date: str) -> None:
+    _configure_logging()
     logger.info("scheduler triggered recruiter-info run_id=%s run_date=%s", run_id, run_date)
     run_recruiter_info_extraction(run_id=run_id, run_date=run_date)
 
 
-def _run_linkedin_posts_scrape_from_scheduler() -> None:
-    run_id = str(uuid.uuid4())
-    run_date = _cron_today()
+def _linkedin_posts_scrape_work(run_id: str, run_date: str) -> None:
+    _configure_logging()
     logger.info("scheduler triggered linkedin-posts-scrape run_id=%s run_date=%s", run_id, run_date)
     run_linkedin_posts_scrape_only(run_id=run_id, run_date=run_date)
 
 
-def _run_linkedin_posts_classify_from_scheduler() -> None:
-    run_id = str(uuid.uuid4())
-    run_date = _cron_today()
+def _linkedin_posts_classify_work(run_id: str, run_date: str) -> None:
+    _configure_logging()
     logger.info("scheduler triggered linkedin-posts-classify run_id=%s run_date=%s", run_id, run_date)
     run_linkedin_posts_classify_only(run_id=run_id, run_date=run_date)
 
 
-def _run_slack_handover_from_scheduler() -> None:
-    run_date = _cron_today()
+def _slack_handover_work(run_date: str) -> None:
+    _configure_logging()
     logger.info("scheduler triggered slack-handover run_date=%s", run_date)
     summary = send_handover_notifications(
         run_date=run_date,
@@ -201,6 +214,30 @@ def _run_slack_handover_from_scheduler() -> None:
         logger.info("scheduler handover-log-sync result=%s", log_sync)
     except Exception as exc:
         logger.exception("scheduler handover-log-sync failed: %s", exc)
+
+
+def _run_scrape_jobs_from_scheduler() -> None:
+    _run_in_subprocess(_scrape_jobs_work, str(uuid.uuid4()), _cron_today())
+
+
+def _run_classify_relevant_from_scheduler() -> None:
+    _run_in_subprocess(_classify_relevant_work, str(uuid.uuid4()), _cron_today())
+
+
+def _run_recruiter_info_from_scheduler() -> None:
+    _run_in_subprocess(_recruiter_info_work, str(uuid.uuid4()), _cron_today())
+
+
+def _run_linkedin_posts_scrape_from_scheduler() -> None:
+    _run_in_subprocess(_linkedin_posts_scrape_work, str(uuid.uuid4()), _cron_today())
+
+
+def _run_linkedin_posts_classify_from_scheduler() -> None:
+    _run_in_subprocess(_linkedin_posts_classify_work, str(uuid.uuid4()), _cron_today())
+
+
+def _run_slack_handover_from_scheduler() -> None:
+    _run_in_subprocess(_slack_handover_work, _cron_today())
 
 
 def _run_linkedin_auto_login_and_log(job_id: str) -> None:

@@ -35,6 +35,7 @@ from services.wellfound_classify_pipeline import (
     run_wellfound_classify_only_pipeline,
 )
 from services.hirecafe_only_pipeline import get_hirecafe_run_metrics, run_hirecafe_scrape_only_pipeline
+from services.hirist_only_pipeline import get_hirist_run_metrics, run_hirist_scrape_only_pipeline
 from services.linkedin_posts_pipeline import get_linkedin_posts_run_metrics, run_linkedin_posts_pipeline
 from services.scrape_relevance_service import (
     get_classify_only_run_metrics,
@@ -736,6 +737,33 @@ def get_hirecafe_run_status(
 ) -> JSONResponse:
     validate_internal_trigger_token(x_internal_token)
     metrics = get_hirecafe_run_metrics(run_id)
+    if not metrics:
+        raise HTTPException(status_code=404, detail="Run ID not found.")
+    return JSONResponse(content=metrics)
+
+
+@app.post("/internal/run-hirist-scrape")
+def run_hirist_scrape(
+    background_tasks: BackgroundTasks,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+
+    run_id = str(uuid.uuid4())
+    background_tasks.add_task(run_hirist_scrape_only_pipeline, run_id)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={"run_id": run_id, "status": "accepted"},
+    )
+
+
+@app.get("/internal/run-hirist-scrape/{run_id}")
+def get_hirist_run_status(
+    run_id: str,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    metrics = get_hirist_run_metrics(run_id)
     if not metrics:
         raise HTTPException(status_code=404, detail="Run ID not found.")
     return JSONResponse(content=metrics)

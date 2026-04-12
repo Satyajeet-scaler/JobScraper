@@ -25,6 +25,7 @@ from services.slack_handover_notify import (
 from services.apify_naukri import normalize_naukri_item, scrape_naukri_jobs
 from services.apify_wellfound import normalize_wellfound_item, scrape_wellfound_jobs
 from services.hire_cafe import normalize_hirecafe_item, scrape_hirecafe_jobs
+from services.hirist import HiristTechService, normalize_hirist_item
 try:
     import google.generativeai as genai
 except ImportError:  # pragma: no cover - optional dependency behavior
@@ -334,6 +335,49 @@ def _scrape_target_jobs() -> list[dict[str, Any]]:
             logger.warning("hirecafe scrape failed: %s", exc)
     else:
         logger.info("hirecafe scrape skipped (HIRECAFE_ENABLED=false)")
+
+    # Hirist.tech via undetected-chromedriver (same runtime expectations as HireCafe).
+    if os.getenv("HIRIST_ENABLED", "true").lower() not in ("0", "false", "no"):
+        hirist_max_scrolls = int(os.getenv("HIRIST_MAX_SCROLLS", "250"))
+        hirist_max_runtime = int(os.getenv("HIRIST_MAX_RUNTIME_SECONDS", "300"))
+        hirist_max_idle = int(os.getenv("HIRIST_MAX_IDLE_SECONDS", "90"))
+        hirist_min_scroll_delay = float(os.getenv("HIRIST_MIN_SCROLL_DELAY_SECONDS", "1.0"))
+        hirist_max_scroll_delay = float(os.getenv("HIRIST_MAX_SCROLL_DELAY_SECONDS", "2.0"))
+        hirist_headless = os.getenv("HIRIST_HEADLESS", "true").lower() not in ("0", "false", "no")
+        hirist_recent_hours = int(os.getenv("HIRIST_RECENT_MAX_AGE_HOURS", "24"))
+        hirist_include_desc = os.getenv("HIRIST_INCLUDE_JOB_DESCRIPTION", "true").lower() not in ("0", "false", "no")
+        logger.info(
+            "hirist scrape starting max_scrolls=%s max_runtime_s=%s headless=%s",
+            hirist_max_scrolls,
+            hirist_max_runtime,
+            hirist_headless,
+        )
+        try:
+            hirist_result = _retry(
+                action=lambda: HiristTechService.scrape_hirist_categories(
+                    max_scrolls=hirist_max_scrolls,
+                    max_runtime_seconds=hirist_max_runtime,
+                    max_idle_seconds=hirist_max_idle,
+                    min_scroll_delay_seconds=hirist_min_scroll_delay,
+                    max_scroll_delay_seconds=hirist_max_scroll_delay,
+                    headless=hirist_headless,
+                    recent_job_max_age_hours=hirist_recent_hours,
+                    include_job_description=hirist_include_desc,
+                ),
+                retries=2,
+                initial_delay_seconds=5.0,
+            )
+            hirist_items: list[dict[str, Any]] = []
+            for card in hirist_result.get("recent_jobs") or []:
+                normalized = normalize_hirist_item(card)
+                normalized["role_query"] = "hirist.tech"
+                hirist_items.append(normalized)
+            logger.info("hirist scrape completed fetched=%s", len(hirist_items))
+            all_jobs.extend(hirist_items)
+        except Exception as exc:
+            logger.warning("hirist scrape failed: %s", exc)
+    else:
+        logger.info("hirist scrape skipped (HIRIST_ENABLED=false)")
 
     for role in TARGET_ROLES:
         logger.info(

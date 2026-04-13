@@ -11,8 +11,7 @@ from services.google_sheets import GoogleSheetsWriter
 logger = logging.getLogger(__name__)
 
 
-def worksheet_row_dicts(worksheet: Any) -> list[dict[str, str]]:
-    values = worksheet.get_all_values()
+def worksheet_row_dicts(values: list[list[Any]]) -> list[dict[str, str]]:
     if len(values) <= 1:
         return []
     headers = [str(h or "").strip() for h in values[0]]
@@ -38,11 +37,12 @@ def load_owner_rows_for_handover() -> list[dict[str, str]] | None:
     owner_tab = os.getenv("OWNER_SHEET_NAME", "owner_slack_ID")
     try:
         writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-        owners_ws = writer.sheet.worksheet(owner_tab)
+        owners_ws = writer.open_worksheet(owner_tab)
+        raw = writer.worksheet_get_all_values(owners_ws, f"handover_owners:{owner_tab}:get_all_values")
     except Exception as exc:
         logger.warning("handover owner sheet unavailable tab=%s err=%s", owner_tab, exc)
         return None
-    rows = worksheet_row_dicts(owners_ws)
+    rows = worksheet_row_dicts(raw)
     return rows if rows else None
 
 
@@ -62,9 +62,10 @@ def load_internal_poc_tag_rows() -> list[dict[str, str]]:
         return []
     try:
         writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-        ws = writer.sheet.worksheet(tab)
+        ws = writer.open_worksheet(tab)
+        raw = writer.worksheet_get_all_values(ws, f"internal_poc_tag:{tab}:get_all_values")
     except Exception as exc:
         logger.warning("internal POC tag sheet unavailable tab=%s err=%s", tab, exc)
         return []
-    rows = worksheet_row_dicts(ws)
+    rows = worksheet_row_dicts(raw)
     return rows

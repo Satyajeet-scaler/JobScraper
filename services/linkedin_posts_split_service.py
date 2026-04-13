@@ -6,6 +6,8 @@ from datetime import date
 from time import perf_counter
 from typing import Any
 
+from gspread.exceptions import APIError
+
 from services.apify_linkedin_posts import normalize_linkedin_post_item, scrape_linkedin_posts
 from services.google_sheets import GoogleSheetsWriter
 from services.handover_owners import worksheet_row_dicts
@@ -62,7 +64,15 @@ def run_linkedin_posts_scrape_only(run_id: str | None = None, run_date: str | No
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         LINKEDIN_POSTS_SCRAPE_ONLY_RUN_METRICS[pipeline_run_id] = metrics
-        logger.exception("linkedin-posts-scrape-only[%s] failed: %s", pipeline_run_id, exc)
+        if isinstance(exc, APIError):
+            logger.exception(
+                "linkedin-posts-scrape-only[%s] failed: Google Sheets API error while writing "
+                "(Apify scrape may have completed). %s",
+                pipeline_run_id,
+                exc,
+            )
+        else:
+            logger.exception("linkedin-posts-scrape-only[%s] failed: %s", pipeline_run_id, exc)
         raise
 
 
@@ -123,7 +133,7 @@ def _resolve_scraped_run_date(run_date: str | None) -> str:
 
 def _list_worksheet_titles() -> list[str]:
     writer = _get_writer()
-    return [ws.title for ws in writer.sheet.worksheets()]
+    return [ws.title for ws in writer.list_worksheets()]
 
 
 def _latest_scraped_tab_date(titles: list[str]) -> str | None:
@@ -138,8 +148,9 @@ def _latest_scraped_tab_date(titles: list[str]) -> str | None:
 def _read_scraped_rows(run_date: str) -> list[dict[str, Any]]:
     writer = _get_writer()
     tab = f"linkedin_posts_scraped_{run_date}"
-    worksheet = writer.sheet.worksheet(tab)
-    rows = worksheet_row_dicts(worksheet)
+    worksheet = writer.open_worksheet(tab)
+    raw = writer.worksheet_get_all_values(worksheet, f"linkedin_posts_scraped_read:{tab}:get_all_values")
+    rows = worksheet_row_dicts(raw)
     if not rows:
         raise RuntimeError(f"No rows found in worksheet {tab}.")
     return [dict(r) for r in rows]

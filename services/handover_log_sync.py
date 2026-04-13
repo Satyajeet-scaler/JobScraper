@@ -35,8 +35,9 @@ def _load_linkedin_relevant_rows(run_date: str) -> list[dict[str, Any]]:
     tab = linkedin_posts_relevant_tab_name(run_date)
     try:
         writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-        ws = writer.sheet.worksheet(tab)
-        rows = worksheet_row_dicts(ws)
+        ws = writer.open_worksheet(tab)
+        raw = writer.worksheet_get_all_values(ws, f"handover_log_sync:{tab}:get_all_values")
+        rows = worksheet_row_dicts(raw)
         logger.info("handover_log_sync loaded %s linkedin relevant rows from %s", len(rows), tab)
         return list(rows)
     except Exception as exc:

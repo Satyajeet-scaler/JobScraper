@@ -63,8 +63,8 @@ def _load_sheet_rows(spreadsheet_id: str, tab_name: str) -> list[dict[str, str]]
     from services.google_sheets import GoogleSheetsWriter
 
     writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-    ws = writer.sheet.worksheet(tab_name)
-    records = ws.get_all_values()
+    ws = writer.open_worksheet(tab_name)
+    records = writer.worksheet_get_all_values(ws, f"send_linkedin_handover:sheet_rows:{tab_name}")
     if len(records) <= 1:
         return []
     headers = [h.strip().lower() for h in records[0]]
@@ -81,8 +81,8 @@ def _load_owner_rows(spreadsheet_id: str, tab_name: str) -> list[dict[str, str]]
     from services.google_sheets import GoogleSheetsWriter
 
     writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-    ws = writer.sheet.worksheet(tab_name)
-    records = ws.get_all_values()
+    ws = writer.open_worksheet(tab_name)
+    records = writer.worksheet_get_all_values(ws, f"send_linkedin_handover:owner_rows:{tab_name}")
     if len(records) <= 1:
         return []
     headers = [h.strip().lower() for h in records[0]]

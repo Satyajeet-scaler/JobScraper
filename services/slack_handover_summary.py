@@ -21,11 +21,12 @@ def _load_rows(tab_name: str) -> list[dict[str, str]]:
         return []
     try:
         writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-        worksheet = writer.sheet.worksheet(tab_name)
+        worksheet = writer.open_worksheet(tab_name)
+        raw = writer.worksheet_get_all_values(worksheet, f"handover_summary:{tab_name}:get_all_values")
     except Exception as exc:
         logger.warning("handover summary: worksheet unavailable tab=%s err=%s", tab_name, exc)
         return []
-    return worksheet_row_dicts(worksheet)
+    return worksheet_row_dicts(raw)
 
 
 def _count_recruiter_case3(rows: list[dict[str, str]]) -> int:

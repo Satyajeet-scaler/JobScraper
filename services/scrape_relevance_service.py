@@ -125,7 +125,7 @@ def _resolve_scraped_run_date(run_date: str | None) -> str:
 
 def _list_worksheet_titles() -> list[str]:
     writer = _get_writer()
-    return [ws.title for ws in writer.sheet.worksheets()]
+    return [ws.title for ws in writer.list_worksheets()]
 
 
 def _latest_scraped_tab_date(titles: list[str]) -> str | None:
@@ -140,8 +140,9 @@ def _latest_scraped_tab_date(titles: list[str]) -> str | None:
 def _read_scraped_rows(run_date: str) -> list[dict[str, Any]]:
     writer = _get_writer()
     tab = f"scraped_jobs_{run_date}"
-    ws = writer.sheet.worksheet(tab)
-    rows = worksheet_row_dicts(ws)
+    ws = writer.open_worksheet(tab)
+    raw = writer.worksheet_get_all_values(ws, f"scrape_relevance:{tab}:get_all_values")
+    rows = worksheet_row_dicts(raw)
     if not rows:
         raise RuntimeError(f"No rows found in worksheet {tab}.")
     return [dict(r) for r in rows]

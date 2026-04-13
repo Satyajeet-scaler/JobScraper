@@ -169,12 +169,16 @@ def load_recruiter_rows_split_for_handover(
     recruiters_tab = os.getenv("RECRUITERS_INFO_WORKSHEET") or f"recruiters_info_{run_date}"
     try:
         writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-        recruiters_ws = writer.sheet.worksheet(recruiters_tab)
+        recruiters_ws = writer.open_worksheet(recruiters_tab)
+        raw = writer.worksheet_get_all_values(
+            recruiters_ws,
+            f"slack_handover_recruiters:{recruiters_tab}:get_all_values",
+        )
     except Exception as exc:
         logger.warning("recruiter sheet unavailable tab=%s err=%s", recruiters_tab, exc)
         return [], [], []
 
-    recruiter_rows = worksheet_row_dicts(recruiters_ws)
+    recruiter_rows = worksheet_row_dicts(raw)
     filtered: list[dict[str, str]] = []
     for row in recruiter_rows:
         row_run_date = (row.get("run_date") or "").strip()
@@ -207,8 +211,9 @@ def load_linkedin_relevant_posts_from_sheet(run_date: str) -> list[dict[str, Any
     tab = linkedin_posts_relevant_tab_name(run_date)
     try:
         writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-        ws = writer.sheet.worksheet(tab)
-        rows = worksheet_row_dicts(ws)
+        ws = writer.open_worksheet(tab)
+        raw = writer.worksheet_get_all_values(ws, f"slack_handover_linkedin_relevant:{tab}:get_all_values")
+        rows = worksheet_row_dicts(raw)
         logger.info("loaded %s relevant linkedin posts from sheet %s", len(rows), tab)
         return list(rows)
     except Exception as exc:
@@ -659,8 +664,8 @@ def _persist_internal_poc_assigned_owner(
 
     try:
         writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-        ws = writer.sheet.worksheet(tab)
-        values = ws.get_all_values()
+        ws = writer.open_worksheet(tab)
+        values = writer.worksheet_get_all_values(ws, f"persist_internal_poc:{tab}:get_all_values")
         if not values:
             return
         headers = [str(h or "").strip() for h in values[0]]
@@ -697,12 +702,13 @@ def _persist_internal_poc_assigned_owner(
         if not updated:
             return
 
-        ws.update("A1", [headers])
+        writer.worksheet_update(ws, "A1", [headers], f"persist_internal_poc:{tab}:update_headers")
         col_letter = _column_letter(assigned_col_idx + 1)
         end_row = len(data_rows) + 1
         if end_row >= 2:
             col_values = [[row[assigned_col_idx]] for row in data_rows]
-            ws.update(f"{col_letter}2:{col_letter}{end_row}", col_values)
+            rng = f"{col_letter}2:{col_letter}{end_row}"
+            writer.worksheet_update(ws, rng, col_values, f"persist_internal_poc:{tab}:update_column")
         logger.info(
             "internal POC assigned owner persisted sheet=%s tab=%s updated_rows=%s",
             spreadsheet_id,
@@ -750,8 +756,11 @@ def _persist_assigned_owner_column(
 ) -> None:
     try:
         writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-        ws = writer.sheet.worksheet(worksheet_title)
-        values = ws.get_all_values()
+        ws = writer.open_worksheet(worksheet_title)
+        values = writer.worksheet_get_all_values(
+            ws,
+            f"persist_assigned_owner:{worksheet_title}:get_all_values",
+        )
         if not values:
             return
         headers = [str(h or "").strip() for h in values[0]]
@@ -786,13 +795,24 @@ def _persist_assigned_owner_column(
             data_rows[row_pos][assigned_col_idx] = owner_names[idx % len(owner_names)]
 
         # Ensure header exists before writing column values.
-        ws.update("A1", [headers])
+        writer.worksheet_update(
+            ws,
+            "A1",
+            [headers],
+            f"persist_assigned_owner:{worksheet_title}:update_headers",
+        )
 
         col_letter = _column_letter(assigned_col_idx + 1)
         end_row = len(data_rows) + 1
         if end_row >= 2:
             col_values = [[row[assigned_col_idx]] for row in data_rows]
-            ws.update(f"{col_letter}2:{col_letter}{end_row}", col_values)
+            rng = f"{col_letter}2:{col_letter}{end_row}"
+            writer.worksheet_update(
+                ws,
+                rng,
+                col_values,
+                f"persist_assigned_owner:{worksheet_title}:update_column",
+            )
         logger.info(
             "assigned owner persisted sheet=%s tab=%s updated_rows=%s",
             spreadsheet_id,

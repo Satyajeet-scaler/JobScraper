@@ -267,8 +267,11 @@ def _load_company_contact_email_map() -> dict[str, list[str]]:
 
     try:
         writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-        worksheet = writer.sheet.worksheet(sheet_name)
-        rows = worksheet.get_all_values()
+        worksheet = writer.open_worksheet(sheet_name)
+        rows = writer.worksheet_get_all_values(
+            worksheet,
+            f"linkedin_recruiter_sheets:{sheet_name}:get_all_values",
+        )
     except Exception as exc:
         logger.warning("linkedin recruiter sheet: contacts tab unavailable sheet=%s err=%s", sheet_name, exc)
         return {}

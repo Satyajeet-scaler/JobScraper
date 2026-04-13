@@ -74,8 +74,9 @@ def _read_relevant_jobs(run_date: str) -> list[dict[str, Any]]:
     spreadsheet_id = _require_spreadsheet_id()
     writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
     tab = f"relevant_jobs_{run_date}"
-    ws = writer.sheet.worksheet(tab)
-    rows = worksheet_row_dicts(ws)
+    ws = writer.open_worksheet(tab)
+    raw = writer.worksheet_get_all_values(ws, f"recruiter_info:{tab}:get_all_values")
+    rows = worksheet_row_dicts(raw)
     if not rows:
         raise RuntimeError(f"No rows found in worksheet {tab}.")
     # worksheet_row_dicts returns dict[str,str]; keep as dict for downstream

@@ -98,7 +98,7 @@ def _resolve_wellfound_run_date(run_date: str | None) -> str:
 
 def _list_worksheet_titles() -> list[str]:
     writer = _get_writer()
-    return [ws.title for ws in writer.sheet.worksheets()]
+    return [ws.title for ws in writer.list_worksheets()]
 
 
 def _latest_wellfound_scraped_tab_date(titles: list[str]) -> str | None:
@@ -113,8 +113,9 @@ def _latest_wellfound_scraped_tab_date(titles: list[str]) -> str | None:
 def _read_wellfound_rows(run_date: str) -> list[dict[str, Any]]:
     writer = _get_writer()
     tab_name = f"wellfound_jobs_{run_date}"
-    worksheet = writer.sheet.worksheet(tab_name)
-    rows = worksheet_row_dicts(worksheet)
+    worksheet = writer.open_worksheet(tab_name)
+    raw = writer.worksheet_get_all_values(worksheet, f"wellfound_read:{tab_name}:get_all_values")
+    rows = worksheet_row_dicts(raw)
     if not rows:
         raise RuntimeError(f"No rows found in worksheet {tab_name}.")
     return [dict(row) for row in rows]

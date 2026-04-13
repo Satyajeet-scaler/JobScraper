@@ -1217,8 +1217,9 @@ def _get_recruiter_handover_case_counts(run_date: str) -> tuple[int, int]:
     recruiters_tab = os.getenv("RECRUITERS_INFO_WORKSHEET") or f"recruiters_info_{run_date}"
     try:
         writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-        ws = writer.sheet.worksheet(recruiters_tab)
-        rows = worksheet_row_dicts(ws)
+        ws = writer.open_worksheet(recruiters_tab)
+        raw = writer.worksheet_get_all_values(ws, f"pipeline_handover_counts:{recruiters_tab}:get_all_values")
+        rows = worksheet_row_dicts(raw)
     except Exception as exc:
         logger.warning("handover summary counts skipped: recruiters tab unavailable: %s", exc)
         return 0, 0

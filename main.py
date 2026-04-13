@@ -146,21 +146,24 @@ def _cron_today() -> str:
     return datetime.now(tz).strftime("%Y-%m-%d")
 
 
-def _run_in_subprocess(func, *args, **kwargs) -> None:
+def _run_in_subprocess(func, *args, **kwargs) -> int:
     """
     Run func(*args, **kwargs) in a forked child process.
     When the child exits, the OS reclaims ALL its memory instantly --
     no heap fragmentation, no malloc_trim needed.
     The parent (FastAPI) process stays at baseline RSS.
+    Returns the child process exit code (0 = success).
     """
     name = getattr(func, "__name__", str(func))
     proc = multiprocessing.Process(target=func, args=args, kwargs=kwargs)
     proc.start()
     proc.join()
-    if proc.exitcode == 0:
+    exitcode = proc.exitcode if proc.exitcode is not None else -1
+    if exitcode == 0:
         logger.info("subprocess %s pid=%d completed successfully", name, proc.pid)
     else:
-        logger.error("subprocess %s pid=%d exited with code %d", name, proc.pid, proc.exitcode or -1)
+        logger.error("subprocess %s pid=%d exited with code %d", name, proc.pid, exitcode)
+    return exitcode
 
 
 def _scrape_jobs_work(run_id: str, run_date: str) -> None:
@@ -210,11 +213,6 @@ def _slack_handover_work(run_date: str) -> None:
         send_internal_poc=True,
     )
     logger.info("scheduler slack-handover summary-counts=%s", summary_counts)
-    try:
-        log_sync = sync_handover_log_to_sheet(run_date)
-        logger.info("scheduler handover-log-sync result=%s", log_sync)
-    except Exception as exc:
-        logger.exception("scheduler handover-log-sync failed: %s", exc)
 
 
 def _run_scrape_jobs_from_scheduler() -> None:
@@ -238,7 +236,21 @@ def _run_linkedin_posts_classify_from_scheduler() -> None:
 
 
 def _run_slack_handover_from_scheduler() -> None:
-    _run_in_subprocess(_slack_handover_work, _cron_today())
+    """Run Slack handover in a subprocess, then append to the handover log in the parent."""
+    run_date = _cron_today()
+    exitcode = _run_in_subprocess(_slack_handover_work, run_date)
+    if exitcode != 0:
+        logger.error(
+            "handover-log-sync skipped: slack-handover subprocess failed exitcode=%s run_date=%s",
+            exitcode,
+            run_date,
+        )
+        return
+    try:
+        log_sync = sync_handover_log_to_sheet(run_date)
+        logger.info("scheduler handover-log-sync result=%s", log_sync)
+    except Exception as exc:
+        logger.exception("scheduler handover-log-sync failed: %s", exc)
 
 
 def _run_linkedin_auto_login_and_log(job_id: str) -> None:
@@ -860,6 +872,10 @@ def internal_send_slack_handover(
     """
     Send Slack handovers by reading ``recruiters_info_{date}`` and ``linkedin_posts_relevant_{date}``.
 
+    Does not append to the handover log sheet (avoids duplicate rows on re-runs). The scheduled
+    Slack handover job syncs the log after the handover subprocess completes; use
+    ``POST /internal/sync-handover-log`` for a manual sync.
+
     JSON body (all optional except flags default true):
     - ``run_date``: YYYY-MM-DD (default: today on server)
     - ``send_linkedin_post``: bool (default true)
@@ -892,11 +908,6 @@ def internal_send_slack_handover(
         username=body.get("username") if isinstance(body.get("username"), str) else None,
         icon_emoji=body.get("icon_emoji") if isinstance(body.get("icon_emoji"), str) else None,
     )
-    try:
-        result["handover_log_sync"] = sync_handover_log_to_sheet(run_date)
-    except Exception as exc:
-        logger.exception("handover_log_sync after internal send-slack-handover failed: %s", exc)
-        result["handover_log_sync"] = {"error": str(exc)}
     return JSONResponse(content=jsonable_encoder(result))
 
 

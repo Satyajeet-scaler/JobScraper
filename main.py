@@ -236,21 +236,18 @@ def _run_linkedin_posts_classify_from_scheduler() -> None:
 
 
 def _run_slack_handover_from_scheduler() -> None:
-    """Run Slack handover in a subprocess, then append to the handover log in the parent."""
+    """Run Slack handover in a subprocess (notifications + summary only)."""
+    _run_in_subprocess(_slack_handover_work, _cron_today())
+
+
+def _run_handover_log_sync_from_scheduler() -> None:
+    """Append handover rows to the handover log sheet; runs after the 9:30 Slack handover slot."""
     run_date = _cron_today()
-    exitcode = _run_in_subprocess(_slack_handover_work, run_date)
-    if exitcode != 0:
-        logger.error(
-            "handover-log-sync skipped: slack-handover subprocess failed exitcode=%s run_date=%s",
-            exitcode,
-            run_date,
-        )
-        return
     try:
-        log_sync = sync_handover_log_to_sheet(run_date)
-        logger.info("scheduler handover-log-sync result=%s", log_sync)
-    except Exception as exc:
-        logger.exception("scheduler handover-log-sync failed: %s", exc)
+        result = sync_handover_log_to_sheet(run_date)
+        logger.info("scheduler handover-log-sync result=%s", result)
+    except Exception:
+        logger.exception("scheduler handover-log-sync failed run_date=%s", run_date)
 
 
 def _run_linkedin_auto_login_and_log(job_id: str) -> None:
@@ -420,6 +417,15 @@ def _build_scheduler() -> BackgroundScheduler:
         misfire_grace_time=1800,
     )
     scheduler.add_job(
+        _run_handover_log_sync_from_scheduler,
+        trigger=CronTrigger(hour=9, minute=40, timezone=timezone),
+        id="daily-handover-log-sync",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=1800,
+    )
+    scheduler.add_job(
         _run_free_memory_from_scheduler,
         trigger=CronTrigger(hour=9, minute=45, timezone=timezone),
         id="daily-post-cron-memory-cleanup",
@@ -448,7 +454,8 @@ def startup_event() -> None:
     logger.info(
         (
             "internal scheduler started timezone=%s "
-            "scrape=%s classify=%s recruiter=%s linkedin_scrape=%s linkedin_classify=%s slack=%s memory_cleanup=%s"
+            "scrape=%s classify=%s recruiter=%s linkedin_scrape=%s linkedin_classify=%s "
+            "slack=%s handover_log=%s memory_cleanup=%s"
         ),
         os.getenv("CRON_TIMEZONE", "Asia/Kolkata"),
         "00:10",
@@ -457,6 +464,7 @@ def startup_event() -> None:
         "04:00",
         "05:00",
         "09:30",
+        "09:40",
         "09:45",
     )
 
@@ -872,9 +880,9 @@ def internal_send_slack_handover(
     """
     Send Slack handovers by reading ``recruiters_info_{date}`` and ``linkedin_posts_relevant_{date}``.
 
-    Does not append to the handover log sheet (avoids duplicate rows on re-runs). The scheduled
-    Slack handover job syncs the log after the handover subprocess completes; use
-    ``POST /internal/sync-handover-log`` for a manual sync.
+    Does not append to the handover log sheet (avoids duplicate rows on re-runs). The
+    ``daily-handover-log-sync`` cron (default 9:40, same timezone as other jobs) appends to the log;
+    use ``POST /internal/sync-handover-log`` for a manual sync.
 
     JSON body (all optional except flags default true):
     - ``run_date``: YYYY-MM-DD (default: today on server)

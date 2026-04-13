@@ -149,10 +149,9 @@ def _cron_today() -> str:
 def _run_in_subprocess(func, *args, **kwargs) -> int:
     """
     Run func(*args, **kwargs) in a forked child process.
-    When the child exits, the OS reclaims ALL its memory instantly --
-    no heap fragmentation, no malloc_trim needed.
-    The parent (FastAPI) process stays at baseline RSS.
-    Returns the child process exit code (0 = success).
+    When the child exits, the OS reclaims ALL its memory instantly.
+    After join, we also gc + malloc_trim the parent and drop page cache
+    so the container-level memory (cgroup) drops back to baseline.
     """
     name = getattr(func, "__name__", str(func))
     proc = multiprocessing.Process(target=func, args=args, kwargs=kwargs)
@@ -163,6 +162,11 @@ def _run_in_subprocess(func, *args, **kwargs) -> int:
         logger.info("subprocess %s pid=%d completed successfully", name, proc.pid)
     else:
         logger.error("subprocess %s pid=%d exited with code %d", name, proc.pid, exitcode)
+    proc.close()
+
+    gc.collect()
+    _malloc_trim()
+    _drop_page_cache()
     return exitcode
 
 
@@ -297,14 +301,42 @@ def _malloc_trim() -> bool:
         return False
 
 
+def _drop_page_cache() -> bool:
+    """
+    Ask the kernel to drop clean file-backed page cache.
+    Railway/cgroup memory accounting includes page cache, so dropping it
+    directly reduces the billed container memory after heavy I/O (HTTP
+    responses from Apify/Sheets, Playwright page loads, Chromium temp files).
+    """
+    try:
+        with open("/proc/sys/vm/drop_caches", "w") as f:
+            f.write("1\n")
+        return True
+    except (OSError, PermissionError):
+        return False
+
+
+def _get_cgroup_memory_mb() -> float:
+    """Read container memory usage from cgroup v2 (or v1 fallback). This is what Railway bills."""
+    for path in ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+        try:
+            with open(path) as f:
+                return int(f.read().strip()) / (1024 * 1024)
+        except (OSError, ValueError):
+            continue
+    return 0.0
+
+
 def free_memory() -> dict[str, Any]:
     """
     Aggressively free process memory after heavy cron workloads.
     1. Clear all in-process run-metrics dicts (stale data that grows unbounded).
     2. Full GC sweep.
     3. malloc_trim to release freed heap pages back to the OS.
+    4. Drop kernel page cache (the main contributor to Railway's billed memory).
     """
     rss_before = _get_rss_mb()
+    cgroup_before = _get_cgroup_memory_mb()
 
     from services.pipeline import PIPELINE_RUN_METRICS
     from services.scrape_relevance_service import SCRAPE_ONLY_RUN_METRICS, CLASSIFY_ONLY_RUN_METRICS
@@ -338,15 +370,21 @@ def free_memory() -> dict[str, Any]:
 
     gc.collect()
     trimmed = _malloc_trim()
+    cache_dropped = _drop_page_cache()
 
     rss_after = _get_rss_mb()
+    cgroup_after = _get_cgroup_memory_mb()
     result = {
         "rss_before_mb": round(rss_before, 1),
         "rss_after_mb": round(rss_after, 1),
-        "freed_mb": round(rss_before - rss_after, 1),
+        "freed_rss_mb": round(rss_before - rss_after, 1),
+        "cgroup_before_mb": round(cgroup_before, 1),
+        "cgroup_after_mb": round(cgroup_after, 1),
+        "freed_cgroup_mb": round(cgroup_before - cgroup_after, 1),
         "metrics_entries_cleared": entries_cleared,
         "gc_collected": True,
         "malloc_trimmed": trimmed,
+        "page_cache_dropped": cache_dropped,
     }
     logger.info("free_memory result=%s", result)
     return result

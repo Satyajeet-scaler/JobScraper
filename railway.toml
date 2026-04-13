@@ -5,7 +5,7 @@
 #   LINKEDIN_EMAIL             — for /internal/linkedin-auto-login
 #   LINKEDIN_PASSWORD
 #   LINKEDIN_HEADLESS          — use true on Railway (no display). POST local linkedin_storage.json to /internal/linkedin-session.
-# Optional: LINKEDIN_STORAGE_PATH=/app/data/linkedin_storage.json with a volume so sessions survive redeploys
+#   LINKEDIN_STORAGE_PATH=/data/linkedin_storage.json  — mount a Railway volume at /data; session survives redeploys
 # Local manual login: set LINKEDIN_SESSION_UPLOAD_URL=https://<app>/internal/linkedin-session + INTERNAL_TRIGGER_TOKEN to auto-upload from linkedin_manual_login.py
 # Optional: LINKEDIN_RECRUITER_SHEET_ENABLED=true — after classification, scrape LinkedIn recruiters into tab recruiters_info_{date} (or RECRUITERS_INFO_WORKSHEET)
 # Optional: LINKEDIN_RECRUITER_MAX_URLS_PER_RUN=0 (0 = no cap; set e.g. 60 to limit per run)

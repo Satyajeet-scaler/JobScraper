@@ -3,6 +3,15 @@ FROM python:3.11-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
+# Limit glibc malloc arenas to reduce memory fragmentation across threads.
+# Default is 8*ncpus; each arena retains freed memory independently,
+# preventing malloc_trim from releasing it back to the OS.
+ENV MALLOC_ARENA_MAX=2
+# Allocations >= 64KB use mmap instead of sbrk; mmap'd memory is returned
+# to the OS immediately when freed (no fragmentation).
+ENV MALLOC_MMAP_THRESHOLD_=65536
+ENV MALLOC_TRIM_THRESHOLD_=131072
+ENV MALLOC_MMAP_MAX_=65536
 
 WORKDIR /app
 

@@ -174,7 +174,7 @@ def _read_jd_rows_for_date(writer: GoogleSheetsWriter, run_date: str) -> list[di
 
     jd_rows: list[dict[str, str]] = []
     relevant_rows_cache: dict[str, list[dict[str, str]]] = {}
-    for row in recruiter_rows:
+    for recruiter_sheet_row_num, row in enumerate(recruiter_rows, start=2):
         if _normalize_date(row.get(date_key, "")) != run_date:
             continue
         raw_tab_value = (row.get(tab_key) or "").strip()
@@ -197,6 +197,7 @@ def _read_jd_rows_for_date(writer: GoogleSheetsWriter, run_date: str) -> list[di
         merged = dict(row)
         merged["jd"] = jd_text
         merged["_jd_key"] = "jd"
+        merged["_recruiter_sheet_row_number"] = str(recruiter_sheet_row_num)
         jd_rows.append(merged)
 
     if not jd_rows:
@@ -278,10 +279,10 @@ def _extract_jd_text(relevant_row: dict[str, str]) -> str:
 
 
 def _build_jd_context(jd_row: dict[str, str], index: int) -> dict[str, str]:
-    job_id_key = _find_first_key(jd_row, ["job_id", "job id", "id"])
     title_key = _find_first_key(jd_row, ["job_title", "job title", "title"])
     jd_key = jd_row["_jd_key"]
-    job_id = (jd_row.get(job_id_key, "") if job_id_key else "").strip() or f"jd_{index}"
+    # TODO: Change this temporary tab naming key to a stable business/job identifier.
+    job_id = (jd_row.get("_recruiter_sheet_row_number") or "").strip() or f"jd_{index}"
     job_title = (jd_row.get(title_key, "") if title_key else "").strip() or f"JD {index}"
     jd_text = (jd_row.get(jd_key) or "").strip()
     if not jd_text:

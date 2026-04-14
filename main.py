@@ -44,6 +44,14 @@ from services.scrape_relevance_service import (
     run_scrape_jobs_only,
 )
 from services.recruiter_info_service import get_recruiter_info_run_metrics, run_recruiter_info_extraction
+from services.candidate_jd_evaluator_service import (
+    get_candidate_jd_evaluator_run_metrics,
+    run_candidate_jd_evaluator,
+)
+from services.relevant_jobs_tab_fix_service import (
+    get_relevant_jobs_tab_fix_run_metrics,
+    run_fix_relevant_jobs_tab,
+)
 from services.linkedin_posts_split_service import (
     get_linkedin_posts_classify_only_metrics,
     get_linkedin_posts_scrape_only_metrics,
@@ -657,6 +665,62 @@ def get_recruiter_info_run_status(
 ) -> JSONResponse:
     validate_internal_trigger_token(x_internal_token)
     metrics = get_recruiter_info_run_metrics(run_id)
+    if not metrics:
+        raise HTTPException(status_code=404, detail="Run ID not found.")
+    return JSONResponse(content=metrics)
+
+
+@app.post("/internal/run-candidate-jd-evaluator")
+def run_candidate_jd_evaluator_endpoint(
+    background_tasks: BackgroundTasks,
+    run_date: Optional[str] = Query(default=None, description="Optional date YYYY-MM-DD"),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    resolved_date = run_date or _cron_today()
+    run_id = str(uuid.uuid4())
+    background_tasks.add_task(run_candidate_jd_evaluator, run_id, resolved_date)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={"run_id": run_id, "status": "accepted", "run_date": resolved_date},
+    )
+
+
+@app.get("/internal/run-candidate-jd-evaluator/{run_id}")
+def get_candidate_jd_evaluator_run_status(
+    run_id: str,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    metrics = get_candidate_jd_evaluator_run_metrics(run_id)
+    if not metrics:
+        raise HTTPException(status_code=404, detail="Run ID not found.")
+    return JSONResponse(content=metrics)
+
+
+@app.post("/internal/fix-relevant-jobs-tab")
+def fix_relevant_jobs_tab(
+    background_tasks: BackgroundTasks,
+    run_date: Optional[str] = Query(default=None, description="Optional date YYYY-MM-DD"),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    resolved_date = run_date or _cron_today()
+    run_id = str(uuid.uuid4())
+    background_tasks.add_task(run_fix_relevant_jobs_tab, run_id, resolved_date)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={"run_id": run_id, "status": "accepted", "run_date": resolved_date},
+    )
+
+
+@app.get("/internal/fix-relevant-jobs-tab/{run_id}")
+def get_fix_relevant_jobs_tab_status(
+    run_id: str,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    metrics = get_relevant_jobs_tab_fix_run_metrics(run_id)
     if not metrics:
         raise HTTPException(status_code=404, detail="Run ID not found.")
     return JSONResponse(content=metrics)

@@ -6,7 +6,8 @@ from datetime import date
 from time import perf_counter
 from typing import Any
 
-from services.apify_naukri import scrape_naukri_jobs
+from services.apify_naukri import normalize_naukri_item, scrape_naukri_jobs
+from services.description_text_parts import apply_three_part_text_columns
 from services.google_sheets import GoogleSheetsWriter
 
 logger = logging.getLogger(__name__)
@@ -53,6 +54,9 @@ def run_naukri_scrape_only_pipeline(run_id: str | None = None) -> dict[str, Any]
         enriched_rows: list[dict[str, Any]] = []
         for row in rows:
             copy = dict(row)
+            normalized = normalize_naukri_item(copy)
+            if normalized.get("description"):
+                copy["description"] = normalized.get("description")
             copy["run_date"] = run_date
             copy["source"] = "naukri"
             enriched_rows.append(copy)
@@ -63,18 +67,30 @@ def run_naukri_scrape_only_pipeline(run_id: str | None = None) -> dict[str, Any]
 
         tab_name = os.getenv("NAUKRI_SCRAPED_TAB_TEMPLATE", "naukri_scraped_jobs_{date}").format(date=run_date)
         writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-        writer.write_rows(tab_name, enriched_rows, chunk_size=max(1, int(os.getenv("GOOGLE_SHEETS_WRITE_CHUNK_SIZE", "200"))))
+        rows_for_sheet, overflow_rows, overflow_chars = apply_three_part_text_columns(enriched_rows, "description")
+        if overflow_rows:
+            logger.warning(
+                "description split truncated rows=%s overflow_chars=%s tab=%s",
+                overflow_rows,
+                overflow_chars,
+                tab_name,
+            )
+        writer.write_rows(
+            tab_name,
+            rows_for_sheet,
+            chunk_size=max(1, int(os.getenv("GOOGLE_SHEETS_WRITE_CHUNK_SIZE", "200"))),
+        )
 
         metrics = {
             "run_id": pipeline_run_id,
             "status": "completed",
             "run_date": run_date,
             "tab_name": tab_name,
-            "scraped_count": len(enriched_rows),
+            "scraped_count": len(rows_for_sheet),
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         NAUKRI_RUN_METRICS[pipeline_run_id] = metrics
-        logger.info("naukri-only pipeline[%s] completed scraped_count=%s", pipeline_run_id, len(enriched_rows))
+        logger.info("naukri-only pipeline[%s] completed scraped_count=%s", pipeline_run_id, len(rows_for_sheet))
         return metrics
     except Exception as exc:
         metrics = {

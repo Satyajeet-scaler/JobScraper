@@ -6,6 +6,7 @@ from datetime import date
 from time import perf_counter
 from typing import Any
 
+from services.description_text_parts import apply_three_part_text_columns
 from services.google_sheets import GoogleSheetsWriter
 from services.handover_owners import worksheet_row_dicts
 from services.pipeline import _classify_relevant_jobs, _dedupe_jobs
@@ -125,7 +126,15 @@ def _write_wellfound_relevant_rows(run_date: str, relevant_rows: list[dict[str, 
     writer = _get_writer()
     tab_name = f"wellfound_relevant_jobs_{run_date}"
     chunk_size = _get_chunk_size()
-    writer.write_rows(tab_name, relevant_rows, chunk_size=chunk_size)
+    rows_for_sheet, overflow_rows, overflow_chars = apply_three_part_text_columns(relevant_rows, "description")
+    if overflow_rows:
+        logger.warning(
+            "description split truncated rows=%s overflow_chars=%s tab=%s",
+            overflow_rows,
+            overflow_chars,
+            tab_name,
+        )
+    writer.write_rows(tab_name, rows_for_sheet, chunk_size=chunk_size)
 
 
 def _get_writer() -> GoogleSheetsWriter:

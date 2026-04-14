@@ -13,6 +13,12 @@ import requests
 from jobspy import scrape_jobs
 from pandas import DataFrame, to_datetime
 
+from services.description_text_parts import (
+    apply_three_part_text_columns,
+    cap_text,
+    combine_three_part_text,
+    read_positive_int_env,
+)
 from services.google_sheets import GoogleSheetsWriter
 from services.handover_owners import worksheet_row_dicts
 from services.linkedin_recruiter.sheets_pipeline import write_linkedin_recruiters_for_relevant_jobs
@@ -633,6 +639,17 @@ def _classify_relevant_jobs(jobs: list[dict[str, Any]]) -> tuple[list[dict[str, 
     return relevant_jobs, {"classification_errors": classification_errors}
 
 
+def _job_relevance_text_max_chars(*, batch: bool) -> int:
+    env_name = "JOBS_RELEVANCE_TEXT_MAX_CHARS_BATCH" if batch else "JOBS_RELEVANCE_TEXT_MAX_CHARS_SINGLE"
+    default = 9000 if batch else 12000
+    return read_positive_int_env(env_name, default)
+
+
+def _job_description_for_relevance(job: dict[str, Any], *, batch: bool) -> str:
+    combined = combine_three_part_text(job, "description")
+    return cap_text(combined, _job_relevance_text_max_chars(batch=batch))
+
+
 def _classify_single_job(
     job: dict[str, Any],
     gemini_api_key: str | None,
@@ -641,6 +658,8 @@ def _classify_single_job(
     ai_token: str | None,
     prompt: str,
 ) -> dict[str, Any]:
+    description_for_relevance = _job_description_for_relevance(job, batch=False)
+
     if gemini_api_key:
         return _classify_with_gemini(
             job=job,
@@ -656,7 +675,7 @@ def _classify_single_job(
                 "title": job.get("title"),
                 "company": job.get("company"),
                 "location": job.get("location"),
-                "description": job.get("description"),
+                "description": description_for_relevance,
                 "experience": job.get("experience"),
                 "salary": job.get("salary"),
                 "job_type": job.get("job_type"),
@@ -678,7 +697,7 @@ def _classify_single_job(
             raise ValueError("AI response missing relevance field")
         return data
 
-    text = f"{job.get('title', '')} {job.get('description', '')}".lower()
+    text = f"{job.get('title', '')} {description_for_relevance}".lower()
     for role in TARGET_ROLES:
         if role.lower() in text:
             return {
@@ -701,7 +720,7 @@ def _classify_with_gemini(
 
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name, system_instruction=prompt)
-    description = (job.get("description") or "")[:4000]
+    description = _job_description_for_relevance(job, batch=False)
     content = (
         "Return ONLY JSON with keys: relevant, reason, role_category, priority.\n"
         "Job payload:\n"
@@ -744,7 +763,7 @@ def _classify_batch_with_gemini(
             "title": job.get("title"),
             "company": job.get("company"),
             "location": job.get("location"),
-            "description": (job.get("description") or "")[:3000],
+            "description": _job_description_for_relevance(job, batch=True),
             "experience": job.get("experience"),
             "salary": job.get("salary"),
             "job_type": job.get("job_type"),
@@ -1142,22 +1161,30 @@ def _write_scraped_jobs_to_google_sheets(
 ) -> None:
     writer, sheet_chunk_size = _get_sheets_writer_and_chunk_size()
     scraped_tab = f"scraped_jobs_{run_date}"
+    rows_for_sheet, overflow_rows, overflow_chars = apply_three_part_text_columns(scraped_jobs, "description")
+    if overflow_rows:
+        logger.warning(
+            "description split truncated rows=%s overflow_chars=%s tab=%s",
+            overflow_rows,
+            overflow_chars,
+            scraped_tab,
+        )
     logger.info(
         "sheets write scraped spreadsheet_id=%s scraped_tab=%s scraped_count=%s chunk_size=%s",
         writer.spreadsheet_id,
         scraped_tab,
-        len(scraped_jobs),
+        len(rows_for_sheet),
         sheet_chunk_size,
     )
     _retry(
-        action=lambda: writer.write_rows(scraped_tab, scraped_jobs, chunk_size=sheet_chunk_size),
+        action=lambda: writer.write_rows(scraped_tab, rows_for_sheet, chunk_size=sheet_chunk_size),
         retries=3,
         initial_delay_seconds=1.0,
     )
     logger.info(
         "sheets write scraped completed scraped_tab=%s rows=%s",
         scraped_tab,
-        len(scraped_jobs),
+        len(rows_for_sheet),
     )
 
 
@@ -1167,22 +1194,30 @@ def _write_relevant_jobs_to_google_sheets(
 ) -> None:
     writer, sheet_chunk_size = _get_sheets_writer_and_chunk_size()
     relevant_tab = f"relevant_jobs_{run_date}"
+    rows_for_sheet, overflow_rows, overflow_chars = apply_three_part_text_columns(relevant_jobs, "description")
+    if overflow_rows:
+        logger.warning(
+            "description split truncated rows=%s overflow_chars=%s tab=%s",
+            overflow_rows,
+            overflow_chars,
+            relevant_tab,
+        )
     logger.info(
         "sheets write relevant spreadsheet_id=%s relevant_tab=%s relevant_count=%s chunk_size=%s",
         writer.spreadsheet_id,
         relevant_tab,
-        len(relevant_jobs),
+        len(rows_for_sheet),
         sheet_chunk_size,
     )
     _retry(
-        action=lambda: writer.write_rows(relevant_tab, relevant_jobs, chunk_size=sheet_chunk_size),
+        action=lambda: writer.write_rows(relevant_tab, rows_for_sheet, chunk_size=sheet_chunk_size),
         retries=3,
         initial_delay_seconds=1.0,
     )
     logger.info(
         "sheets write relevant completed relevant_tab=%s rows=%s",
         relevant_tab,
-        len(relevant_jobs),
+        len(rows_for_sheet),
     )
 
 

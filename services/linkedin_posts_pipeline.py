@@ -11,6 +11,12 @@ from typing import Any
 import requests
 
 from services.apify_linkedin_posts import normalize_linkedin_post_item, scrape_linkedin_posts
+from services.description_text_parts import (
+    apply_three_part_text_columns,
+    cap_text,
+    combine_three_part_text,
+    read_positive_int_env,
+)
 from services.google_sheets import GoogleSheetsWriter
 from services.slack_handover_notify import send_linkedin_post_handover_messages, slack_notify_defaults_from_env
 
@@ -287,6 +293,21 @@ def _classify_relevant_posts(rows: list[dict[str, Any]]) -> tuple[list[dict[str,
     return relevant_rows, errors
 
 
+def _linkedin_post_relevance_text_max_chars(*, batch: bool) -> int:
+    env_name = (
+        "LINKEDIN_POSTS_RELEVANCE_TEXT_MAX_CHARS_BATCH"
+        if batch
+        else "LINKEDIN_POSTS_RELEVANCE_TEXT_MAX_CHARS_SINGLE"
+    )
+    default = 7000 if batch else 9000
+    return read_positive_int_env(env_name, default)
+
+
+def _linkedin_post_text_for_relevance(row: dict[str, Any], *, batch: bool) -> str:
+    combined = combine_three_part_text(row, "post_text")
+    return cap_text(combined, _linkedin_post_relevance_text_max_chars(batch=batch))
+
+
 def _classify_single_post(
     row: dict[str, Any],
     gemini_api_key: str | None,
@@ -295,13 +316,15 @@ def _classify_single_post(
     ai_token: str | None,
     prompt: str,
 ) -> dict[str, Any]:
+    post_text_for_relevance = _linkedin_post_text_for_relevance(row, batch=False)
+
     if gemini_api_key:
         if genai is None:
             raise RuntimeError("google-generativeai package is not installed.")
         genai.configure(api_key=gemini_api_key)
         model = genai.GenerativeModel(gemini_model, system_instruction=prompt)
         payload = {
-            "post_text": (row.get("post_text") or "")[:3000],
+            "post_text": post_text_for_relevance,
             "job_title_hint": row.get("job_title_hint"),
             "company": row.get("company"),
             "author_name": row.get("author_name"),
@@ -325,7 +348,7 @@ def _classify_single_post(
         payload = {
             "prompt": prompt,
             "post": {
-                "post_text": row.get("post_text"),
+                "post_text": post_text_for_relevance,
                 "job_title_hint": row.get("job_title_hint"),
                 "company": row.get("company"),
                 "author_name": row.get("author_name"),
@@ -343,7 +366,7 @@ def _classify_single_post(
         response.raise_for_status()
         return _normalize_classifier_decision(response.json())
 
-    text = f"{row.get('search_query', '')} {row.get('post_text', '')}"
+    text = f"{row.get('search_query', '')} {post_text_for_relevance}"
     text_lower = text.lower()
     if re.search(r"\breferral\b", text_lower):
         return {
@@ -390,7 +413,16 @@ def _write_linkedin_posts_scraped_only(
     writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
     chunk_size = max(1, int(os.getenv("GOOGLE_SHEETS_WRITE_CHUNK_SIZE", "200")))
     scraped_tab = os.getenv("LINKEDIN_POSTS_SCRAPED_TAB_TEMPLATE", "linkedin_posts_scraped_{date}").format(date=run_date)
-    writer.write_rows(scraped_tab, _with_run_date(scraped_rows, run_date), chunk_size=chunk_size)
+    rows_with_run_date = _with_run_date(scraped_rows, run_date)
+    rows_for_sheet, overflow_rows, overflow_chars = apply_three_part_text_columns(rows_with_run_date, "post_text")
+    if overflow_rows:
+        logger.warning(
+            "post_text split truncated rows=%s overflow_chars=%s tab=%s",
+            overflow_rows,
+            overflow_chars,
+            scraped_tab,
+        )
+    writer.write_rows(scraped_tab, rows_for_sheet, chunk_size=chunk_size)
 
 
 def _write_linkedin_posts_relevant_only(
@@ -405,7 +437,16 @@ def _write_linkedin_posts_relevant_only(
     chunk_size = max(1, int(os.getenv("GOOGLE_SHEETS_WRITE_CHUNK_SIZE", "200")))
     relevant_tab = os.getenv("LINKEDIN_POSTS_RELEVANT_TAB_TEMPLATE", "linkedin_posts_relevant_{date}").format(date=run_date)
     deduped_relevant_rows = _dedupe_linkedin_relevant_rows(relevant_rows)
-    writer.write_rows(relevant_tab, _with_run_date(deduped_relevant_rows, run_date), chunk_size=chunk_size)
+    rows_with_run_date = _with_run_date(deduped_relevant_rows, run_date)
+    rows_for_sheet, overflow_rows, overflow_chars = apply_three_part_text_columns(rows_with_run_date, "post_text")
+    if overflow_rows:
+        logger.warning(
+            "post_text split truncated rows=%s overflow_chars=%s tab=%s",
+            overflow_rows,
+            overflow_chars,
+            relevant_tab,
+        )
+    writer.write_rows(relevant_tab, rows_for_sheet, chunk_size=chunk_size)
 
 
 def _with_run_date(rows: list[dict[str, Any]], run_date: str) -> list[dict[str, Any]]:
@@ -532,7 +573,7 @@ def _classify_batch_posts_with_gemini(
         compact_rows.append(
             {
                 "row": idx,
-                "post_text": (row.get("post_text") or "")[:2500],
+                "post_text": _linkedin_post_text_for_relevance(row, batch=True),
                 "job_title_hint": row.get("job_title_hint"),
                 "company": row.get("company"),
                 "author_name": row.get("author_name"),

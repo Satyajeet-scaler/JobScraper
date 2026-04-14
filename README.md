@@ -149,3 +149,32 @@ What it tests:
 - invalid type for `results_wanted` (should fail validation)
 
 The script prints a JSON summary with accepted/rejected cases and the union of observed output keys.
+
+## Description Storage and Relevance Text Caps
+
+Long job descriptions and LinkedIn post text are now stored across 3 sheet columns.
+
+- Jobs: `description`, `description_2`, `description_3`
+- LinkedIn posts: `post_text`, `post_text_2`, `post_text_3`
+
+Behavior:
+
+- The first column keeps backward compatibility (`description` / `post_text`).
+- If text exceeds the first column, overflow is written into `_2`, then `_3`.
+- If text still exceeds all 3 columns, only the remainder is truncated and a truncation notice is appended in the third column.
+
+Config:
+
+- `SHEETS_TEXT_PART_MAX_CHARS` (default: `GOOGLE_SHEETS_MAX_CELL_CHARS`, fallback `48000`)
+
+Relevance classification now combines all 3 parts first, then applies a configurable cap per mode.
+
+Jobs relevance caps:
+
+- `JOBS_RELEVANCE_TEXT_MAX_CHARS_SINGLE` (default `12000`)
+- `JOBS_RELEVANCE_TEXT_MAX_CHARS_BATCH` (default `9000`)
+
+LinkedIn posts relevance caps:
+
+- `LINKEDIN_POSTS_RELEVANCE_TEXT_MAX_CHARS_SINGLE` (default `9000`)
+- `LINKEDIN_POSTS_RELEVANCE_TEXT_MAX_CHARS_BATCH` (default `7000`)

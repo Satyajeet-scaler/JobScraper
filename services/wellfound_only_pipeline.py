@@ -9,6 +9,7 @@ from typing import Any
 from pandas import to_datetime
 
 from services.apify_wellfound import normalize_wellfound_item, scrape_wellfound_jobs
+from services.description_text_parts import apply_three_part_text_columns
 from services.google_sheets import GoogleSheetsWriter
 
 logger = logging.getLogger(__name__)
@@ -111,7 +112,15 @@ def _run_wellfound_scrape_only_pipeline(
         tab_name = os.getenv("WELLFOUND_SCRAPED_TAB_TEMPLATE", "wellfound_jobs_{date}").format(date=run_date)
         writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
         chunk_size = max(1, int(os.getenv("GOOGLE_SHEETS_WRITE_CHUNK_SIZE", "200")))
-        writer.write_rows(tab_name, enriched_rows, chunk_size=chunk_size)
+        rows_for_sheet, overflow_rows, overflow_chars = apply_three_part_text_columns(enriched_rows, "description")
+        if overflow_rows:
+            logger.warning(
+                "description split truncated rows=%s overflow_chars=%s tab=%s",
+                overflow_rows,
+                overflow_chars,
+                tab_name,
+            )
+        writer.write_rows(tab_name, rows_for_sheet, chunk_size=chunk_size)
 
         metrics = {
             "run_id": pipeline_run_id,
@@ -126,7 +135,7 @@ def _run_wellfound_scrape_only_pipeline(
             "time_filter_enabled": time_filter_enabled,
             "hours_old": resolved_hours_old,
             "target_roles": selected_roles,
-            "scraped_count": len(enriched_rows),
+            "scraped_count": len(rows_for_sheet),
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         WELLFOUND_RUN_METRICS[pipeline_run_id] = metrics
@@ -135,7 +144,7 @@ def _run_wellfound_scrape_only_pipeline(
             pipeline_run_id,
             raw_count,
             len(filtered_rows),
-            len(enriched_rows),
+            len(rows_for_sheet),
         )
         return metrics
     except Exception as exc:

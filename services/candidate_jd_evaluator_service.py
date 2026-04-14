@@ -414,6 +414,7 @@ def _score_candidates_with_gemini(
     candidates: list[dict[str, Any]],
     requested_count: int,
 ) -> list[dict[str, Any]] | None:
+    profile_separator = "\n\n---\n\n"
     profiles = []
     for idx, candidate in enumerate(candidates, start=1):
         profiles.append(
@@ -443,7 +444,7 @@ def _score_candidates_with_gemini(
         "JOB DESCRIPTION:\n"
         f"{jd_text}\n\n"
         "CANDIDATE PROFILES:\n"
-        f"{'\n\n---\n\n'.join(profiles)}\n\n"
+        f"{profile_separator.join(profiles)}\n\n"
         "Return ONLY a valid JSON array:\n"
         "[\n"
         "  {\n"

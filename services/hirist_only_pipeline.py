@@ -7,6 +7,7 @@ from time import perf_counter
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from services.description_text_parts import apply_three_part_text_columns
 from services.google_sheets import GoogleSheetsWriter
 from services.hirist import HiristTechService, normalize_hirist_item
 
@@ -72,14 +73,22 @@ def run_hirist_scrape_only_pipeline(run_id: str | None = None) -> dict[str, Any]
         tab_name = tab_template.format(date=run_date)
         writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
         chunk_size = max(1, int(os.getenv("GOOGLE_SHEETS_WRITE_CHUNK_SIZE", "200")))
-        writer.write_rows(tab_name, enriched_rows, chunk_size=chunk_size)
+        rows_for_sheet, overflow_rows, overflow_chars = apply_three_part_text_columns(enriched_rows, "description")
+        if overflow_rows:
+            logger.warning(
+                "description split truncated rows=%s overflow_chars=%s tab=%s",
+                overflow_rows,
+                overflow_chars,
+                tab_name,
+            )
+        writer.write_rows(tab_name, rows_for_sheet, chunk_size=chunk_size)
 
         metrics = {
             "run_id": pipeline_run_id,
             "status": "completed",
             "run_date": run_date,
             "tab_name": tab_name,
-            "scraped_count": len(enriched_rows),
+            "scraped_count": len(rows_for_sheet),
             "output_file": result.get("output_file"),
             "total_recent_jobs": result.get("total_recent_jobs"),
             "duration_seconds": round(perf_counter() - started_at, 2),
@@ -88,7 +97,7 @@ def run_hirist_scrape_only_pipeline(run_id: str | None = None) -> dict[str, Any]
         logger.info(
             "hirist-only pipeline[%s] completed scraped_count=%s",
             pipeline_run_id,
-            len(enriched_rows),
+            len(rows_for_sheet),
         )
         return metrics
     except Exception as exc:

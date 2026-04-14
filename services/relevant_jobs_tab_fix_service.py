@@ -5,6 +5,7 @@ import uuid
 from datetime import datetime
 from time import perf_counter
 from typing import Any
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from services.google_sheets import GoogleSheetsWriter
@@ -58,12 +59,16 @@ def run_fix_relevant_jobs_tab(run_id: str | None = None, run_date: str | None = 
         if relevant_job_url_idx is None:
             raise RuntimeError(f"'job_url' column is required in worksheet '{relevant_tab}'.")
 
-        relevant_urls = {
-            str(row[relevant_job_url_idx]).strip().lower()
-            for row in relevant_raw[1:]
-            if len(row) > relevant_job_url_idx and str(row[relevant_job_url_idx]).strip()
-        }
-        if not relevant_urls:
+        relevant_url_to_row: dict[str, int] = {}
+        for row_num, row in enumerate(relevant_raw[1:], start=2):
+            if len(row) <= relevant_job_url_idx:
+                continue
+            url = _normalize_job_url(str(row[relevant_job_url_idx]))
+            if not url:
+                continue
+            if url not in relevant_url_to_row:
+                relevant_url_to_row[url] = row_num
+        if not relevant_url_to_row:
             raise RuntimeError(f"No usable job URLs found in worksheet '{relevant_tab}'.")
 
         updated_rows = 0
@@ -71,13 +76,14 @@ def run_fix_relevant_jobs_tab(run_id: str | None = None, run_date: str | None = 
         unmatched_rows = 0
         column_values: list[list[str]] = []
         for row in recruiters_raw[1:]:
-            job_url = str(row[job_url_col_idx]).strip().lower() if len(row) > job_url_col_idx else ""
+            job_url = _normalize_job_url(str(row[job_url_col_idx]) if len(row) > job_url_col_idx else "")
             existing = str(row[rel_tab_col_idx]).strip() if len(row) > rel_tab_col_idx else ""
-            if job_url and job_url in relevant_urls:
-                target = relevant_tab
+            matched_row = relevant_url_to_row.get(job_url) if job_url else None
+            if matched_row is not None:
+                target = str(matched_row)
                 matched_rows += 1
             else:
-                target = existing
+                target = ""
                 if job_url:
                     unmatched_rows += 1
             if target != existing:
@@ -161,3 +167,16 @@ def _column_letter(index: int) -> str:
         current, remainder = divmod(current - 1, 26)
         letters = chr(65 + remainder) + letters
     return letters
+
+
+def _normalize_job_url(raw_url: str) -> str:
+    text = str(raw_url or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    netloc = parsed.netloc.lower().strip()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    path = (parsed.path or "").rstrip("/")
+    # ignore query + fragments so tracking parameters do not break matching
+    return f"{netloc}{path}".strip()

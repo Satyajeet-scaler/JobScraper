@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime
 from time import perf_counter, sleep
 from typing import Any
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
 from services.google_sheets import GoogleSheetsWriter
@@ -172,15 +173,21 @@ def _read_jd_rows_for_date(writer: GoogleSheetsWriter, run_date: str) -> list[di
         )
 
     jd_rows: list[dict[str, str]] = []
+    relevant_rows_cache: dict[str, list[dict[str, str]]] = {}
     for row in recruiter_rows:
         if _normalize_date(row.get(date_key, "")) != run_date:
             continue
-        relevant_tab = (row.get(tab_key) or "").strip() or f"relevant_jobs_{run_date}"
-        relevant_rows = _load_relevant_rows(writer, relevant_tab)
+        raw_tab_value = (row.get(tab_key) or "").strip()
+        relevant_tab = raw_tab_value if raw_tab_value.startswith("relevant_jobs_") else f"relevant_jobs_{run_date}"
+        row_number = _parse_int(raw_tab_value)
+        if relevant_tab not in relevant_rows_cache:
+            relevant_rows_cache[relevant_tab] = _load_relevant_rows(writer, relevant_tab)
+        relevant_rows = relevant_rows_cache[relevant_tab]
         matched = _match_relevant_job_row(
             recruiter_row=row,
             relevant_rows=relevant_rows,
             job_url_key=job_url_key,
+            row_number=row_number,
         )
         if not matched:
             continue
@@ -201,28 +208,42 @@ def _read_jd_rows_for_date(writer: GoogleSheetsWriter, run_date: str) -> list[di
 
 def _load_relevant_rows(writer: GoogleSheetsWriter, relevant_tab: str) -> list[dict[str, str]]:
     ws = writer.open_worksheet(relevant_tab)
-    rows = worksheet_row_dicts(
-        writer.worksheet_get_all_values(
-            ws,
-            f"candidate_jd_eval:{relevant_tab}:get_all_values",
-        )
+    raw = writer.worksheet_get_all_values(
+        ws,
+        f"candidate_jd_eval:{relevant_tab}:get_all_values",
     )
-    return rows
+    if len(raw) <= 1:
+        return []
+    headers = [str(h or "").strip().lower() for h in raw[0]]
+    out: list[dict[str, str]] = []
+    for sheet_row_num, raw_row in enumerate(raw[1:], start=2):
+        row: dict[str, str] = {"_sheet_row_number": str(sheet_row_num)}
+        for idx, header in enumerate(headers):
+            if not header:
+                continue
+            row[header] = raw_row[idx].strip() if idx < len(raw_row) else ""
+        out.append(row)
+    return out
 
 
 def _match_relevant_job_row(
     recruiter_row: dict[str, str],
     relevant_rows: list[dict[str, str]],
     job_url_key: str | None,
+    row_number: int | None,
 ) -> dict[str, str] | None:
     if not relevant_rows:
         return None
-    recruiter_job_url = (recruiter_row.get(job_url_key or "", "") if job_url_key else "").strip().lower()
+    if row_number is not None:
+        for row in relevant_rows:
+            if _parse_int(row.get("_sheet_row_number")) == row_number:
+                return row
+    recruiter_job_url = _normalize_job_url(recruiter_row.get(job_url_key or "", "") if job_url_key else "")
     if recruiter_job_url:
         by_url = {
-            (row.get("job_url") or "").strip().lower(): row
+            _normalize_job_url(row.get("job_url") or ""): row
             for row in relevant_rows
-            if (row.get("job_url") or "").strip()
+            if _normalize_job_url(row.get("job_url") or "")
         }
         match = by_url.get(recruiter_job_url)
         if match:
@@ -567,6 +588,28 @@ def _to_float(value: Any) -> float:
         return float(str(value or "").strip())
     except ValueError:
         return 0.0
+
+
+def _parse_int(value: Any) -> int | None:
+    try:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        return int(text)
+    except ValueError:
+        return None
+
+
+def _normalize_job_url(raw_url: Any) -> str:
+    text = str(raw_url or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    netloc = parsed.netloc.lower().strip()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    path = (parsed.path or "").rstrip("/")
+    return f"{netloc}{path}".strip()
 
 
 def _require_columns(rows: list[dict[str, str]], columns: list[str], source_name: str) -> None:

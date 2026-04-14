@@ -35,30 +35,39 @@ def run_candidate_jd_evaluator(run_id: str | None = None, run_date: str | None =
     try:
         writer = GoogleSheetsWriter(spreadsheet_id=_require_spreadsheet_id())
         candidates = _read_candidates(writer)
-        jd_rows = _read_jd_rows_for_date(writer, resolved_run_date)
+        recruiters_tab = os.getenv("RECRUITERS_INFO_WORKSHEET") or f"recruiters_info_{resolved_run_date}"
+        jd_rows = _read_jd_rows_for_date(writer, resolved_run_date, recruiters_tab)
         results: list[dict[str, Any]] = []
         failures: list[dict[str, str]] = []
+        combined_output_rows: list[dict[str, Any]] = []
+        recruiter_summaries: list[dict[str, str]] = []
+        output_sheet = _build_output_sheet_name(resolved_run_date)
 
         for idx, jd_row in enumerate(jd_rows, start=1):
             try:
                 jd_context = _build_jd_context(jd_row, idx)
                 ranked = _evaluate_candidates_for_jd(candidates, jd_context["jd_text"])
-                output_rows = _build_output_rows(ranked)
-                worksheet_title = _build_output_sheet_name(
-                    run_date=resolved_run_date,
-                    job_id=jd_context["job_id"],
-                    index=idx,
+                output_rows = _build_output_rows(ranked, jd_context)
+                combined_output_rows.extend(output_rows)
+                summary = _ai_gt_70_summary(ranked)
+                recruiter_summaries.append(
+                    {
+                        "recruiter_sheet_row_number": jd_context["recruiter_sheet_row_number"],
+                        "ai_score_gt_70_count": str(summary["count"]),
+                        "ai_score_gt_70_emails": summary["emails_csv"],
+                    }
                 )
-                writer.write_rows(worksheet_title, output_rows)
                 results.append(
                     {
                         "jd_index": idx,
                         "job_id": jd_context["job_id"],
                         "job_title": jd_context["job_title"],
-                        "output_sheet": worksheet_title,
+                        "output_sheet": output_sheet,
                         "rows_written": len(output_rows),
                         "top_score": _top_score(ranked),
                         "ai_unavailable_count": len([row for row in ranked if row.get("ai_score") is None]),
+                        "ai_score_gt_70_count": summary["count"],
+                        "ai_score_gt_70_emails": summary["emails_csv"],
                     }
                 )
             except Exception as exc:
@@ -73,15 +82,21 @@ def run_candidate_jd_evaluator(run_id: str | None = None, run_date: str | None =
         if not results:
             raise RuntimeError("No JD evaluations completed successfully for the selected run date.")
 
+        writer.write_rows(output_sheet, combined_output_rows)
+        recruiter_update_stats = _write_recruiter_ai_summaries(writer, recruiters_tab, recruiter_summaries)
+
         metrics = {
             "run_id": pipeline_run_id,
             "status": "completed",
             "run_date": resolved_run_date,
             "candidate_count": len(candidates),
             "jd_count": len(jd_rows),
+            "output_sheet": output_sheet,
+            "total_rows_written": len(combined_output_rows),
             "successful_jd_runs": len(results),
             "failed_jd_runs": len(failures),
             "jd_results": results,
+            "recruiter_summary_updates": recruiter_update_stats,
             "failures": failures,
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
@@ -150,8 +165,11 @@ def _read_candidates(writer: GoogleSheetsWriter) -> list[dict[str, Any]]:
     return out
 
 
-def _read_jd_rows_for_date(writer: GoogleSheetsWriter, run_date: str) -> list[dict[str, str]]:
-    recruiters_tab = os.getenv("RECRUITERS_INFO_WORKSHEET") or f"recruiters_info_{run_date}"
+def _read_jd_rows_for_date(
+    writer: GoogleSheetsWriter,
+    run_date: str,
+    recruiters_tab: str,
+) -> list[dict[str, str]]:
     recruiters_ws = writer.open_worksheet(recruiters_tab)
     recruiter_rows = worksheet_row_dicts(
         writer.worksheet_get_all_values(
@@ -196,6 +214,7 @@ def _read_jd_rows_for_date(writer: GoogleSheetsWriter, run_date: str) -> list[di
             continue
         merged = dict(row)
         merged["jd"] = jd_text
+        merged["job_url"] = _extract_job_url(matched, row, job_url_key)
         merged["_jd_key"] = "jd"
         merged["_recruiter_sheet_row_number"] = str(recruiter_sheet_row_num)
         jd_rows.append(merged)
@@ -287,7 +306,14 @@ def _build_jd_context(jd_row: dict[str, str], index: int) -> dict[str, str]:
     jd_text = (jd_row.get(jd_key) or "").strip()
     if not jd_text:
         raise RuntimeError(f"JD text is empty for row index {index}.")
-    return {"job_id": job_id, "job_title": job_title, "jd_text": jd_text}
+    recruiter_sheet_row_number = (jd_row.get("_recruiter_sheet_row_number") or "").strip()
+    return {
+        "job_id": job_id,
+        "job_title": job_title,
+        "job_url": (jd_row.get("job_url") or "").strip(),
+        "jd_text": jd_text,
+        "recruiter_sheet_row_number": recruiter_sheet_row_number,
+    }
 
 
 def _evaluate_candidates_for_jd(candidates: list[dict[str, Any]], jd_text: str) -> list[dict[str, Any]]:
@@ -539,11 +565,15 @@ def _merge_ai_scores(candidates: list[dict[str, Any]], ai_rows: list[dict[str, A
         matched["ai_reason"] = str(row.get("reason") or "").strip()
 
 
-def _build_output_rows(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _build_output_rows(candidates: list[dict[str, Any]], jd_context: dict[str, str]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for rank, candidate in enumerate(candidates, start=1):
         rows.append(
             {
+                "job_id": jd_context.get("job_id", ""),
+                "job_title": jd_context.get("job_title", ""),
+                "job_url": jd_context.get("job_url", ""),
+                "recruiter_sheet_row_number": jd_context.get("recruiter_sheet_row_number", ""),
                 "rank": rank,
                 "email": candidate.get("email", ""),
                 "ai_score": candidate.get("ai_score") if candidate.get("ai_score") is not None else "",
@@ -562,12 +592,106 @@ def _build_output_rows(candidates: list[dict[str, Any]]) -> list[dict[str, Any]]
     return rows
 
 
-def _build_output_sheet_name(run_date: str, job_id: str, index: int) -> str:
-    safe_job_id = re.sub(r"[^a-zA-Z0-9_-]+", "_", (job_id or "").strip()).strip("_")
-    if not safe_job_id:
-        safe_job_id = f"jd_{index}"
-    tab = f"candidate_match_{run_date}_{safe_job_id}"
-    return tab[:100]
+def _build_output_sheet_name(run_date: str) -> str:
+    return f"candidate_match_{run_date}"
+
+
+def _ai_gt_70_summary(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    qualified_emails: list[str] = []
+    for candidate in candidates:
+        score = candidate.get("ai_score")
+        if not isinstance(score, (int, float)):
+            continue
+        if float(score) <= 70:
+            continue
+        email = str(candidate.get("email") or "").strip()
+        if email:
+            qualified_emails.append(email)
+    return {
+        "count": len(qualified_emails),
+        "emails_csv": ", ".join(qualified_emails),
+    }
+
+
+def _write_recruiter_ai_summaries(
+    writer: GoogleSheetsWriter,
+    recruiters_tab: str,
+    summaries: list[dict[str, str]],
+) -> dict[str, Any]:
+    if not summaries:
+        return {
+            "recruiters_tab": recruiters_tab,
+            "rows_updated": 0,
+            "failed_updates": 0,
+        }
+    ws = writer.open_worksheet(recruiters_tab)
+    col_indexes = _ensure_recruiter_summary_columns(writer, ws, recruiters_tab)
+    rows_updated = 0
+    failed_updates = 0
+    for summary in summaries:
+        row_number = _parse_int(summary.get("recruiter_sheet_row_number"))
+        if row_number is None or row_number < 2:
+            failed_updates += 1
+            continue
+        try:
+            count_col = GoogleSheetsWriter._column_letter(col_indexes["ai_score_gt_70_count"])
+            emails_col = GoogleSheetsWriter._column_letter(col_indexes["ai_score_gt_70_emails"])
+            writer.worksheet_update(
+                ws,
+                f"{count_col}{row_number}:{emails_col}{row_number}",
+                [[summary["ai_score_gt_70_count"], summary["ai_score_gt_70_emails"]]],
+                f"candidate_jd_eval:{recruiters_tab}:summary_update:{row_number}",
+            )
+            rows_updated += 1
+        except Exception:
+            failed_updates += 1
+            logger.exception(
+                "candidate-jd-evaluator failed updating recruiter summary row=%s tab=%s",
+                row_number,
+                recruiters_tab,
+            )
+    return {
+        "recruiters_tab": recruiters_tab,
+        "rows_updated": rows_updated,
+        "failed_updates": failed_updates,
+    }
+
+
+def _ensure_recruiter_summary_columns(writer: GoogleSheetsWriter, ws: Any, recruiters_tab: str) -> dict[str, int]:
+    raw = writer.worksheet_get_all_values(
+        ws,
+        f"candidate_jd_eval:{recruiters_tab}:summary_columns:get_all_values",
+    )
+    headers = [str(v or "").strip() for v in (raw[0] if raw else [])]
+    normalized = {h.lower(): idx + 1 for idx, h in enumerate(headers) if h}
+    required = ["ai_score_gt_70_count", "ai_score_gt_70_emails"]
+    missing = [col for col in required if col not in normalized]
+    if missing:
+        for column in missing:
+            headers.append(column)
+            normalized[column] = len(headers)
+        end_col_letter = GoogleSheetsWriter._column_letter(len(headers))
+        writer.worksheet_update(
+            ws,
+            f"A1:{end_col_letter}1",
+            [headers],
+            f"candidate_jd_eval:{recruiters_tab}:summary_columns:update_header",
+        )
+    return {
+        "ai_score_gt_70_count": normalized["ai_score_gt_70_count"],
+        "ai_score_gt_70_emails": normalized["ai_score_gt_70_emails"],
+    }
+
+
+def _extract_job_url(matched_row: dict[str, str], recruiter_row: dict[str, str], recruiter_job_url_key: str | None) -> str:
+    matched_job_url_key = _find_first_key(matched_row, ["job_url", "url", "link"])
+    if matched_job_url_key:
+        url = (matched_row.get(matched_job_url_key) or "").strip()
+        if url:
+            return url
+    if recruiter_job_url_key:
+        return (recruiter_row.get(recruiter_job_url_key) or "").strip()
+    return ""
 
 
 def _top_score(candidates: list[dict[str, Any]]) -> int:

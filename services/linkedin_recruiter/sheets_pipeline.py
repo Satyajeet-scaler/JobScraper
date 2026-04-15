@@ -8,6 +8,7 @@ using company-contact emails from a contacts sheet.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from time import sleep
@@ -19,6 +20,7 @@ T = TypeVar("T")
 LinkedinRecruiterSheetResult = tuple[int, frozenset[str]]
 
 from services.google_sheets import GoogleSheetsWriter
+from services.handover_owners import worksheet_row_dicts
 from services.linkedin_recruiter.pipeline import is_linkedin_job_url, scrape_linkedin_job_recruiters_sync
 from services.linkedin_session import get_linkedin_storage_path
 

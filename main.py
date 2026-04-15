@@ -61,6 +61,7 @@ from services.linkedin_posts_split_service import (
 from services.handover_log_sync import sync_handover_log_to_sheet
 from services.slack_handover_notify import send_handover_notifications
 from services.slack_handover_summary import send_handover_summary_to_slack
+from services.slack_candidate_match_notify import send_candidate_match_slack_notifications
 
 
 app = FastAPI(
@@ -250,6 +251,18 @@ def _run_linkedin_posts_classify_from_scheduler() -> None:
 def _run_slack_handover_from_scheduler() -> None:
     """Run Slack handover in a subprocess (notifications + summary only)."""
     _run_in_subprocess(_slack_handover_work, _cron_today())
+
+
+def _candidate_match_slack_work(run_date: str) -> None:
+    _configure_logging()
+    logger.info("scheduler triggered candidate-match-slack run_date=%s", run_date)
+    result = send_candidate_match_slack_notifications(run_date)
+    logger.info("scheduler candidate-match-slack result=%s", result)
+
+
+def _run_candidate_match_slack_from_scheduler() -> None:
+    """Post candidate_match sheet summary to Slack (one message per job)."""
+    _run_in_subprocess(_candidate_match_slack_work, _cron_today())
 
 
 def _run_handover_log_sync_from_scheduler() -> None:
@@ -463,6 +476,15 @@ def _build_scheduler() -> BackgroundScheduler:
         misfire_grace_time=1800,
     )
     scheduler.add_job(
+        _run_candidate_match_slack_from_scheduler,
+        trigger=CronTrigger(hour=9, minute=35, timezone=timezone),
+        id="daily-candidate-match-slack",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=1800,
+    )
+    scheduler.add_job(
         _run_handover_log_sync_from_scheduler,
         trigger=CronTrigger(hour=9, minute=40, timezone=timezone),
         id="daily-handover-log-sync",
@@ -501,7 +523,7 @@ def startup_event() -> None:
         (
             "internal scheduler started timezone=%s "
             "scrape=%s classify=%s recruiter=%s linkedin_scrape=%s linkedin_classify=%s "
-            "slack=%s handover_log=%s memory_cleanup=%s"
+            "slack=%s candidate_match_slack=%s handover_log=%s memory_cleanup=%s"
         ),
         os.getenv("CRON_TIMEZONE", "Asia/Kolkata"),
         "00:10",
@@ -510,6 +532,7 @@ def startup_event() -> None:
         "04:00",
         "05:00",
         "09:30",
+        "09:35",
         "09:40",
         "09:45",
     )
@@ -696,6 +719,31 @@ def get_candidate_jd_evaluator_run_status(
     if not metrics:
         raise HTTPException(status_code=404, detail="Run ID not found.")
     return JSONResponse(content=metrics)
+
+
+def _run_candidate_match_slack_background_task(run_id: str, run_date: str) -> None:
+    _configure_logging()
+    try:
+        result = send_candidate_match_slack_notifications(run_date)
+        logger.info("candidate-match-slack internal run_id=%s result=%s", run_id, result)
+    except Exception:
+        logger.exception("candidate-match-slack internal failed run_id=%s", run_id)
+
+
+@app.post("/internal/run-candidate-match-slack")
+def run_candidate_match_slack_endpoint(
+    background_tasks: BackgroundTasks,
+    run_date: Optional[str] = Query(default=None, description="Optional date YYYY-MM-DD"),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    resolved_date = run_date or _cron_today()
+    run_id = str(uuid.uuid4())
+    background_tasks.add_task(_run_candidate_match_slack_background_task, run_id, resolved_date)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={"run_id": run_id, "status": "accepted", "run_date": resolved_date},
+    )
 
 
 @app.post("/internal/fix-relevant-jobs-tab")

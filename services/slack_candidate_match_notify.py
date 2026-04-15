@@ -131,6 +131,15 @@ def send_candidate_match_slack_notifications(run_date: str | None = None) -> dic
 
     sleep_between = float(os.getenv("CANDIDATE_MATCH_SLACK_SLEEP_SEC", "1.0"))
     messages_sent = 0
+    date_header = f":calendar: *Candidate match date:* `{resolved}`"
+    if send_slack_text(
+        date_header,
+        defaults=defaults,
+        sleep_after=sleep_between,
+        log_skip_message=None,
+    ):
+        messages_sent += 1
+
     for row in rows:
         job_url = (row.get(url_key) or "").strip()
         count_val = _parse_count(row.get(count_key) or "")

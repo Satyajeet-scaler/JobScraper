@@ -10,6 +10,7 @@ from datetime import date
 from enum import Enum
 from time import sleep
 from typing import Any, Callable, TypeVar
+from urllib.parse import urlparse
 
 import requests
 
@@ -203,6 +204,63 @@ def linkedin_posts_relevant_tab_name(run_date: str) -> str:
     )
 
 
+def candidate_match_tab_name(run_date: str) -> str:
+    """Tab name for candidate match summary rows."""
+    template = (os.getenv("CANDIDATE_MATCH_WORKSHEET_TEMPLATE") or "candidate_match_{date}").strip()
+    return template.replace("{date}", run_date)
+
+
+def _normalize_job_url_for_match(raw_url: Any) -> str:
+    text = str(raw_url or "").strip()
+    if not text:
+        return ""
+    parsed = urlparse(text)
+    netloc = parsed.netloc.lower().strip()
+    if netloc.startswith("www."):
+        netloc = netloc[4:]
+    path = (parsed.path or "").rstrip("/")
+    return f"{netloc}{path}".strip()
+
+
+def _parse_candidate_match_count(value: Any) -> int:
+    text = str(value or "").strip()
+    if not text:
+        return 0
+    try:
+        return int(float(text))
+    except ValueError:
+        return 0
+
+
+def load_candidate_match_count_map(run_date: str) -> dict[str, int]:
+    """
+    Read candidate match tab and return normalized job_url -> ai_score_gt_70_count.
+    Missing/invalid counts are treated as zero.
+    """
+    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
+    if not spreadsheet_id:
+        return {}
+    tab = candidate_match_tab_name(run_date)
+    try:
+        writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
+        ws = writer.open_worksheet(tab)
+        raw = writer.worksheet_get_all_values(ws, f"slack_handover_candidate_match:{tab}:get_all_values")
+        rows = worksheet_row_dicts(raw)
+    except Exception as exc:
+        logger.warning("failed to load candidate match sheet=%s err=%s", tab, exc)
+        return {}
+
+    out: dict[str, int] = {}
+    for row in rows:
+        job_url = (row.get("job_url") or row.get("url") or row.get("link") or "").strip()
+        key = _normalize_job_url_for_match(job_url)
+        if not key:
+            continue
+        count = _parse_candidate_match_count(row.get("ai_score_gt_70_count"))
+        out[key] = count
+    return out
+
+
 def load_linkedin_relevant_posts_from_sheet(run_date: str) -> list[dict[str, Any]]:
     """Read ``linkedin_posts_relevant_{run_date}`` tab."""
     spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
@@ -227,16 +285,12 @@ def send_recruiter_handover_case(
     *,
     run_date: str,
     defaults: SlackNotifyDefaults,
+    candidate_match_count_map: dict[str, int],
 ) -> int:
-    """Case 3: heading + round-robin owners from ``owner_slack_ID``. Returns Slack POST count."""
+    """Case 3: recruiter-profile leads with round-robin owners. Returns Slack POST count."""
     if not rows or not owner_rows:
         return 0
     sent = 0
-    if not send_slack_text(
-        heading_for_case(HandoverSlackCase.RECRUITER_DETAIL), defaults=defaults, sleep_after=1.0
-    ):
-        return 0
-    sent += 1
 
     owner_buckets: dict[int, list[dict[str, str]]] = {i: [] for i in range(len(owner_rows))}
     for idx, row in enumerate(rows):
@@ -252,7 +306,8 @@ def send_recruiter_handover_case(
             role = (row.get("role_category") or row.get("matched_role") or "-").strip() or "-"
             job_url = (row.get("job_url") or "-").strip() or "-"
             profile_url = (row.get("recruiter_profile_url") or "-").strip() or "-"
-            msg = format_recruiter_detail_lead(tag, company, role, job_url, profile_url)
+            matched_count = candidate_match_count_map.get(_normalize_job_url_for_match(job_url), 0)
+            msg = format_recruiter_detail_lead(tag, company, role, job_url, profile_url, matched_count)
             if send_slack_text(msg, defaults=defaults, sleep_after=1.0):
                 sent += 1
     _persist_recruiter_detail_assigned_owner(run_date=run_date, owner_rows=owner_rows)
@@ -264,9 +319,10 @@ def send_internal_poc_handover_case(
     *,
     run_date: str,
     defaults: SlackNotifyDefaults,
+    candidate_match_count_map: dict[str, int],
 ) -> int:
     """
-    Case 2: heading + per-lead tag(s) from ``INTERNAL_POC_TAG_SHEET_NAME`` (all matching emails), else *Unassigned*.
+    Case 2: per-lead tag(s) from ``INTERNAL_POC_TAG_SHEET_NAME`` (all matching emails), else *Unassigned*.
     Does not use the main owner round-robin sheet.
     """
     if not rows:
@@ -274,11 +330,6 @@ def send_internal_poc_handover_case(
     poc_sheet_rows = load_internal_poc_tag_rows()
     email_map = internal_poc_email_owner_map(poc_sheet_rows)
     sent = 0
-    if not send_slack_text(
-        heading_for_case(HandoverSlackCase.INTERNAL_POC), defaults=defaults, sleep_after=1.0
-    ):
-        return 0
-    sent += 1
 
     for row in rows:
         poc_email = (row.get("recruiter_email") or "-").strip() or "-"
@@ -309,7 +360,8 @@ def send_internal_poc_handover_case(
         company = (row.get("company") or "-").strip() or "-"
         role = (row.get("role_category") or row.get("matched_role") or "-").strip() or "-"
         job_url = (row.get("job_url") or "-").strip() or "-"
-        msg = format_internal_poc_lead(tag, company, role, job_url, poc_email)
+        matched_count = candidate_match_count_map.get(_normalize_job_url_for_match(job_url), 0)
+        msg = format_internal_poc_lead(tag, company, role, job_url, poc_email, matched_count)
         if send_slack_text(msg, defaults=defaults, sleep_after=1.0):
             sent += 1
 
@@ -417,6 +469,7 @@ def send_handover_notifications(
     _, case3, case2 = load_recruiter_rows_split_for_handover(rd)
     result["recruiter_detail_leads"] = len(case3)
     result["internal_poc_leads"] = len(case2)
+    candidate_match_count_map = load_candidate_match_count_map(rd)
 
     owner_rows_opt = load_owner_rows_for_handover()
     owner_rows = owner_rows_opt if owner_rows_opt else []
@@ -428,12 +481,19 @@ def send_handover_notifications(
 
     if owner_rows and send_recruiter_info and case3:
         result["recruiter_messages_sent"] += send_recruiter_handover_case(
-            case3, owner_rows, run_date=rd, defaults=defaults
+            case3,
+            owner_rows,
+            run_date=rd,
+            defaults=defaults,
+            candidate_match_count_map=candidate_match_count_map,
         )
 
     if send_internal_poc and case2:
         result["recruiter_messages_sent"] += send_internal_poc_handover_case(
-            case2, run_date=rd, defaults=defaults
+            case2,
+            run_date=rd,
+            defaults=defaults,
+            candidate_match_count_map=candidate_match_count_map,
         )
 
     if send_linkedin_post:
@@ -547,13 +607,15 @@ def format_recruiter_detail_lead(
     role: str,
     job_url: str,
     recruiter_profile_url: str,
+    candidate_match_count: int,
 ) -> str:
     return (
         f"{owner_tag}\n"
         f"Company: {company}\n"
         f"Role: {role}\n"
         f"Job URL: {job_url}\n"
-        f"Recruiter Profile: {recruiter_profile_url}"
+        f"Recruiter Profile: {recruiter_profile_url}\n"
+        f"Candidate match — {candidate_match_count} candidate(s) with AI score > 70"
     )
 
 
@@ -563,13 +625,15 @@ def format_internal_poc_lead(
     role: str,
     job_url: str,
     poc_email: str,
+    candidate_match_count: int,
 ) -> str:
     return (
         f"{owner_tag}\n"
         f"Company: {company}\n"
         f"Role: {role}\n"
         f"Job URL: {job_url}\n"
-        f"Internal POC Email: {poc_email}"
+        f"Internal POC Email: {poc_email}\n"
+        f"Candidate match — {candidate_match_count} candidate(s) with AI score > 70"
     )
 
 

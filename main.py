@@ -264,18 +264,6 @@ def _run_slack_handover_from_scheduler() -> None:
     _run_in_subprocess(_slack_handover_work, _cron_today())
 
 
-def _candidate_match_slack_work(run_date: str) -> None:
-    _configure_logging()
-    logger.info("scheduler triggered candidate-match-slack run_date=%s", run_date)
-    result = send_candidate_match_slack_notifications(run_date)
-    logger.info("scheduler candidate-match-slack result=%s", result)
-
-
-def _run_candidate_match_slack_from_scheduler() -> None:
-    """Post candidate_match sheet summary to Slack (one message per job)."""
-    _run_in_subprocess(_candidate_match_slack_work, _cron_today())
-
-
 def _run_handover_log_sync_from_scheduler() -> None:
     """Append handover rows to the handover log sheet; runs after the 9:30 Slack handover slot."""
     run_date = _cron_today()
@@ -496,15 +484,6 @@ def _build_scheduler() -> BackgroundScheduler:
         misfire_grace_time=1800,
     )
     scheduler.add_job(
-        _run_candidate_match_slack_from_scheduler,
-        trigger=CronTrigger(hour=9, minute=35, timezone=timezone),
-        id="daily-candidate-match-slack",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=1800,
-    )
-    scheduler.add_job(
         _run_handover_log_sync_from_scheduler,
         trigger=CronTrigger(hour=9, minute=40, timezone=timezone),
         id="daily-handover-log-sync",
@@ -543,7 +522,7 @@ def startup_event() -> None:
         (
             "internal scheduler started timezone=%s "
             "scrape=%s classify=%s recruiter=%s linkedin_scrape=%s linkedin_classify=%s "
-            "candidate_jd_eval=%s slack=%s candidate_match_slack=%s handover_log=%s memory_cleanup=%s"
+            "candidate_jd_eval=%s slack=%s handover_log=%s memory_cleanup=%s"
         ),
         os.getenv("CRON_TIMEZONE", "Asia/Kolkata"),
         "00:10",
@@ -553,7 +532,6 @@ def startup_event() -> None:
         "05:00",
         "06:00",
         "09:30",
-        "09:35",
         "09:40",
         "09:45",
     )

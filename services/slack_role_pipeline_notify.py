@@ -22,6 +22,8 @@ from services.slack_handover_notify import (
     load_candidate_match_count_map,
     match_internal_poc_owners_ordered,
     owner_tag_for_handover,
+    persist_assigned_owner_from_email_map,
+    persist_assigned_owner_round_robin,
     send_slack_text,
     slack_notify_defaults_from_env,
 )
@@ -52,6 +54,7 @@ def send_role_handover_notifications(
         "internal_poc_leads": 0,
         "skipped_reason": None,
         "upstream_run_id": upstream_run_id or "",
+        "assigned_owner_rows_updated": 0,
     }
     if not defaults.webhook_url:
         out["skipped_reason"] = "SLACK_WEBHOOK_URL not configured"
@@ -67,11 +70,14 @@ def send_role_handover_notifications(
         resolved_date,
         upstream_run_id=upstream_run_id,
     )
+    case3 = [row for row in case3 if _is_assigned_owner_empty(row)]
+    case2 = [row for row in case2 if _is_assigned_owner_empty(row)]
     out["recruiter_detail_leads"] = len(case3)
     out["internal_poc_leads"] = len(case2)
     candidate_match_count_map = load_candidate_match_count_map(resolved_date)
 
     owner_rows = load_owner_rows_for_handover() or []
+    sent_case3_keys: set[tuple[str, str, str, str]] = set()
     if case3 and owner_rows:
         if send_slack_text(HEADING_RECRUITER_DETAIL, defaults=defaults, sleep_after=1.0):
             out["recruiter_messages_sent"] += 1
@@ -89,7 +95,24 @@ def send_role_handover_notifications(
                     msg = format_recruiter_detail_lead(tag, company, role_category, job_url, profile_url, count)
                     if send_slack_text(msg, defaults=defaults, sleep_after=1.0):
                         out["recruiter_messages_sent"] += 1
+                        sent_case3_keys.add(_recruiter_row_identity(row))
 
+    spreadsheet_id = _google_spreadsheet_id()
+    if sent_case3_keys and owner_rows and spreadsheet_id:
+        persist_assigned_owner_round_robin(
+            spreadsheet_id=spreadsheet_id,
+            worksheet_title=recruiters_tab,
+            owner_rows=owner_rows,
+            selector=lambda row: _is_recruiter_case3_selected(
+                row,
+                run_date=resolved_date,
+                upstream_run_id=upstream_run_id,
+                selected_keys=sent_case3_keys,
+            ),
+        )
+        out["assigned_owner_rows_updated"] += len(sent_case3_keys)
+
+    sent_case2_keys: set[tuple[str, str, str]] = set()
     if case2:
         if send_slack_text(HEADING_INTERNAL_POC, defaults=defaults, sleep_after=1.0):
             out["recruiter_messages_sent"] += 1
@@ -105,6 +128,20 @@ def send_role_handover_notifications(
                 msg = format_internal_poc_lead(tag, company, role_category, job_url, raw_email or "-", count)
                 if send_slack_text(msg, defaults=defaults, sleep_after=1.0):
                     out["recruiter_messages_sent"] += 1
+                    sent_case2_keys.add(_recruiter_case2_identity(row))
+            if sent_case2_keys and spreadsheet_id:
+                persist_assigned_owner_from_email_map(
+                    spreadsheet_id=spreadsheet_id,
+                    worksheet_title=recruiters_tab,
+                    email_map=poc_email_map,
+                    selector=lambda row: _is_recruiter_case2_selected(
+                        row,
+                        run_date=resolved_date,
+                        upstream_run_id=upstream_run_id,
+                        selected_keys=sent_case2_keys,
+                    ),
+                )
+                out["assigned_owner_rows_updated"] += len(sent_case2_keys)
 
     return out
 
@@ -154,4 +191,73 @@ def _normalize_job_key(url: str) -> str:
     from services.slack_handover_notify import _normalize_job_url_for_match
 
     return _normalize_job_url_for_match(url)
+
+
+def _is_assigned_owner_empty(row: dict[str, str]) -> bool:
+    return not str(row.get("assigned owner") or row.get("assigned_owner") or "").strip()
+
+
+def _google_spreadsheet_id() -> str:
+    import os
+
+    return (os.getenv("GOOGLE_SPREADSHEET_ID") or "").strip()
+
+
+def _recruiter_row_identity(row: dict[str, str]) -> tuple[str, str, str, str]:
+    job = _normalize_job_key(str(row.get("job_url") or ""))
+    profile = str(row.get("recruiter_profile_url") or "").strip().lower()
+    email = str(row.get("recruiter_email") or "").strip().lower()
+    source = str(row.get("recruiter_source") or "").strip().lower()
+    return (job, profile, email, source)
+
+
+def _recruiter_case2_identity(row: dict[str, str]) -> tuple[str, str, str]:
+    job = _normalize_job_key(str(row.get("job_url") or ""))
+    email = str(row.get("recruiter_email") or "").strip().lower()
+    source = str(row.get("recruiter_source") or "").strip().lower()
+    return (job, email, source)
+
+
+def _is_recruiter_case3_selected(
+    row: dict[str, str],
+    *,
+    run_date: str,
+    upstream_run_id: str | None,
+    selected_keys: set[tuple[str, str, str, str]],
+) -> bool:
+    row_date = (row.get("run_date") or "").strip()
+    if row_date and row_date != run_date:
+        return False
+    if upstream_run_id:
+        if (row.get("role_pipeline_upstream_run_id") or "").strip() != upstream_run_id:
+            return False
+    if not (row.get("recruiter_profile_url") or "").strip():
+        return False
+    if not _is_assigned_owner_empty(row):
+        return False
+    key = _recruiter_row_identity(row)
+    return key in selected_keys
+
+
+def _is_recruiter_case2_selected(
+    row: dict[str, str],
+    *,
+    run_date: str,
+    upstream_run_id: str | None,
+    selected_keys: set[tuple[str, str, str]],
+) -> bool:
+    row_date = (row.get("run_date") or "").strip()
+    if row_date and row_date != run_date:
+        return False
+    if upstream_run_id:
+        if (row.get("role_pipeline_upstream_run_id") or "").strip() != upstream_run_id:
+            return False
+    has_profile = bool((row.get("recruiter_profile_url") or "").strip())
+    has_email = bool((row.get("recruiter_email") or "").strip())
+    if has_profile or not has_email:
+        return False
+    if not _is_assigned_owner_empty(row):
+        return False
+    key = _recruiter_case2_identity(row)
+    return key in selected_keys
 

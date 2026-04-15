@@ -217,11 +217,13 @@ def send_role_linkedin_posts_notifications(
             run_date=resolved_run_date,
             upstream_run_id=upstream_run_id,
         )
+        unsent_rows = _filter_rows_without_assigned_owner(filtered_rows)
         defaults = slack_notify_defaults_from_env()
         messages_sent = send_linkedin_post_handover_messages(
-            filtered_rows,
+            unsent_rows,
             run_date=resolved_run_date,
             defaults=defaults,
+            persist_assigned_owner_tab=relevant_tab,
         )
         summary = {
             "run_id": notify_run_id,
@@ -232,7 +234,7 @@ def send_role_linkedin_posts_notifications(
             "upstream_run_id": upstream_run_id or "",
             "relevant_tab": relevant_tab,
             "input_relevant_count": len(relevant_rows),
-            "notified_relevant_count": len(filtered_rows),
+            "notified_relevant_count": len(unsent_rows),
             "messages_sent": messages_sent,
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
@@ -331,6 +333,16 @@ def _filter_relevant_rows_for_notify(
                 continue
         output.append(dict(row))
     return output
+
+
+def _filter_rows_without_assigned_owner(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        assigned_owner = str(row.get("assigned owner") or row.get("assigned_owner") or "").strip()
+        if assigned_owner:
+            continue
+        out.append(dict(row))
+    return out
 
 
 def _dedupe_rows_by_post_url(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

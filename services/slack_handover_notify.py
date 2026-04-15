@@ -384,6 +384,7 @@ def send_linkedin_post_handover_messages(
     *,
     run_date: str | None = None,
     defaults: SlackNotifyDefaults | None = None,
+    persist_assigned_owner_tab: str | None = None,
 ) -> int:
     """Heading + per-post messages (owners round-robin or Unassigned). Returns POST count."""
     d = defaults or slack_notify_defaults_from_env()
@@ -410,6 +411,7 @@ def send_linkedin_post_handover_messages(
         _persist_linkedin_posts_assigned_owner(
             run_date=run_date,
             owner_rows=owner_rows_opt,
+            worksheet_title=persist_assigned_owner_tab,
         )
         owner_buckets: dict[int, list[dict[str, Any]]] = {i: [] for i in range(len(owner_rows_opt))}
         for idx, row in enumerate(relevant_rows):
@@ -802,12 +804,13 @@ def _persist_linkedin_posts_assigned_owner(
     *,
     run_date: str | None,
     owner_rows: list[dict[str, str]],
+    worksheet_title: str | None = None,
 ) -> None:
     spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
     if not spreadsheet_id or not owner_rows:
         return
     rd = (run_date or date.today().isoformat()).strip()
-    tab = linkedin_posts_relevant_tab_name(rd)
+    tab = worksheet_title or linkedin_posts_relevant_tab_name(rd)
 
     def selector(row: dict[str, str]) -> bool:
         row_run_date = (row.get("run_date") or "").strip()
@@ -819,6 +822,109 @@ def _persist_linkedin_posts_assigned_owner(
         owner_rows=owner_rows,
         selector=selector,
     )
+
+
+def persist_assigned_owner_round_robin(
+    *,
+    spreadsheet_id: str,
+    worksheet_title: str,
+    owner_rows: list[dict[str, str]],
+    selector: Callable[[dict[str, str]], bool],
+) -> None:
+    """Public helper to persist round-robin assigned owner for selected rows."""
+    if not spreadsheet_id or not owner_rows:
+        return
+    _persist_assigned_owner_column(
+        spreadsheet_id=spreadsheet_id,
+        worksheet_title=worksheet_title,
+        owner_rows=owner_rows,
+        selector=selector,
+    )
+
+
+def persist_assigned_owner_from_email_map(
+    *,
+    spreadsheet_id: str,
+    worksheet_title: str,
+    email_map: dict[str, dict[str, str]],
+    selector: Callable[[dict[str, str]], bool],
+) -> None:
+    """Public helper to persist assigned owner via recruiter email mapping."""
+    if not spreadsheet_id:
+        return
+    try:
+        writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
+        ws = writer.open_worksheet(worksheet_title)
+        values = writer.worksheet_get_all_values(
+            ws,
+            f"persist_email_map:{worksheet_title}:get_all_values",
+        )
+        if not values:
+            return
+        headers = [str(h or "").strip() for h in values[0]]
+        data_rows = [list(r) for r in values[1:]]
+
+        normalized_headers = [h.lower() for h in headers]
+        assigned_header = "assigned owner"
+        if assigned_header in normalized_headers:
+            assigned_col_idx = normalized_headers.index(assigned_header)
+        else:
+            headers.append(assigned_header)
+            assigned_col_idx = len(headers) - 1
+            normalized_headers.append(assigned_header)
+
+        for row in data_rows:
+            while len(row) < len(headers):
+                row.append("")
+
+        updated = 0
+        for row in data_rows:
+            row_dict: dict[str, str] = {}
+            for idx, header in enumerate(normalized_headers):
+                row_dict[header] = row[idx].strip() if idx < len(row) else ""
+            if not selector(row_dict):
+                continue
+            raw_rec = (row_dict.get("recruiter_email") or "").strip()
+            matched_owners = match_internal_poc_owners_ordered(raw_rec, email_map)
+            if matched_owners:
+                row[assigned_col_idx] = "; ".join(_owner_display_name(o) for o in matched_owners)
+            else:
+                row[assigned_col_idx] = "Unassigned"
+            updated += 1
+
+        if not updated:
+            return
+
+        writer.worksheet_update(
+            ws,
+            "A1",
+            [headers],
+            f"persist_email_map:{worksheet_title}:update_headers",
+        )
+        col_letter = _column_letter(assigned_col_idx + 1)
+        end_row = len(data_rows) + 1
+        if end_row >= 2:
+            col_values = [[row[assigned_col_idx]] for row in data_rows]
+            rng = f"{col_letter}2:{col_letter}{end_row}"
+            writer.worksheet_update(
+                ws,
+                rng,
+                col_values,
+                f"persist_email_map:{worksheet_title}:update_column",
+            )
+        logger.info(
+            "assigned owner via email-map persisted sheet=%s tab=%s updated_rows=%s",
+            spreadsheet_id,
+            worksheet_title,
+            updated,
+        )
+    except Exception as exc:
+        logger.warning(
+            "failed to persist assigned owner via email-map sheet=%s tab=%s err=%s",
+            spreadsheet_id,
+            worksheet_title,
+            exc,
+        )
 
 
 def _persist_assigned_owner_column(

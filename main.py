@@ -248,6 +248,17 @@ def _run_linkedin_posts_classify_from_scheduler() -> None:
     _run_in_subprocess(_linkedin_posts_classify_work, str(uuid.uuid4()), _cron_today())
 
 
+def _candidate_jd_evaluator_work(run_id: str, run_date: str) -> None:
+    _configure_logging()
+    logger.info("scheduler triggered candidate-jd-evaluator run_id=%s run_date=%s", run_id, run_date)
+    run_candidate_jd_evaluator(run_id=run_id, run_date=run_date)
+
+
+def _run_candidate_jd_evaluator_from_scheduler() -> None:
+    """Run candidate vs JD matching (Sheets + Gemini) for today's date in CRON_TIMEZONE (IST by default)."""
+    _run_in_subprocess(_candidate_jd_evaluator_work, str(uuid.uuid4()), _cron_today())
+
+
 def _run_slack_handover_from_scheduler() -> None:
     """Run Slack handover in a subprocess (notifications + summary only)."""
     _run_in_subprocess(_slack_handover_work, _cron_today())
@@ -467,6 +478,15 @@ def _build_scheduler() -> BackgroundScheduler:
         misfire_grace_time=1800,
     )
     scheduler.add_job(
+        _run_candidate_jd_evaluator_from_scheduler,
+        trigger=CronTrigger(hour=6, minute=0, timezone=timezone),
+        id="daily-candidate-jd-evaluator",
+        replace_existing=True,
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=1800,
+    )
+    scheduler.add_job(
         _run_slack_handover_from_scheduler,
         trigger=CronTrigger(hour=9, minute=30, timezone=timezone),
         id="daily-slack-handover-all-cases",
@@ -523,7 +543,7 @@ def startup_event() -> None:
         (
             "internal scheduler started timezone=%s "
             "scrape=%s classify=%s recruiter=%s linkedin_scrape=%s linkedin_classify=%s "
-            "slack=%s candidate_match_slack=%s handover_log=%s memory_cleanup=%s"
+            "candidate_jd_eval=%s slack=%s candidate_match_slack=%s handover_log=%s memory_cleanup=%s"
         ),
         os.getenv("CRON_TIMEZONE", "Asia/Kolkata"),
         "00:10",
@@ -531,6 +551,7 @@ def startup_event() -> None:
         "03:00",
         "04:00",
         "05:00",
+        "06:00",
         "09:30",
         "09:35",
         "09:40",

@@ -103,6 +103,7 @@ def run_role_linkedin_posts_classify_only(
     run_id: str | None = None,
     run_date: str | None = None,
     role: str | None = None,
+    post_classify_notify_enabled: bool | None = None,
 ) -> dict[str, Any]:
     pipeline_run_id = run_id or str(uuid.uuid4())
     resolved_run_date = (run_date or date.today().isoformat()).strip()
@@ -159,7 +160,9 @@ def run_role_linkedin_posts_classify_only(
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         notify_enabled = (
-            os.getenv("ROLE_LINKEDIN_POSTS_POST_CLASSIFY_NOTIFY_ENABLED", "true").lower() in ("1", "true", "yes")
+            post_classify_notify_enabled
+            if post_classify_notify_enabled is not None
+            else os.getenv("ROLE_LINKEDIN_POSTS_POST_CLASSIFY_NOTIFY_ENABLED", "true").lower() in ("1", "true", "yes")
         )
         metrics["post_classify_notify_enabled"] = notify_enabled
         if notify_enabled:

@@ -114,6 +114,7 @@ def run_role_classify_only(
     run_id: str | None = None,
     run_date: str | None = None,
     role: str | None = None,
+    post_classify_chain_enabled: bool | None = None,
 ) -> dict[str, Any]:
     pipeline_run_id = run_id or str(uuid.uuid4())
     resolved_role = _validate_role(role)
@@ -181,7 +182,11 @@ def run_role_classify_only(
             "relevant_tab": relevant_tab,
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
-        chain_enabled = os.getenv("ROLE_PIPELINE_POST_CLASSIFY_CHAIN_ENABLED", "true").lower() in ("1", "true", "yes")
+        chain_enabled = (
+            post_classify_chain_enabled
+            if post_classify_chain_enabled is not None
+            else os.getenv("ROLE_PIPELINE_POST_CLASSIFY_CHAIN_ENABLED", "true").lower() in ("1", "true", "yes")
+        )
         metrics["post_classify_chain_enabled"] = chain_enabled
         if chain_enabled:
             recruiter_summary: dict[str, Any] = {"status": "skipped"}

@@ -77,6 +77,7 @@ from services.role_linkedin_posts_pipeline import (
     run_role_linkedin_posts_scrape_only,
     send_role_linkedin_posts_notifications,
 )
+from services.slack_role_pipeline_notify import send_role_handover_notifications
 from services.handover_log_sync import sync_handover_log_to_sheet
 from services.slack_handover_notify import send_handover_notifications
 from services.slack_handover_summary import send_handover_summary_to_slack
@@ -230,7 +231,23 @@ def _role_classify_work(run_id: str, run_date: str, role: str) -> None:
         run_date,
         role,
     )
-    run_role_classify_only(run_id=run_id, run_date=run_date, role=role)
+    run_role_classify_only(
+        run_id=run_id,
+        run_date=run_date,
+        role=role,
+        post_classify_chain_enabled=False,
+    )
+
+
+def _role_recruiter_info_work(run_id: str, run_date: str, role: str) -> None:
+    _configure_logging()
+    logger.info(
+        "scheduler triggered role-recruiter-info run_id=%s run_date=%s role=%s",
+        run_id,
+        run_date,
+        role,
+    )
+    run_role_recruiter_info_extraction(run_id=run_id, run_date=run_date, role=role)
 
 
 def _role_linkedin_posts_scrape_work(run_id: str, run_date: str, role: str) -> None:
@@ -252,7 +269,27 @@ def _role_linkedin_posts_classify_work(run_id: str, run_date: str, role: str) ->
         run_date,
         role,
     )
-    run_role_linkedin_posts_classify_only(run_id=run_id, run_date=run_date, role=role)
+    run_role_linkedin_posts_classify_only(
+        run_id=run_id,
+        run_date=run_date,
+        role=role,
+        post_classify_notify_enabled=False,
+    )
+
+
+def _role_slack_handover_work(run_date: str, role: str) -> None:
+    _configure_logging()
+    logger.info("scheduler triggered role-slack-handover run_date=%s role=%s", run_date, role)
+    recruiter_summary = send_role_handover_notifications(
+        run_date=run_date,
+        role=role,
+    )
+    logger.info("scheduler role-slack-handover recruiter-summary=%s", recruiter_summary)
+    linkedin_summary = send_role_linkedin_posts_notifications(
+        run_date=run_date,
+        role=role,
+    )
+    logger.info("scheduler role-slack-handover linkedin-summary=%s", linkedin_summary)
 
 
 def _recruiter_info_work(run_id: str, run_date: str) -> None:
@@ -328,6 +365,11 @@ def _run_role_classify_from_scheduler() -> None:
     _run_in_subprocess(_role_classify_work, str(uuid.uuid4()), run_date, _role_pipeline_cron_role())
 
 
+def _run_role_recruiter_info_from_scheduler() -> None:
+    run_date = _cron_today()
+    _run_in_subprocess(_role_recruiter_info_work, str(uuid.uuid4()), run_date, _role_pipeline_cron_role())
+
+
 def _run_role_linkedin_posts_scrape_from_scheduler() -> None:
     run_date = _cron_today()
     _run_in_subprocess(
@@ -346,6 +388,12 @@ def _run_role_linkedin_posts_classify_from_scheduler() -> None:
         run_date,
         _role_pipeline_cron_role(),
     )
+
+
+def _run_role_slack_handover_from_scheduler() -> None:
+    run_date = _cron_today()
+    role = _role_pipeline_cron_role()
+    _run_in_subprocess(_role_slack_handover_work, run_date, role)
 
 
 def _role_scrape_sources_for_current_slot() -> list[str]:
@@ -593,8 +641,26 @@ def _build_scheduler() -> BackgroundScheduler:
         )
         scheduler.add_job(
             _run_role_classify_from_scheduler,
-            trigger=CronTrigger(hour="9-18/3", minute=10, timezone=timezone),
+            trigger=CronTrigger(hour="9-18/3", minute=0, timezone=timezone),
             id="intraday-role-classify-only",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800,
+        )
+        scheduler.add_job(
+            _run_role_recruiter_info_from_scheduler,
+            trigger=CronTrigger(hour="9-18/3", minute=10, timezone=timezone),
+            id="intraday-role-recruiter-info-only",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800,
+        )
+        scheduler.add_job(
+            _run_role_slack_handover_from_scheduler,
+            trigger=CronTrigger(hour="9-18/3", minute=30, timezone=timezone),
+            id="intraday-role-slack-handover",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
@@ -712,7 +778,7 @@ def startup_event() -> None:
             "scrape=%s classify=%s recruiter=%s linkedin_scrape=%s linkedin_classify=%s "
             "candidate_jd_eval=%s slack=%s handover_log=%s memory_cleanup=%s "
             "legacy_pipeline_enabled=%s role_pipeline_enabled=%s role_linkedin_posts_enabled=%s "
-            "role_pipeline_role=%s role_scrape_slots=%s role_classify_slots=%s "
+            "role_pipeline_role=%s role_scrape_slots=%s role_classify_slots=%s role_recruiter_info_slots=%s role_slack_slots=%s "
             "role_linkedin_posts_scrape_slots=%s role_linkedin_posts_classify_slots=%s"
         ),
         os.getenv("CRON_TIMEZONE", "Asia/Kolkata"),
@@ -730,7 +796,9 @@ def startup_event() -> None:
         role_linkedin_posts_enabled,
         role_pipeline_role,
         "8:30,11:30,14:30,17:30",
+        "9:00,12:00,15:00,18:00",
         "9:10,12:10,15:10,18:10",
+        "9:30,12:30,15:30,18:30",
         "8:50,11:50,14:50,17:50",
         "9:20,12:20,15:20,18:20",
     )

@@ -126,7 +126,7 @@ def run_role_linkedin_posts_classify_only(
         relevant_run_seq = _next_run_sequence(existing_relevant_rows, seq_field="role_linkedin_posts_classify_run_seq")
         classify_input_rows = _filter_new_rows_by_post_url(deduped_scraped, existing_relevant_rows)
         if classify_input_rows:
-            relevant_rows, classification_errors = _classify_relevant_posts(classify_input_rows)
+            relevant_rows, classification_errors = _classify_relevant_posts_for_role_pipeline(classify_input_rows)
         else:
             relevant_rows, classification_errors = [], 0
         relevant_rows = _enrich_role_context(relevant_rows, resolved_role, role_slug)
@@ -304,6 +304,33 @@ def _resolve_role_queries(role: str, override_queries: list[str] | None) -> list
     if not queries:
         raise RuntimeError("ROLE_LINKEDIN_POSTS_QUERY_TEMPLATE resolved to empty queries.")
     return queries
+
+
+def _classify_relevant_posts_for_role_pipeline(
+    rows: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], int]:
+    """
+    Role pipeline wrapper around LinkedIn-post classifier prompt.
+
+    Preferred role-specific env:
+    - ROLE_LINKEDIN_POSTS_AI_RELEVANCE_PROMPT
+
+    Fallback remains shared LinkedIn-post prompt behavior:
+    - AI_RELEVANCE_PROMPT_LINKEDIN_POSTS
+    """
+    role_prompt = os.getenv("ROLE_LINKEDIN_POSTS_AI_RELEVANCE_PROMPT")
+    if not role_prompt:
+        return _classify_relevant_posts(rows)
+
+    previous_prompt = os.environ.get("AI_RELEVANCE_PROMPT_LINKEDIN_POSTS")
+    try:
+        os.environ["AI_RELEVANCE_PROMPT_LINKEDIN_POSTS"] = role_prompt
+        return _classify_relevant_posts(rows)
+    finally:
+        if previous_prompt is None:
+            os.environ.pop("AI_RELEVANCE_PROMPT_LINKEDIN_POSTS", None)
+        else:
+            os.environ["AI_RELEVANCE_PROMPT_LINKEDIN_POSTS"] = previous_prompt
 
 
 def _enrich_role_context(rows: list[dict[str, Any]], role: str, role_slug: str) -> list[dict[str, Any]]:

@@ -287,10 +287,15 @@ def send_recruiter_handover_case(
     defaults: SlackNotifyDefaults,
     candidate_match_count_map: dict[str, int],
 ) -> int:
-    """Case 3: recruiter-profile leads with round-robin owners. Returns Slack POST count."""
+    """Case 3: heading + round-robin owners from ``owner_slack_ID``. Returns Slack POST count."""
     if not rows or not owner_rows:
         return 0
     sent = 0
+    if not send_slack_text(
+        heading_for_case(HandoverSlackCase.RECRUITER_DETAIL), defaults=defaults, sleep_after=1.0
+    ):
+        return 0
+    sent += 1
 
     owner_buckets: dict[int, list[dict[str, str]]] = {i: [] for i in range(len(owner_rows))}
     for idx, row in enumerate(rows):
@@ -322,7 +327,7 @@ def send_internal_poc_handover_case(
     candidate_match_count_map: dict[str, int],
 ) -> int:
     """
-    Case 2: per-lead tag(s) from ``INTERNAL_POC_TAG_SHEET_NAME`` (all matching emails), else *Unassigned*.
+    Case 2: heading + per-lead tag(s) from ``INTERNAL_POC_TAG_SHEET_NAME`` (all matching emails), else *Unassigned*.
     Does not use the main owner round-robin sheet.
     """
     if not rows:
@@ -330,6 +335,11 @@ def send_internal_poc_handover_case(
     poc_sheet_rows = load_internal_poc_tag_rows()
     email_map = internal_poc_email_owner_map(poc_sheet_rows)
     sent = 0
+    if not send_slack_text(
+        heading_for_case(HandoverSlackCase.INTERNAL_POC), defaults=defaults, sleep_after=1.0
+    ):
+        return 0
+    sent += 1
 
     for row in rows:
         poc_email = (row.get("recruiter_email") or "-").strip() or "-"

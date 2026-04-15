@@ -49,7 +49,11 @@ from services.role_pipeline import (
     run_role_classify_only,
     run_role_scrape_only,
 )
-from services.role_recruiter_info_service import ROLE_RECRUITER_INFO_RUN_METRICS
+from services.role_recruiter_info_service import (
+    ROLE_RECRUITER_INFO_RUN_METRICS,
+    get_role_recruiter_info_run_metrics,
+    run_role_recruiter_info_extraction,
+)
 from services.recruiter_info_service import get_recruiter_info_run_metrics, run_recruiter_info_extraction
 from services.candidate_jd_evaluator_service import (
     get_candidate_jd_evaluator_run_metrics,
@@ -928,6 +932,51 @@ def get_role_classify_run_status(
 ) -> JSONResponse:
     validate_internal_trigger_token(x_internal_token)
     metrics = get_role_classify_run_metrics(run_id)
+    if not metrics:
+        raise HTTPException(status_code=404, detail="Run ID not found.")
+    return JSONResponse(content=metrics)
+
+
+@app.post("/internal/run-role-recruiter-info")
+def run_role_recruiter_info(
+    background_tasks: BackgroundTasks,
+    role: str = Query(..., description="Required role query, e.g. Data Analyst"),
+    run_date: Optional[str] = Query(default=None, description="Optional date YYYY-MM-DD"),
+    upstream_run_id: Optional[str] = Query(default=None, description="Optional classify run_id for exact recruiter scope."),
+    upstream_run_seq: Optional[int] = Query(default=None, description="Optional classify run sequence for metadata tracking."),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    resolved_date = run_date or _cron_today()
+    run_id = str(uuid.uuid4())
+    background_tasks.add_task(
+        run_role_recruiter_info_extraction,
+        run_id,
+        resolved_date,
+        role,
+        upstream_run_id,
+        upstream_run_seq,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "run_id": run_id,
+            "status": "accepted",
+            "run_date": resolved_date,
+            "role": role.strip(),
+            "upstream_run_id": upstream_run_id,
+            "upstream_run_seq": upstream_run_seq,
+        },
+    )
+
+
+@app.get("/internal/run-role-recruiter-info/{run_id}")
+def get_role_recruiter_info_run_status(
+    run_id: str,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    metrics = get_role_recruiter_info_run_metrics(run_id)
     if not metrics:
         raise HTTPException(status_code=404, detail="Run ID not found.")
     return JSONResponse(content=metrics)

@@ -224,11 +224,27 @@ class GoogleSheetsWriter:
             ws,
             f"append_to_worksheet:{worksheet_title}:get_all_values",
         )
-        if not existing:
-            if header_row:
+        if header_row:
+            should_write_header = False
+            if not existing:
+                should_write_header = True
+            else:
+                first_row = [str(c or "").strip() for c in existing[0]]
+                expected = [str(c or "").strip() for c in header_row]
+                max_len = max(len(first_row), len(expected))
+                first_row_norm = first_row + ([""] * (max_len - len(first_row)))
+                expected_norm = expected + ([""] * (max_len - len(expected)))
+                if first_row_norm != expected_norm:
+                    should_write_header = True
+
+            if should_write_header:
                 self._sheet_op(
-                    f"append_to_worksheet:{worksheet_title}:header_row",
-                    lambda: ws.append_rows([header_row], value_input_option="USER_ENTERED"),
+                    f"append_to_worksheet:{worksheet_title}:insert_header_row",
+                    lambda: ws.insert_row(
+                        [self._stringify(c) for c in header_row],
+                        index=1,
+                        value_input_option="USER_ENTERED",
+                    ),
                 )
 
         if not data_rows:

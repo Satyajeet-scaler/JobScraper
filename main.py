@@ -65,6 +65,14 @@ from services.linkedin_posts_split_service import (
     run_linkedin_posts_classify_only,
     run_linkedin_posts_scrape_only,
 )
+from services.role_linkedin_posts_pipeline import (
+    get_role_linkedin_posts_classify_run_metrics,
+    get_role_linkedin_posts_notify_run_metrics,
+    get_role_linkedin_posts_scrape_run_metrics,
+    run_role_linkedin_posts_classify_only,
+    run_role_linkedin_posts_scrape_only,
+    send_role_linkedin_posts_notifications,
+)
 from services.handover_log_sync import sync_handover_log_to_sheet
 from services.slack_handover_notify import send_handover_notifications
 from services.slack_handover_summary import send_handover_summary_to_slack
@@ -221,6 +229,28 @@ def _role_classify_work(run_id: str, run_date: str, role: str) -> None:
     run_role_classify_only(run_id=run_id, run_date=run_date, role=role)
 
 
+def _role_linkedin_posts_scrape_work(run_id: str, run_date: str, role: str) -> None:
+    _configure_logging()
+    logger.info(
+        "scheduler triggered role-linkedin-posts-scrape run_id=%s run_date=%s role=%s",
+        run_id,
+        run_date,
+        role,
+    )
+    run_role_linkedin_posts_scrape_only(run_id=run_id, run_date=run_date, role=role)
+
+
+def _role_linkedin_posts_classify_work(run_id: str, run_date: str, role: str) -> None:
+    _configure_logging()
+    logger.info(
+        "scheduler triggered role-linkedin-posts-classify run_id=%s run_date=%s role=%s",
+        run_id,
+        run_date,
+        role,
+    )
+    run_role_linkedin_posts_classify_only(run_id=run_id, run_date=run_date, role=role)
+
+
 def _recruiter_info_work(run_id: str, run_date: str) -> None:
     _configure_logging()
     logger.info("scheduler triggered recruiter-info run_id=%s run_date=%s", run_id, run_date)
@@ -292,6 +322,26 @@ def _run_role_scrape_from_scheduler() -> None:
 def _run_role_classify_from_scheduler() -> None:
     run_date = _cron_today()
     _run_in_subprocess(_role_classify_work, str(uuid.uuid4()), run_date, _role_pipeline_cron_role())
+
+
+def _run_role_linkedin_posts_scrape_from_scheduler() -> None:
+    run_date = _cron_today()
+    _run_in_subprocess(
+        _role_linkedin_posts_scrape_work,
+        str(uuid.uuid4()),
+        run_date,
+        _role_pipeline_cron_role(),
+    )
+
+
+def _run_role_linkedin_posts_classify_from_scheduler() -> None:
+    run_date = _cron_today()
+    _run_in_subprocess(
+        _role_linkedin_posts_classify_work,
+        str(uuid.uuid4()),
+        run_date,
+        _role_pipeline_cron_role(),
+    )
 
 
 def _role_scrape_sources_for_current_slot() -> list[str]:
@@ -441,6 +491,11 @@ def free_memory() -> dict[str, Any]:
     from services.wellfound_classify_pipeline import WELLFOUND_CLASSIFY_RUN_METRICS
     from services.hirecafe_only_pipeline import HIRECAFE_RUN_METRICS
     from services.role_pipeline import ROLE_CLASSIFY_RUN_METRICS, ROLE_SCRAPE_RUN_METRICS
+    from services.role_linkedin_posts_pipeline import (
+        ROLE_LINKEDIN_POSTS_CLASSIFY_RUN_METRICS,
+        ROLE_LINKEDIN_POSTS_NOTIFY_RUN_METRICS,
+        ROLE_LINKEDIN_POSTS_SCRAPE_RUN_METRICS,
+    )
 
     all_metrics = [
         PIPELINE_RUN_METRICS,
@@ -457,6 +512,9 @@ def free_memory() -> dict[str, Any]:
         ROLE_SCRAPE_RUN_METRICS,
         ROLE_CLASSIFY_RUN_METRICS,
         ROLE_RECRUITER_INFO_RUN_METRICS,
+        ROLE_LINKEDIN_POSTS_SCRAPE_RUN_METRICS,
+        ROLE_LINKEDIN_POSTS_CLASSIFY_RUN_METRICS,
+        ROLE_LINKEDIN_POSTS_NOTIFY_RUN_METRICS,
     ]
     entries_cleared = sum(len(m) for m in all_metrics)
     for m in all_metrics:
@@ -494,6 +552,9 @@ def _build_scheduler() -> BackgroundScheduler:
     timezone = ZoneInfo(timezone_name)
     legacy_pipeline_enabled = os.getenv("ENABLE_LEGACY_CRON_JOBS", "true").lower() == "true"
     role_pipeline_enabled = os.getenv("ENABLE_ROLE_PIPELINE_CRON", "false").lower() == "true"
+    role_linkedin_posts_enabled = (
+        os.getenv("ENABLE_ROLE_LINKEDIN_POSTS_PIPELINE_CRON", "false").lower() == "true"
+    )
     role_pipeline_role = _role_pipeline_cron_role()
 
     scheduler = BackgroundScheduler(timezone=timezone)
@@ -530,6 +591,25 @@ def _build_scheduler() -> BackgroundScheduler:
             _run_role_classify_from_scheduler,
             trigger=CronTrigger(hour="9-18/3", minute=10, timezone=timezone),
             id="intraday-role-classify-only",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800,
+        )
+    if role_linkedin_posts_enabled:
+        scheduler.add_job(
+            _run_role_linkedin_posts_scrape_from_scheduler,
+            trigger=CronTrigger(hour="8-17/3", minute=50, timezone=timezone),
+            id="intraday-role-linkedin-posts-scrape-only",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800,
+        )
+        scheduler.add_job(
+            _run_role_linkedin_posts_classify_from_scheduler,
+            trigger=CronTrigger(hour="9-18/3", minute=20, timezone=timezone),
+            id="intraday-role-linkedin-posts-classify-only",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
@@ -618,14 +698,18 @@ def startup_event() -> None:
     _scheduler.start()
     legacy_pipeline_enabled = os.getenv("ENABLE_LEGACY_CRON_JOBS", "true").lower() == "true"
     role_pipeline_enabled = os.getenv("ENABLE_ROLE_PIPELINE_CRON", "false").lower() == "true"
+    role_linkedin_posts_enabled = (
+        os.getenv("ENABLE_ROLE_LINKEDIN_POSTS_PIPELINE_CRON", "false").lower() == "true"
+    )
     role_pipeline_role = _role_pipeline_cron_role()
     logger.info(
         (
             "internal scheduler started timezone=%s "
             "scrape=%s classify=%s recruiter=%s linkedin_scrape=%s linkedin_classify=%s "
             "candidate_jd_eval=%s slack=%s handover_log=%s memory_cleanup=%s "
-            "legacy_pipeline_enabled=%s role_pipeline_enabled=%s role_pipeline_role=%s "
-            "role_scrape_slots=%s role_classify_slots=%s"
+            "legacy_pipeline_enabled=%s role_pipeline_enabled=%s role_linkedin_posts_enabled=%s "
+            "role_pipeline_role=%s role_scrape_slots=%s role_classify_slots=%s "
+            "role_linkedin_posts_scrape_slots=%s role_linkedin_posts_classify_slots=%s"
         ),
         os.getenv("CRON_TIMEZONE", "Asia/Kolkata"),
         "00:10",
@@ -639,9 +723,12 @@ def startup_event() -> None:
         "09:45",
         legacy_pipeline_enabled,
         role_pipeline_enabled,
+        role_linkedin_posts_enabled,
         role_pipeline_role,
         "8:30,11:30,14:30,17:30",
         "9:10,12:10,15:10,18:10",
+        "8:50,11:50,14:50,17:50",
+        "9:20,12:20,15:20,18:20",
     )
 
 
@@ -1198,6 +1285,136 @@ def get_linkedin_posts_classify_status(
 ) -> JSONResponse:
     validate_internal_trigger_token(x_internal_token)
     metrics = get_linkedin_posts_classify_only_metrics(run_id)
+    if not metrics:
+        raise HTTPException(status_code=404, detail="Run ID not found.")
+    return JSONResponse(content=metrics)
+
+
+@app.post("/internal/run-role-linkedin-posts-scrape")
+def run_role_linkedin_posts_scrape(
+    background_tasks: BackgroundTasks,
+    role: str = Query(..., description="Required role query, e.g. Data Analyst"),
+    queries: Optional[str] = Query(
+        default=None,
+        description="Optional pipe-separated custom queries (overrides role query template).",
+    ),
+    run_date: Optional[str] = Query(default=None, description="Optional date YYYY-MM-DD"),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    resolved_date = run_date or _cron_today()
+    selected_queries = [part.strip() for part in (queries or "").split("|") if part.strip()] if queries else None
+    run_id = str(uuid.uuid4())
+    background_tasks.add_task(
+        run_role_linkedin_posts_scrape_only,
+        run_id,
+        resolved_date,
+        role,
+        selected_queries,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "run_id": run_id,
+            "status": "accepted",
+            "run_date": resolved_date,
+            "role": role.strip(),
+            "queries": selected_queries,
+        },
+    )
+
+
+@app.get("/internal/run-role-linkedin-posts-scrape/{run_id}")
+def get_role_linkedin_posts_scrape_status(
+    run_id: str,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    metrics = get_role_linkedin_posts_scrape_run_metrics(run_id)
+    if not metrics:
+        raise HTTPException(status_code=404, detail="Run ID not found.")
+    return JSONResponse(content=metrics)
+
+
+@app.post("/internal/run-role-linkedin-posts-classify")
+def run_role_linkedin_posts_classify(
+    background_tasks: BackgroundTasks,
+    role: str = Query(..., description="Required role query, e.g. Data Analyst"),
+    run_date: Optional[str] = Query(default=None, description="Optional date YYYY-MM-DD"),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    resolved_date = run_date or _cron_today()
+    run_id = str(uuid.uuid4())
+    background_tasks.add_task(
+        run_role_linkedin_posts_classify_only,
+        run_id,
+        resolved_date,
+        role,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "run_id": run_id,
+            "status": "accepted",
+            "run_date": resolved_date,
+            "role": role.strip(),
+        },
+    )
+
+
+@app.get("/internal/run-role-linkedin-posts-classify/{run_id}")
+def get_role_linkedin_posts_classify_status(
+    run_id: str,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    metrics = get_role_linkedin_posts_classify_run_metrics(run_id)
+    if not metrics:
+        raise HTTPException(status_code=404, detail="Run ID not found.")
+    return JSONResponse(content=metrics)
+
+
+@app.post("/internal/run-role-linkedin-posts-notify")
+def run_role_linkedin_posts_notify(
+    background_tasks: BackgroundTasks,
+    role: str = Query(..., description="Required role query, e.g. Data Analyst"),
+    run_date: Optional[str] = Query(default=None, description="Optional date YYYY-MM-DD"),
+    upstream_run_id: Optional[str] = Query(default=None, description="Optional classify run_id for exact notify scope."),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    resolved_date = run_date or _cron_today()
+    run_id = str(uuid.uuid4())
+
+    def _notify_background() -> None:
+        send_role_linkedin_posts_notifications(
+            run_date=resolved_date,
+            role=role,
+            upstream_run_id=upstream_run_id,
+            run_id=run_id,
+        )
+
+    background_tasks.add_task(_notify_background)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "run_id": run_id,
+            "status": "accepted",
+            "run_date": resolved_date,
+            "role": role.strip(),
+            "upstream_run_id": upstream_run_id,
+        },
+    )
+
+
+@app.get("/internal/run-role-linkedin-posts-notify/{run_id}")
+def get_role_linkedin_posts_notify_status(
+    run_id: str,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    metrics = get_role_linkedin_posts_notify_run_metrics(run_id)
     if not metrics:
         raise HTTPException(status_code=404, detail="Run ID not found.")
     return JSONResponse(content=metrics)

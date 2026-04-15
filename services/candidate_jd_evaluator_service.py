@@ -85,7 +85,20 @@ def run_candidate_jd_evaluator(run_id: str | None = None, run_date: str | None =
         if not results:
             raise RuntimeError("No JD evaluations completed successfully for the selected run date.")
 
+        logger.info(
+            "candidate-jd-evaluator sheet write starting run_id=%s tab=%s row_count=%s failed_jds=%s",
+            pipeline_run_id,
+            output_sheet,
+            len(combined_output_rows),
+            len(failures),
+        )
         writer.write_rows(output_sheet, combined_output_rows)
+        logger.info(
+            "candidate-jd-evaluator sheet write done run_id=%s tab=%s row_count=%s",
+            pipeline_run_id,
+            output_sheet,
+            len(combined_output_rows),
+        )
 
         metrics = {
             "run_id": pipeline_run_id,
@@ -510,6 +523,34 @@ def _score_candidates_with_gemini(
     return [item for item in parsed if isinstance(item, dict)]
 
 
+def _transient_gemini_exception_types() -> tuple[type[BaseException], ...]:
+    try:
+        from google.api_core import exceptions as gexc
+
+        names = (
+            "DeadlineExceeded",
+            "ServiceUnavailable",
+            "InternalServerError",
+            "TooManyRequests",
+            "ResourceExhausted",
+        )
+        return tuple(getattr(gexc, n) for n in names if hasattr(gexc, n))
+    except ImportError:
+        return ()
+
+
+_TRANSIENT_GEMINI_EXCEPTIONS = _transient_gemini_exception_types()
+
+
+def _is_transient_gemini_error(exc: BaseException) -> bool:
+    if _TRANSIENT_GEMINI_EXCEPTIONS and isinstance(exc, _TRANSIENT_GEMINI_EXCEPTIONS):
+        return True
+    msg = str(exc).lower()
+    if "deadline" in msg or "504" in msg or "503" in msg or "429" in msg:
+        return True
+    return False
+
+
 def _gemini_json(prompt: str) -> Any:
     api_key = (os.getenv("GEMINI_API_KEY") or "").strip()
     if not api_key:
@@ -517,14 +558,39 @@ def _gemini_json(prompt: str) -> Any:
     if genai is None:
         raise RuntimeError("google-generativeai package is not installed.")
     model_name = (os.getenv("GEMINI_MODEL") or "gemini-1.5-flash").strip()
+    max_attempts = max(1, int(os.getenv("GEMINI_API_MAX_RETRIES", "3")))
+    base_delay = float(os.getenv("GEMINI_API_RETRY_BASE_DELAY_SEC", "2.0"))
+    timeout_sec = max(30.0, float(os.getenv("GEMINI_REQUEST_TIMEOUT_SEC", "600")))
     genai.configure(api_key=api_key)
     model = genai.GenerativeModel(model_name)
-    response = model.generate_content(
-        prompt,
-        generation_config={"temperature": 0.1},
-    )
-    text = (getattr(response, "text", "") or "").strip()
-    return _parse_json_payload(text)
+    request_options: dict[str, Any] = {"timeout": timeout_sec}
+    for attempt in range(1, max_attempts + 1):
+        try:
+            try:
+                response = model.generate_content(
+                    prompt,
+                    generation_config={"temperature": 0.1},
+                    request_options=request_options,
+                )
+            except TypeError:
+                response = model.generate_content(
+                    prompt,
+                    generation_config={"temperature": 0.1},
+                )
+            text = (getattr(response, "text", "") or "").strip()
+            return _parse_json_payload(text)
+        except Exception as exc:
+            if not _is_transient_gemini_error(exc) or attempt >= max_attempts:
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
+            logger.warning(
+                "candidate-jd-evaluator Gemini transient error attempt=%s/%s delay=%.1fs: %s",
+                attempt,
+                max_attempts,
+                delay,
+                exc,
+            )
+            sleep(delay)
 
 
 def _parse_json_payload(raw_text: str) -> Any:

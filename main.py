@@ -79,6 +79,7 @@ from services.role_linkedin_posts_pipeline import (
 )
 from services.slack_role_pipeline_notify import send_role_handover_notifications
 from services.handover_log_sync import sync_handover_log_to_sheet
+from services.role_handover_log_sync import sync_role_handover_log_to_sheet
 from services.slack_handover_notify import send_handover_notifications
 from services.slack_handover_summary import send_handover_summary_to_slack
 from services.slack_candidate_match_notify import send_candidate_match_slack_notifications
@@ -396,6 +397,17 @@ def _run_role_slack_handover_from_scheduler() -> None:
     _run_in_subprocess(_role_slack_handover_work, run_date, role)
 
 
+def _run_role_handover_log_sync_from_scheduler() -> None:
+    """Append role handover rows to shared handover log after role slack slot."""
+    run_date = _cron_today()
+    role = _role_pipeline_cron_role()
+    try:
+        result = sync_role_handover_log_to_sheet(run_date=run_date, role=role)
+        logger.info("scheduler role-handover-log-sync result=%s", result)
+    except Exception:
+        logger.exception("scheduler role-handover-log-sync failed run_date=%s role=%s", run_date, role)
+
+
 def _role_scrape_sources_for_current_slot() -> list[str]:
     from datetime import datetime
 
@@ -666,6 +678,15 @@ def _build_scheduler() -> BackgroundScheduler:
             coalesce=True,
             misfire_grace_time=1800,
         )
+        scheduler.add_job(
+            _run_role_handover_log_sync_from_scheduler,
+            trigger=CronTrigger(hour="9-18/3", minute=40, timezone=timezone),
+            id="intraday-role-handover-log-sync",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800,
+        )
     if role_linkedin_posts_enabled:
         scheduler.add_job(
             _run_role_linkedin_posts_scrape_from_scheduler,
@@ -778,7 +799,7 @@ def startup_event() -> None:
             "scrape=%s classify=%s recruiter=%s linkedin_scrape=%s linkedin_classify=%s "
             "candidate_jd_eval=%s slack=%s handover_log=%s memory_cleanup=%s "
             "legacy_pipeline_enabled=%s role_pipeline_enabled=%s role_linkedin_posts_enabled=%s "
-            "role_pipeline_role=%s role_scrape_slots=%s role_classify_slots=%s role_recruiter_info_slots=%s role_slack_slots=%s "
+            "role_pipeline_role=%s role_scrape_slots=%s role_classify_slots=%s role_recruiter_info_slots=%s role_slack_slots=%s role_handover_log_slots=%s "
             "role_linkedin_posts_scrape_slots=%s role_linkedin_posts_classify_slots=%s"
         ),
         os.getenv("CRON_TIMEZONE", "Asia/Kolkata"),
@@ -799,6 +820,7 @@ def startup_event() -> None:
         "9:00,12:00,15:00,18:00",
         "9:10,12:10,15:10,18:10",
         "9:30,12:30,15:30,18:30",
+        "9:40,12:40,15:40,18:40",
         "8:50,11:50,14:50,17:50",
         "9:20,12:20,15:20,18:20",
     )
@@ -1646,6 +1668,35 @@ def internal_sync_handover_log(
             raise HTTPException(status_code=400, detail="run_date must be a non-empty YYYY-MM-DD string.")
     resolved = run_date or _cron_today()
     result = sync_handover_log_to_sheet(resolved)
+    return JSONResponse(content=jsonable_encoder(result))
+
+
+@app.post("/internal/sync-role-handover-log")
+def internal_sync_role_handover_log(
+    role: Optional[str] = Query(
+        default=None,
+        description="Role value used by role pipeline tabs. Defaults to ROLE_PIPELINE_CRON_ROLE.",
+    ),
+    run_date: Optional[str] = Query(
+        default=None,
+        description="Pipeline date YYYY-MM-DD for role tabs. Defaults to today in cron timezone.",
+    ),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """
+    Append rows to HANDOVER_LOG_SPREADSHEET_ID from role recruiter + role LinkedIn relevant tabs.
+    Requires role Slack handover to have run first so assigned owner is populated.
+    """
+    validate_internal_trigger_token(x_internal_token)
+    if run_date is not None:
+        run_date = run_date.strip()
+        if not run_date:
+            raise HTTPException(status_code=400, detail="run_date must be a non-empty YYYY-MM-DD string.")
+    resolved_date = run_date or _cron_today()
+    resolved_role = (role or _role_pipeline_cron_role()).strip()
+    if not resolved_role:
+        raise HTTPException(status_code=400, detail="role must be non-empty.")
+    result = sync_role_handover_log_to_sheet(run_date=resolved_date, role=resolved_role)
     return JSONResponse(content=jsonable_encoder(result))
 
 

@@ -95,6 +95,12 @@ def _retry_sheet_write(action: Callable[[], T], retries: int, initial_delay_seco
 def write_linkedin_recruiters_for_relevant_jobs(
     run_date: str,
     relevant_jobs: list[dict[str, Any]],
+    *,
+    recruiters_tab: str | None = None,
+    relevant_jobs_tab: str | None = None,
+    append_mode: bool = False,
+    dedupe_existing_on: tuple[str, ...] | None = None,
+    extra_columns: dict[str, Any] | None = None,
 ) -> LinkedinRecruiterSheetResult:
     """
     Scrape LinkedIn recruiter cards for relevant LinkedIn job URLs and append rows to
@@ -169,6 +175,7 @@ def write_linkedin_recruiters_for_relevant_jobs(
         logger.info("linkedin recruiter sheet: no LinkedIn URLs found; will only try company-contact fallback rows")
 
     rows: list[dict[str, Any]] = []
+    relevant_tab_name = relevant_jobs_tab or f"relevant_jobs_{run_date}"
     job_urls_with_recruiter_profile: set[str] = set()
     for job in li_relevant:
         url = (job.get("job_url") or "").strip()
@@ -183,7 +190,7 @@ def write_linkedin_recruiters_for_relevant_jobs(
             rows.append(
                 {
                     "run_date": run_date,
-                    "relevant_jobs_tab": f"relevant_jobs_{run_date}",
+                    "relevant_jobs_tab": relevant_tab_name,
                     "job_url": url,
                     "title": job.get("title", ""),
                     "company": job.get("company", ""),
@@ -221,7 +228,7 @@ def write_linkedin_recruiters_for_relevant_jobs(
             rows.append(
                 {
                     "run_date": run_date,
-                    "relevant_jobs_tab": f"relevant_jobs_{run_date}",
+                    "relevant_jobs_tab": relevant_tab_name,
                     "job_url": url,
                     "title": job.get("title", ""),
                     "company": company,
@@ -239,7 +246,12 @@ def write_linkedin_recruiters_for_relevant_jobs(
                 }
             )
 
-    tab = os.getenv("RECRUITERS_INFO_WORKSHEET") or f"recruiters_info_{run_date}"
+    if extra_columns:
+        for row in rows:
+            for key, value in extra_columns.items():
+                row[key] = value
+
+    tab = recruiters_tab or os.getenv("RECRUITERS_INFO_WORKSHEET") or f"recruiters_info_{run_date}"
     chunk_size = max(1, int(os.getenv("GOOGLE_SHEETS_WRITE_CHUNK_SIZE", "200")))
 
     writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
@@ -248,6 +260,46 @@ def write_linkedin_recruiters_for_relevant_jobs(
         logger.info("linkedin recruiter sheet: no recruiter/profile/contact rows; skipping sheet write tab=%s", tab)
         return 0, url_set
 
+    if append_mode:
+        rows_to_write = rows
+        if dedupe_existing_on:
+            existing_rows = _read_existing_rows(writer, tab)
+            existing_keys = {
+                _row_identity_key(row, dedupe_existing_on) for row in existing_rows
+            }
+            filtered: list[dict[str, Any]] = []
+            for row in rows:
+                key = _row_identity_key(row, dedupe_existing_on)
+                if key in existing_keys:
+                    continue
+                existing_keys.add(key)
+                filtered.append(row)
+            rows_to_write = filtered
+
+        if not rows_to_write:
+            logger.info("linkedin recruiter sheet append skipped tab=%s reason=no new rows", tab)
+            return 0, url_set
+
+        headers = _derive_headers(rows_to_write)
+        data_rows = [[_stringify_cell(row.get(col)) for col in headers] for row in rows_to_write]
+        _retry_sheet_write(
+            action=lambda: writer.append_to_worksheet(
+                worksheet_title=tab,
+                data_rows=data_rows,
+                header_row=headers,
+                chunk_size=chunk_size,
+            ),
+            retries=3,
+            initial_delay_seconds=1.0,
+        )
+        logger.info(
+            "linkedin recruiter sheet appended tab=%s rows=%s jobs_with_recruiters=%s",
+            tab,
+            len(rows_to_write),
+            len(url_set),
+        )
+        return len(rows_to_write), url_set
+
     _retry_sheet_write(
         action=lambda: writer.write_rows(tab, rows, chunk_size=chunk_size),
         retries=3,
@@ -255,6 +307,38 @@ def write_linkedin_recruiters_for_relevant_jobs(
     )
     logger.info("linkedin recruiter sheet wrote tab=%s rows=%s jobs_with_recruiters=%s", tab, len(rows), len(url_set))
     return len(rows), url_set
+
+
+def _read_existing_rows(writer: GoogleSheetsWriter, tab: str) -> list[dict[str, str]]:
+    try:
+        ws = writer.open_worksheet(tab)
+    except Exception:
+        return []
+    raw = writer.worksheet_get_all_values(ws, f"linkedin_recruiter_existing:{tab}:get_all_values")
+    return [dict(r) for r in worksheet_row_dicts(raw)]
+
+
+def _row_identity_key(row: dict[str, Any], cols: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(str(row.get(col) or "").strip() for col in cols)
+
+
+def _derive_headers(rows: list[dict[str, Any]]) -> list[str]:
+    seen: set[str] = set()
+    headers: list[str] = []
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                headers.append(key)
+    return headers or ["message"]
+
+
+def _stringify_cell(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=True, default=str)
+    return str(value)
 
 
 def _load_company_contact_email_map() -> dict[str, list[str]]:

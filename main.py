@@ -43,6 +43,13 @@ from services.scrape_relevance_service import (
     run_classify_relevant_only,
     run_scrape_jobs_only,
 )
+from services.role_pipeline import (
+    get_role_classify_run_metrics,
+    get_role_scrape_run_metrics,
+    run_role_classify_only,
+    run_role_scrape_only,
+)
+from services.role_recruiter_info_service import ROLE_RECRUITER_INFO_RUN_METRICS
 from services.recruiter_info_service import get_recruiter_info_run_metrics, run_recruiter_info_extraction
 from services.candidate_jd_evaluator_service import (
     get_candidate_jd_evaluator_run_metrics,
@@ -191,6 +198,29 @@ def _classify_relevant_work(run_id: str, run_date: str) -> None:
     run_classify_relevant_only(run_id=run_id, run_date=run_date)
 
 
+def _role_scrape_work(run_id: str, run_date: str, role: str, sources: list[str] | None = None) -> None:
+    _configure_logging()
+    logger.info(
+        "scheduler triggered role-scrape run_id=%s run_date=%s role=%s sources=%s",
+        run_id,
+        run_date,
+        role,
+        sources,
+    )
+    run_role_scrape_only(run_id=run_id, run_date=run_date, role=role, sources=sources)
+
+
+def _role_classify_work(run_id: str, run_date: str, role: str) -> None:
+    _configure_logging()
+    logger.info(
+        "scheduler triggered role-classify run_id=%s run_date=%s role=%s",
+        run_id,
+        run_date,
+        role,
+    )
+    run_role_classify_only(run_id=run_id, run_date=run_date, role=role)
+
+
 def _recruiter_info_work(run_id: str, run_date: str) -> None:
     _configure_logging()
     logger.info("scheduler triggered recruiter-info run_id=%s run_date=%s", run_id, run_date)
@@ -234,6 +264,46 @@ def _run_scrape_jobs_from_scheduler() -> None:
 
 def _run_classify_relevant_from_scheduler() -> None:
     _run_in_subprocess(_classify_relevant_work, str(uuid.uuid4()), _cron_today())
+
+
+def _role_pipeline_cron_roles() -> list[str]:
+    raw = (os.getenv("ROLE_PIPELINE_CRON_ROLES") or "").strip()
+    if not raw:
+        return []
+    out: list[str] = []
+    for part in raw.split(","):
+        role = part.strip()
+        if role:
+            out.append(role)
+    return out
+
+
+def _role_pipeline_cron_role() -> str:
+    return (os.getenv("ROLE_PIPELINE_CRON_ROLE") or "Data Analyst").strip() or "Data Analyst"
+
+
+def _run_role_scrape_from_scheduler() -> None:
+    run_date = _cron_today()
+    role = _role_pipeline_cron_role()
+    sources = _role_scrape_sources_for_current_slot()
+    _run_in_subprocess(_role_scrape_work, str(uuid.uuid4()), run_date, role, sources)
+
+
+def _run_role_classify_from_scheduler() -> None:
+    run_date = _cron_today()
+    _run_in_subprocess(_role_classify_work, str(uuid.uuid4()), run_date, _role_pipeline_cron_role())
+
+
+def _role_scrape_sources_for_current_slot() -> list[str]:
+    from datetime import datetime
+
+    tz = ZoneInfo(os.getenv("CRON_TIMEZONE", "Asia/Kolkata"))
+    current_hour = datetime.now(tz).hour
+    # First and last scrape cron slots: 08:30 and 17:30 -> run all major sources.
+    if current_hour in (8, 17):
+        return ["jobspy", "naukri", "wellfound", "hirist"]
+    # Middle slots (11:30, 14:30): run JobSpy + Hirist.
+    return ["jobspy", "hirist"]
 
 
 def _run_recruiter_info_from_scheduler() -> None:
@@ -370,6 +440,7 @@ def free_memory() -> dict[str, Any]:
     from services.wellfound_only_pipeline import WELLFOUND_RUN_METRICS
     from services.wellfound_classify_pipeline import WELLFOUND_CLASSIFY_RUN_METRICS
     from services.hirecafe_only_pipeline import HIRECAFE_RUN_METRICS
+    from services.role_pipeline import ROLE_CLASSIFY_RUN_METRICS, ROLE_SCRAPE_RUN_METRICS
 
     all_metrics = [
         PIPELINE_RUN_METRICS,
@@ -383,6 +454,9 @@ def free_memory() -> dict[str, Any]:
         WELLFOUND_RUN_METRICS,
         WELLFOUND_CLASSIFY_RUN_METRICS,
         HIRECAFE_RUN_METRICS,
+        ROLE_SCRAPE_RUN_METRICS,
+        ROLE_CLASSIFY_RUN_METRICS,
+        ROLE_RECRUITER_INFO_RUN_METRICS,
     ]
     entries_cleared = sum(len(m) for m in all_metrics)
     for m in all_metrics:
@@ -418,89 +492,113 @@ def _run_free_memory_from_scheduler() -> None:
 def _build_scheduler() -> BackgroundScheduler:
     timezone_name = os.getenv("CRON_TIMEZONE", "Asia/Kolkata")
     timezone = ZoneInfo(timezone_name)
+    legacy_pipeline_enabled = os.getenv("ENABLE_LEGACY_CRON_JOBS", "true").lower() == "true"
+    role_pipeline_enabled = os.getenv("ENABLE_ROLE_PIPELINE_CRON", "false").lower() == "true"
+    role_pipeline_role = _role_pipeline_cron_role()
 
     scheduler = BackgroundScheduler(timezone=timezone)
-    scheduler.add_job(
-        _run_scrape_jobs_from_scheduler,
-        trigger=CronTrigger(hour=0, minute=10, timezone=timezone),
-        id="daily-scrape-jobs-only",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=1800,
-    )
-    scheduler.add_job(
-        _run_classify_relevant_from_scheduler,
-        trigger=CronTrigger(hour=1, minute=0, timezone=timezone),
-        id="daily-classify-relevant-only",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=1800,
-    )
-    scheduler.add_job(
-        _run_recruiter_info_from_scheduler,
-        trigger=CronTrigger(hour=3, minute=0, timezone=timezone),
-        id="daily-recruiter-info-only",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=1800,
-    )
-    scheduler.add_job(
-        _run_linkedin_posts_scrape_from_scheduler,
-        trigger=CronTrigger(hour=4, minute=0, timezone=timezone),
-        id="daily-linkedin-posts-scrape-only",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=1800,
-    )
-    scheduler.add_job(
-        _run_linkedin_posts_classify_from_scheduler,
-        trigger=CronTrigger(hour=5, minute=0, timezone=timezone),
-        id="daily-linkedin-posts-classify-only",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=1800,
-    )
-    scheduler.add_job(
-        _run_candidate_jd_evaluator_from_scheduler,
-        trigger=CronTrigger(hour=6, minute=0, timezone=timezone),
-        id="daily-candidate-jd-evaluator",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=1800,
-    )
-    scheduler.add_job(
-        _run_slack_handover_from_scheduler,
-        trigger=CronTrigger(hour=9, minute=30, timezone=timezone),
-        id="daily-slack-handover-all-cases",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=1800,
-    )
-    scheduler.add_job(
-        _run_handover_log_sync_from_scheduler,
-        trigger=CronTrigger(hour=9, minute=40, timezone=timezone),
-        id="daily-handover-log-sync",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=1800,
-    )
-    scheduler.add_job(
-        _run_free_memory_from_scheduler,
-        trigger=CronTrigger(hour=9, minute=45, timezone=timezone),
-        id="daily-post-cron-memory-cleanup",
-        replace_existing=True,
-        max_instances=1,
-        coalesce=True,
-        misfire_grace_time=1800,
-    )
+    if legacy_pipeline_enabled:
+        scheduler.add_job(
+            _run_scrape_jobs_from_scheduler,
+            trigger=CronTrigger(hour=0, minute=10, timezone=timezone),
+            id="daily-scrape-jobs-only",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800,
+        )
+        scheduler.add_job(
+            _run_classify_relevant_from_scheduler,
+            trigger=CronTrigger(hour=1, minute=0, timezone=timezone),
+            id="daily-classify-relevant-only",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800,
+        )
+    if role_pipeline_enabled:
+        scheduler.add_job(
+            _run_role_scrape_from_scheduler,
+            trigger=CronTrigger(hour="8-17/3", minute=30, timezone=timezone),
+            id="intraday-role-scrape-only",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800,
+        )
+        scheduler.add_job(
+            _run_role_classify_from_scheduler,
+            trigger=CronTrigger(hour="9-18/3", minute=10, timezone=timezone),
+            id="intraday-role-classify-only",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800,
+        )
+    if legacy_pipeline_enabled:
+        scheduler.add_job(
+            _run_recruiter_info_from_scheduler,
+            trigger=CronTrigger(hour=3, minute=0, timezone=timezone),
+            id="daily-recruiter-info-only",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800,
+        )
+        scheduler.add_job(
+            _run_linkedin_posts_scrape_from_scheduler,
+            trigger=CronTrigger(hour=4, minute=0, timezone=timezone),
+            id="daily-linkedin-posts-scrape-only",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800,
+        )
+        scheduler.add_job(
+            _run_linkedin_posts_classify_from_scheduler,
+            trigger=CronTrigger(hour=5, minute=0, timezone=timezone),
+            id="daily-linkedin-posts-classify-only",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800,
+        )
+        scheduler.add_job(
+            _run_candidate_jd_evaluator_from_scheduler,
+            trigger=CronTrigger(hour=6, minute=0, timezone=timezone),
+            id="daily-candidate-jd-evaluator",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800,
+        )
+        scheduler.add_job(
+            _run_slack_handover_from_scheduler,
+            trigger=CronTrigger(hour=9, minute=30, timezone=timezone),
+            id="daily-slack-handover-all-cases",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800,
+        )
+        scheduler.add_job(
+            _run_handover_log_sync_from_scheduler,
+            trigger=CronTrigger(hour=9, minute=40, timezone=timezone),
+            id="daily-handover-log-sync",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800,
+        )
+        scheduler.add_job(
+            _run_free_memory_from_scheduler,
+            trigger=CronTrigger(hour=9, minute=45, timezone=timezone),
+            id="daily-post-cron-memory-cleanup",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800,
+        )
     return scheduler
 
 
@@ -518,11 +616,16 @@ def startup_event() -> None:
 
     _scheduler = _build_scheduler()
     _scheduler.start()
+    legacy_pipeline_enabled = os.getenv("ENABLE_LEGACY_CRON_JOBS", "true").lower() == "true"
+    role_pipeline_enabled = os.getenv("ENABLE_ROLE_PIPELINE_CRON", "false").lower() == "true"
+    role_pipeline_role = _role_pipeline_cron_role()
     logger.info(
         (
             "internal scheduler started timezone=%s "
             "scrape=%s classify=%s recruiter=%s linkedin_scrape=%s linkedin_classify=%s "
-            "candidate_jd_eval=%s slack=%s handover_log=%s memory_cleanup=%s"
+            "candidate_jd_eval=%s slack=%s handover_log=%s memory_cleanup=%s "
+            "legacy_pipeline_enabled=%s role_pipeline_enabled=%s role_pipeline_role=%s "
+            "role_scrape_slots=%s role_classify_slots=%s"
         ),
         os.getenv("CRON_TIMEZONE", "Asia/Kolkata"),
         "00:10",
@@ -534,6 +637,11 @@ def startup_event() -> None:
         "09:30",
         "09:40",
         "09:45",
+        legacy_pipeline_enabled,
+        role_pipeline_enabled,
+        role_pipeline_role,
+        "8:30,11:30,14:30,17:30",
+        "9:10,12:10,15:10,18:10",
     )
 
 
@@ -659,6 +767,80 @@ def get_classify_relevant_run_status(
 ) -> JSONResponse:
     validate_internal_trigger_token(x_internal_token)
     metrics = get_classify_only_run_metrics(run_id)
+    if not metrics:
+        raise HTTPException(status_code=404, detail="Run ID not found.")
+    return JSONResponse(content=metrics)
+
+
+@app.post("/internal/run-role-scrape")
+def run_role_scrape(
+    background_tasks: BackgroundTasks,
+    role: str = Query(..., description="Required role query, e.g. Data Analyst"),
+    sources: Optional[str] = Query(
+        default=None,
+        description="Optional comma-separated sources: jobspy,naukri,wellfound,hirist. Default runs all.",
+    ),
+    run_date: Optional[str] = Query(default=None, description="Optional date YYYY-MM-DD"),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    resolved_date = run_date or _cron_today()
+    selected_sources = [part.strip() for part in (sources or "").split(",") if part.strip()] if sources else None
+    run_id = str(uuid.uuid4())
+    background_tasks.add_task(run_role_scrape_only, run_id, resolved_date, role, selected_sources)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "run_id": run_id,
+            "status": "accepted",
+            "run_date": resolved_date,
+            "role": role.strip(),
+            "sources": selected_sources or ["jobspy", "naukri", "wellfound", "hirist"],
+        },
+    )
+
+
+@app.get("/internal/run-role-scrape/{run_id}")
+def get_role_scrape_run_status(
+    run_id: str,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    metrics = get_role_scrape_run_metrics(run_id)
+    if not metrics:
+        raise HTTPException(status_code=404, detail="Run ID not found.")
+    return JSONResponse(content=metrics)
+
+
+@app.post("/internal/run-role-classify")
+def run_role_classify(
+    background_tasks: BackgroundTasks,
+    role: str = Query(..., description="Required role query, e.g. Data Analyst"),
+    run_date: Optional[str] = Query(default=None, description="Optional date YYYY-MM-DD"),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    resolved_date = run_date or _cron_today()
+    run_id = str(uuid.uuid4())
+    background_tasks.add_task(run_role_classify_only, run_id, resolved_date, role)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "run_id": run_id,
+            "status": "accepted",
+            "run_date": resolved_date,
+            "role": role.strip(),
+        },
+    )
+
+
+@app.get("/internal/run-role-classify/{run_id}")
+def get_role_classify_run_status(
+    run_id: str,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    metrics = get_role_classify_run_metrics(run_id)
     if not metrics:
         raise HTTPException(status_code=404, detail="Run ID not found.")
     return JSONResponse(content=metrics)

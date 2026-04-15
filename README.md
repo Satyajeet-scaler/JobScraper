@@ -178,3 +178,76 @@ LinkedIn posts relevance caps:
 
 - `LINKEDIN_POSTS_RELEVANCE_TEXT_MAX_CHARS_SINGLE` (default `9000`)
 - `LINKEDIN_POSTS_RELEVANCE_TEXT_MAX_CHARS_BATCH` (default `7000`)
+
+## Role Pipeline (JobSpy + Naukri + Wellfound + Hirist)
+
+This pipeline runs for a single role per trigger and writes to role-specific tabs.
+
+- Sources: `jobspy` (`linkedin` + `indeed`), `naukri` (Apify), `wellfound` (Apify), `hirist`
+- Excluded: `hirecafe`
+- Hirist in role pipeline is restricted to the Data Analytics & BI URL:
+  - `https://www.hirist.tech/c/data-analytics-bi-jobs?ref=topnavigation`
+- Required query param: `role`
+
+### Internal Endpoints
+
+- `POST /internal/run-role-scrape?role=Data%20Analyst&run_date=YYYY-MM-DD&sources=jobspy,naukri`
+- `GET /internal/run-role-scrape/{run_id}`
+- `POST /internal/run-role-classify?role=Data%20Analyst&run_date=YYYY-MM-DD`
+- `GET /internal/run-role-classify/{run_id}`
+
+All endpoints require the same `x-internal-token` auth flow as other `/internal/*` endpoints.
+
+`sources` is optional and controls which scrapers run for that request:
+
+- `jobspy`
+- `naukri`
+- `wellfound`
+- `hirist`
+
+If omitted, all three run.
+
+### Tab Naming
+
+Default templates:
+
+- Scraped tab: `role_scraped_{role_slug}_{date}`
+- Relevant tab: `role_relevant_{role_slug}_{date}`
+- Recruiters tab: `role_recruiters_info_{role_slug}_{date}`
+
+`role_slug` is generated from the `role` query by lowercasing and replacing non-alphanumeric characters with `_`.
+
+Override with env vars:
+
+- `ROLE_PIPELINE_SCRAPED_TAB_TEMPLATE`
+- `ROLE_PIPELINE_RELEVANT_TAB_TEMPLATE`
+- `ROLE_PIPELINE_RECRUITERS_TAB_TEMPLATE`
+- `ROLE_PIPELINE_GOOGLE_SPREADSHEET_ID` (fallbacks to `GOOGLE_SPREADSHEET_ID`)
+- `ROLE_PIPELINE_ROLE_QUERY_MAP_JSON` (optional role -> source query map)
+
+### Role Classify Chain
+
+`/internal/run-role-classify` now triggers:
+
+1. Role classify
+2. Role recruiter extraction
+3. Role Slack handover notifications (same message format as existing recruiter/internal POC handover)
+
+Set `ROLE_PIPELINE_POST_CLASSIFY_CHAIN_ENABLED=false` to disable the post-classify recruiter+slack chain.
+
+### Cron Controls
+
+- Global cron master switch: `ENABLE_INTERNAL_CRON=true|false`
+- Legacy/default cron jobs switch: `ENABLE_LEGACY_CRON_JOBS=true|false` (default `true`)
+- Role pipeline cron switch: `ENABLE_ROLE_PIPELINE_CRON=true|false` (default `false`)
+
+When role cron is enabled, it runs for `ROLE_PIPELINE_CRON_ROLE` (default `Data Analyst`) at fixed slots:
+
+- Role scrape: `08:30, 11:30, 14:30, 17:30` (CRON_TIMEZONE)
+- Role classify chain: `08:50, 11:50, 14:50, 17:50` (CRON_TIMEZONE)
+
+To run only role cron jobs for a week:
+
+- `ENABLE_INTERNAL_CRON=true`
+- `ENABLE_LEGACY_CRON_JOBS=false`
+- `ENABLE_ROLE_PIPELINE_CRON=true`

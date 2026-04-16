@@ -36,6 +36,8 @@ def send_role_handover_notifications(
     *,
     role: str | None = None,
     upstream_run_id: str | None = None,
+    send_recruiter_info: bool = True,
+    send_internal_poc: bool = True,
 ) -> dict[str, Any]:
     resolved_date = (run_date or date.today().isoformat()).strip()
     resolved_role = (role or "").strip()
@@ -78,7 +80,7 @@ def send_role_handover_notifications(
 
     owner_rows = load_owner_rows_for_handover() or []
     sent_case3_keys: set[tuple[str, str, str, str]] = set()
-    if case3 and owner_rows:
+    if send_recruiter_info and case3 and owner_rows:
         if send_slack_text(HEADING_RECRUITER_DETAIL, defaults=defaults, sleep_after=1.0):
             out["recruiter_messages_sent"] += 1
             owner_buckets: dict[int, list[dict[str, str]]] = {i: [] for i in range(len(owner_rows))}
@@ -113,7 +115,7 @@ def send_role_handover_notifications(
         out["assigned_owner_rows_updated"] += len(sent_case3_keys)
 
     sent_case2_keys: set[tuple[str, str, str]] = set()
-    if case2:
+    if send_internal_poc and case2:
         if send_slack_text(HEADING_INTERNAL_POC, defaults=defaults, sleep_after=1.0):
             out["recruiter_messages_sent"] += 1
             poc_email_map = internal_poc_email_owner_map(load_internal_poc_tag_rows())

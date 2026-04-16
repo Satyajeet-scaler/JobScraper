@@ -1649,6 +1649,89 @@ def internal_send_slack_handover_summary(
     return JSONResponse(content=jsonable_encoder(result))
 
 
+@app.post("/internal/send-role-slack-handover")
+def internal_send_role_slack_handover(
+    body: dict[str, Any] = Body(default_factory=dict),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """
+    Send role-pipeline Slack handovers for selected lead cases.
+
+    JSON body:
+    - ``role``: role value (default: ROLE_PIPELINE_CRON_ROLE)
+    - ``run_date``: YYYY-MM-DD (default: today in cron timezone)
+    - ``send_linkedin_post``: bool (default true)
+    - ``send_recruiter_info``: recruiter LinkedIn profile case (default true)
+    - ``send_internal_poc``: internal POC email case (default true)
+    - ``upstream_run_id``: optional role classify run_id to narrow recruiter and LinkedIn rows
+    """
+    validate_internal_trigger_token(x_internal_token)
+    run_date = body.get("run_date")
+    if run_date is not None and not isinstance(run_date, str):
+        raise HTTPException(status_code=400, detail="run_date must be a string YYYY-MM-DD or omitted.")
+    if run_date is None:
+        run_date = _cron_today()
+
+    role = body.get("role")
+    if role is not None and not isinstance(role, str):
+        raise HTTPException(status_code=400, detail="role must be a string or omitted.")
+    resolved_role = (role or _role_pipeline_cron_role()).strip()
+    if not resolved_role:
+        raise HTTPException(status_code=400, detail="role must be non-empty.")
+
+    upstream_run_id = body.get("upstream_run_id")
+    if upstream_run_id is not None and not isinstance(upstream_run_id, str):
+        raise HTTPException(status_code=400, detail="upstream_run_id must be a string or omitted.")
+
+    def _bool_flag(key: str, default: bool = True) -> bool:
+        if key not in body:
+            return default
+        v = body[key]
+        if isinstance(v, bool):
+            return v
+        raise HTTPException(status_code=400, detail=f"{key} must be a boolean.")
+
+    send_linkedin_post = _bool_flag("send_linkedin_post", True)
+    send_recruiter_info = _bool_flag("send_recruiter_info", True)
+    send_internal_poc = _bool_flag("send_internal_poc", True)
+
+    recruiter_summary = send_role_handover_notifications(
+        run_date=run_date,
+        role=resolved_role,
+        upstream_run_id=upstream_run_id,
+        send_recruiter_info=send_recruiter_info,
+        send_internal_poc=send_internal_poc,
+    )
+
+    linkedin_summary: dict[str, Any] = {
+        "run_date": run_date,
+        "role": resolved_role,
+        "status": "skipped",
+        "skipped_reason": "send_linkedin_post=false",
+    }
+    if send_linkedin_post:
+        linkedin_summary = send_role_linkedin_posts_notifications(
+            run_date=run_date,
+            role=resolved_role,
+            upstream_run_id=upstream_run_id,
+        )
+
+    return JSONResponse(
+        content=jsonable_encoder(
+            {
+                "run_date": run_date,
+                "role": resolved_role,
+                "upstream_run_id": upstream_run_id or "",
+                "send_linkedin_post": send_linkedin_post,
+                "send_recruiter_info": send_recruiter_info,
+                "send_internal_poc": send_internal_poc,
+                "role_recruiter_handover_summary": recruiter_summary,
+                "role_linkedin_posts_notify_summary": linkedin_summary,
+            }
+        )
+    )
+
+
 @app.post("/internal/sync-handover-log")
 def internal_sync_handover_log(
     run_date: Optional[str] = Query(

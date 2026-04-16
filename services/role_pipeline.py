@@ -185,7 +185,7 @@ def run_role_classify_only(
         chain_enabled = (
             post_classify_chain_enabled
             if post_classify_chain_enabled is not None
-            else os.getenv("ROLE_PIPELINE_POST_CLASSIFY_CHAIN_ENABLED", "true").lower() in ("1", "true", "yes")
+            else os.getenv("ROLE_PIPELINE_POST_CLASSIFY_CHAIN_ENABLED", "false").lower() in ("1", "true", "yes")
         )
         metrics["post_classify_chain_enabled"] = chain_enabled
         if chain_enabled:

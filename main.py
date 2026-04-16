@@ -416,8 +416,8 @@ def _role_scrape_sources_for_current_slot() -> list[str]:
     # First and last scrape cron slots: 08:30 and 17:30 -> run all major sources.
     if current_hour in (8, 17):
         return ["jobspy", "naukri", "wellfound", "hirist"]
-    # Middle slots (11:30, 14:30): run JobSpy + Hirist.
-    return ["jobspy", "hirist"]
+    # Middle slots (11:30, 14:30): JobSpy + Hirist + Wellfound (Wellfound on every scrape run).
+    return ["jobspy", "hirist", "wellfound"]
 
 
 def _run_recruiter_info_from_scheduler() -> None:

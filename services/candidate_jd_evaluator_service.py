@@ -141,13 +141,13 @@ def run_candidate_jd_evaluator_for_role(
 ) -> dict[str, Any]:
     """Role-aware candidate vs JD matching.
 
-    Reads JDs directly from the role pipeline's relevant tab
-    (``role_relevant_{role_slug}_{date}``), skips job URLs that were already
-    evaluated in today's role-specific ``candidate_match_{role_slug}_{date}``
-    tab, and APPENDS new summary rows so repeated intra-day runs never
-    duplicate rows.
+    Reads JDs via the same recruiter-sheet mapping as the legacy evaluator:
+    ``role_recruiters_info_{role_slug}_{date}`` rows (``relevant_jobs_tab`` →
+    ``role_relevant_*`` / ``relevant_jobs_*``), skips job URLs already present
+    in ``candidate_match_{role_slug}_{date}``, and appends new summary rows.
     """
-    from services.role_pipeline import _role_slug, role_relevant_tab_name
+    from services.role_pipeline import _role_slug
+    from services.role_recruiter_info_service import role_recruiters_tab_name_for_role
 
     pipeline_run_id = run_id or str(uuid.uuid4())
     resolved_run_date = _resolve_run_date(run_date)
@@ -158,6 +158,7 @@ def run_candidate_jd_evaluator_for_role(
     started_at = perf_counter()
 
     output_sheet = _role_candidate_match_tab_name(role_slug=role_slug, run_date=resolved_run_date)
+    recruiters_tab = role_recruiters_tab_name_for_role(role=resolved_role, run_date=resolved_run_date)
     CANDIDATE_JD_EVALUATOR_RUN_METRICS[pipeline_run_id] = {
         "run_id": pipeline_run_id,
         "status": "running",
@@ -165,17 +166,19 @@ def run_candidate_jd_evaluator_for_role(
         "role": resolved_role,
         "role_slug": role_slug,
         "output_sheet": output_sheet,
+        "recruiters_tab": recruiters_tab,
     }
     try:
         candidates_writer = GoogleSheetsWriter(spreadsheet_id=_require_spreadsheet_id())
         candidates = _read_candidates(candidates_writer)
 
-        role_spreadsheet_id = _require_role_spreadsheet_id()
-        role_writer = GoogleSheetsWriter(spreadsheet_id=role_spreadsheet_id)
-        relevant_tab = role_relevant_tab_name(role=resolved_role, run_date=resolved_run_date)
-        relevant_rows = _load_relevant_rows(role_writer, relevant_tab)
-        if not relevant_rows:
-            raise RuntimeError(f"No rows found in relevant tab '{relevant_tab}'.")
+        writer = GoogleSheetsWriter(spreadsheet_id=_require_spreadsheet_id())
+        jd_rows_all = _read_jd_rows_for_date(
+            writer,
+            resolved_run_date,
+            recruiters_tab,
+            allow_empty=True,
+        )
 
         already_evaluated = _existing_candidate_match_job_urls(
             spreadsheet_id=_require_spreadsheet_id(),
@@ -183,23 +186,20 @@ def run_candidate_jd_evaluator_for_role(
         )
 
         jd_rows: list[dict[str, str]] = []
-        for idx, relevant_row in enumerate(relevant_rows, start=2):
-            job_url = (relevant_row.get("job_url") or "").strip()
+        for row in jd_rows_all:
+            job_url = (row.get("job_url") or "").strip()
             if not job_url:
                 continue
             if _normalize_job_url(job_url) in already_evaluated:
                 continue
-            jd_text = _extract_jd_text(relevant_row)
-            if not jd_text:
-                continue
-            merged = dict(relevant_row)
-            merged["jd"] = jd_text
-            merged["job_url"] = job_url
-            merged["_jd_key"] = "jd"
-            merged["_recruiter_sheet_row_number"] = str(idx)
-            jd_rows.append(merged)
+            jd_rows.append(row)
 
         if not jd_rows:
+            skipped_reason = (
+                "no new JD rows to evaluate"
+                if jd_rows_all
+                else "no JD rows mapped from role recruiters sheet (empty or no matches for run_date)"
+            )
             metrics = {
                 "run_id": pipeline_run_id,
                 "status": "completed",
@@ -209,7 +209,8 @@ def run_candidate_jd_evaluator_for_role(
                 "candidate_count": len(candidates),
                 "jd_count": 0,
                 "already_evaluated_count": len(already_evaluated),
-                "relevant_rows_total": len(relevant_rows),
+                "jd_rows_mapped_from_recruiters": len(jd_rows_all),
+                "recruiters_tab": recruiters_tab,
                 "output_sheet": output_sheet,
                 "total_rows_written": 0,
                 "appended_rows": 0,
@@ -217,7 +218,7 @@ def run_candidate_jd_evaluator_for_role(
                 "failed_jd_runs": 0,
                 "jd_results": [],
                 "failures": [],
-                "skipped_reason": "no new JD rows to evaluate",
+                "skipped_reason": skipped_reason,
                 "duration_seconds": round(perf_counter() - started_at, 2),
             }
             CANDIDATE_JD_EVALUATOR_RUN_METRICS[pipeline_run_id] = metrics
@@ -286,7 +287,8 @@ def run_candidate_jd_evaluator_for_role(
             "candidate_count": len(candidates),
             "jd_count": len(jd_rows),
             "already_evaluated_count": len(already_evaluated),
-            "relevant_rows_total": len(relevant_rows),
+            "jd_rows_mapped_from_recruiters": len(jd_rows_all),
+            "recruiters_tab": recruiters_tab,
             "output_sheet": output_sheet,
             "total_rows_written": len(combined_output_rows),
             "appended_rows": appended,
@@ -306,6 +308,7 @@ def run_candidate_jd_evaluator_for_role(
             "role": resolved_role,
             "role_slug": role_slug,
             "output_sheet": output_sheet,
+            "recruiters_tab": recruiters_tab,
             "error": str(exc),
             "traceback": traceback.format_exc(),
             "duration_seconds": round(perf_counter() - started_at, 2),
@@ -432,10 +435,32 @@ def _read_candidates(writer: GoogleSheetsWriter) -> list[dict[str, Any]]:
     return out
 
 
+def _resolve_relevant_tab_and_row_number(
+    *,
+    raw_tab_value: str,
+    run_date: str,
+) -> tuple[str, int | None]:
+    """Map ``relevant_jobs_tab`` cell to a worksheet name and optional row index.
+
+    Legacy shorthand: a cell that is only digits means row ``N`` in
+    ``relevant_jobs_{run_date}``. Any other non-empty value is treated as the
+    full relevant worksheet name (e.g. ``role_relevant_{slug}_{date}``).
+    """
+    default_tab = f"relevant_jobs_{run_date}"
+    if not raw_tab_value:
+        return default_tab, None
+    parsed = _parse_int(raw_tab_value)
+    if parsed is not None and str(raw_tab_value).strip() == str(parsed):
+        return default_tab, parsed
+    return raw_tab_value, None
+
+
 def _read_jd_rows_for_date(
     writer: GoogleSheetsWriter,
     run_date: str,
     recruiters_tab: str,
+    *,
+    allow_empty: bool = False,
 ) -> list[dict[str, str]]:
     recruiters_ws = writer.open_worksheet(recruiters_tab)
     recruiter_rows = worksheet_row_dicts(
@@ -445,6 +470,8 @@ def _read_jd_rows_for_date(
         )
     )
     if not recruiter_rows:
+        if allow_empty:
+            return []
         raise RuntimeError(f"No rows found in recruiter info worksheet '{recruiters_tab}'.")
 
     date_key = _find_first_key(recruiter_rows[0], ["run_date", "date"])
@@ -463,8 +490,10 @@ def _read_jd_rows_for_date(
         if _normalize_date(row.get(date_key, "")) != run_date:
             continue
         raw_tab_value = (row.get(tab_key) or "").strip()
-        relevant_tab = raw_tab_value if raw_tab_value.startswith("relevant_jobs_") else f"relevant_jobs_{run_date}"
-        row_number = _parse_int(raw_tab_value)
+        relevant_tab, row_number = _resolve_relevant_tab_and_row_number(
+            raw_tab_value=raw_tab_value,
+            run_date=run_date,
+        )
         if relevant_tab not in relevant_rows_cache:
             relevant_rows_cache[relevant_tab] = _load_relevant_rows(writer, relevant_tab)
         relevant_rows = relevant_rows_cache[relevant_tab]
@@ -487,6 +516,8 @@ def _read_jd_rows_for_date(
         jd_rows.append(merged)
 
     if not jd_rows:
+        if allow_empty:
+            return []
         raise RuntimeError(
             f"No JD rows could be mapped from '{recruiters_tab}' to relevant_jobs tabs for run_date '{run_date}'."
         )

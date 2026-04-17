@@ -105,6 +105,11 @@ def _role_recruiters_tab_name(*, role_slug: str, run_date: str) -> str:
     return template.format(role_slug=role_slug, date=run_date)
 
 
+def role_recruiters_tab_name_for_role(*, role: str, run_date: str) -> str:
+    """Worksheet name for the role recruiters tab (same as ``run_role_recruiter_info_extraction``)."""
+    return _role_recruiters_tab_name(role_slug=_role_slug(role), run_date=run_date)
+
+
 def get_role_recruiter_info_run_metrics(run_id: str) -> dict[str, Any] | None:
     return ROLE_RECRUITER_INFO_RUN_METRICS.get(run_id)
 

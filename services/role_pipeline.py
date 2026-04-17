@@ -695,8 +695,13 @@ def _load_role_config_map() -> dict[str, dict[str, dict[str, Any]]]:
 
     Reserved top-level keys under each role (preserved as-is, not wrapped):
     - ``ai_relevance_prompt`` (str): per-role classifier prompt override.
-    - ``handover`` (dict): per-role Slack handover rules, e.g.
-      ``{"min_candidate_match": 10}``.
+    - ``handover`` (dict): e.g. ``{"min_candidate_match": N}`` — filters role
+      recruiter-sheet Slack handover (``send_role_handover_notifications``):
+      only jobs with at least ``N`` candidates scoring >70 in ``candidate_match_*``
+      are posted (``0`` = all jobs). Overridable per role; defaults match
+      ``slack_relevant_jobs_handover.DEFAULT_HANDOVER_RULES``. Also used by
+      ``/internal/send-role-relevant-jobs-handover`` for bulk ``role_relevant_*``
+      messages.
     """
     global _role_pipeline_config_file_cache, _role_pipeline_config_file_cache_valid
     file_raw = (os.getenv("ROLE_PIPELINE_ROLE_CONFIG_FILE") or "").strip()

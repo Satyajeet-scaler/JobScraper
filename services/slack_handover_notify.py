@@ -261,6 +261,63 @@ def load_candidate_match_count_map(run_date: str) -> dict[str, int]:
     return out
 
 
+def load_candidate_match_count_map_for_role(*, role: str, run_date: str) -> dict[str, int]:
+    """Like ``load_candidate_match_count_map`` but prefers ``candidate_match_{role_slug}_{date}``.
+
+    Falls back to the generic ``candidate_match_{date}`` tab when the role tab
+    is missing or empty (same behavior as role-pipeline relevant-jobs tooling).
+    """
+    from services.role_pipeline import _role_slug
+
+    spreadsheet_id = (os.getenv("GOOGLE_SPREADSHEET_ID") or "").strip()
+    if not spreadsheet_id:
+        return {}
+    role_slug = _role_slug(role)
+    role_template = (
+        os.getenv("ROLE_PIPELINE_CANDIDATE_MATCH_TAB_TEMPLATE")
+        or "candidate_match_{role_slug}_{date}"
+    ).strip()
+    role_tab = role_template.format(role_slug=role_slug, date=run_date)
+    gen_template = (os.getenv("CANDIDATE_MATCH_WORKSHEET_TEMPLATE") or "candidate_match_{date}").strip()
+    fallback_tab = gen_template.replace("{date}", run_date)
+
+    rows: list[dict[str, str]] = []
+    try:
+        writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
+        ws = writer.open_worksheet(role_tab)
+        raw = writer.worksheet_get_all_values(
+            ws,
+            f"slack_handover_candidate_match_role:{role_tab}:get_all_values",
+        )
+        rows = worksheet_row_dicts(raw)
+    except Exception as exc:
+        logger.warning("failed to load role candidate match sheet=%s err=%s", role_tab, exc)
+        rows = []
+
+    if not rows and fallback_tab != role_tab:
+        try:
+            writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
+            ws = writer.open_worksheet(fallback_tab)
+            raw = writer.worksheet_get_all_values(
+                ws,
+                f"slack_handover_candidate_match_fallback:{fallback_tab}:get_all_values",
+            )
+            rows = worksheet_row_dicts(raw)
+        except Exception as exc:
+            logger.warning("failed to load fallback candidate match sheet=%s err=%s", fallback_tab, exc)
+            return {}
+
+    out: dict[str, int] = {}
+    for row in rows:
+        job_url = (row.get("job_url") or row.get("url") or row.get("link") or "").strip()
+        key = _normalize_job_url_for_match(job_url)
+        if not key:
+            continue
+        count = _parse_candidate_match_count(row.get("ai_score_gt_70_count"))
+        out[key] = count
+    return out
+
+
 def load_linkedin_relevant_posts_from_sheet(run_date: str) -> list[dict[str, Any]]:
     """Read ``linkedin_posts_relevant_{run_date}`` tab."""
     spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")

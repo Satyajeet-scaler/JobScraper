@@ -7,11 +7,13 @@ import os
 from typing import Any
 
 from services.google_sheets import GoogleSheetsWriter
-from services.handover_log_sync import HANDOVER_LOG_HEADER
+from services.handover_log_sync import HANDOVER_LOG_HEADER, _recruiter_row_to_log_cells
 from services.handover_owners import worksheet_row_dicts
 from services.linkedin_posts_slack_row import slack_post_url_from_row
 from services.role_linkedin_posts_pipeline import _role_linkedin_relevant_tab_name
-from services.role_pipeline import _role_slug, role_relevant_tab_name
+from services.role_pipeline import _role_slug
+from services.role_recruiter_info_service import role_recruiters_tab_name_for_role
+from services.slack_role_pipeline_notify import _read_role_recruiter_rows, _split_recruiter_cases
 
 logger = logging.getLogger(__name__)
 
@@ -28,29 +30,6 @@ def _load_rows(tab: str) -> list[dict[str, Any]]:
         logger.warning("role_handover_log_sync tab unavailable tab=%s err=%s", tab, exc)
         return []
     return [dict(r) for r in worksheet_row_dicts(raw)]
-
-
-def _relevant_job_row_to_log_cells(row: dict[str, Any]) -> list[str]:
-    """Map a role_relevant_* row to the shared handover log schema.
-
-    Uses ``matched_role`` / ``role_category`` as the Title column so the log
-    reflects the AI-matched role rather than the raw scraped job title.
-    """
-
-    def g(key: str) -> str:
-        return str(row.get(key) or "").strip()
-
-    title = g("matched_role") or g("role_category") or g("title")
-    return [
-        g("run_date"),
-        g("job_url"),
-        g("company"),
-        title,
-        g("assigned owner") or g("assigned_owner"),
-        "",
-        "",
-        "",
-    ]
 
 
 def _linkedin_row_to_log_cells(row: dict[str, Any]) -> list[str]:
@@ -92,12 +71,11 @@ def _load_existing_log_keys(*, log_id: str, worksheet_name: str) -> set[tuple[st
 
 def sync_role_handover_log_to_sheet(*, run_date: str, role: str) -> dict[str, Any]:
     """
-    Append role relevant-jobs + role LinkedIn rows to HANDOVER_LOG sheet.
+    Append role recruiter-sheet rows + role LinkedIn rows to HANDOVER_LOG sheet.
 
-    Relevant jobs are sourced from ``role_relevant_{slug}_{date}`` and only
-    rows that were actually handed over on Slack are logged (i.e. rows with
-    a non-empty ``handover_sent`` column). LinkedIn rows continue to come
-    from the role LinkedIn relevant tab (unchanged).
+    Job leads use ``role_recruiters_info_{slug}_{date}`` (recruiter profile and
+    internal POC cases), matching ``sync_handover_log_to_sheet`` for the legacy
+    pipeline. LinkedIn rows come from the role LinkedIn relevant tab.
     """
     log_id = (os.getenv("HANDOVER_LOG_SPREADSHEET_ID") or "").strip()
     if not log_id:
@@ -113,23 +91,24 @@ def sync_role_handover_log_to_sheet(*, run_date: str, role: str) -> dict[str, An
         return {"skipped": True, "reason": "role is required"}
     role_slug = _role_slug(resolved_role)
 
-    relevant_tab = role_relevant_tab_name(role=resolved_role, run_date=run_date)
+    recruiters_tab = role_recruiters_tab_name_for_role(role=resolved_role, run_date=run_date)
     linkedin_tab = _role_linkedin_relevant_tab_name(role_slug=role_slug, run_date=run_date)
 
-    raw_relevant_rows = _load_rows(relevant_tab)
-    relevant_rows = [
-        r for r in raw_relevant_rows
-        if str(r.get("handover_sent") or "").strip()
-        and (str(r.get("run_date") or "").strip() in ("", run_date))
-    ]
+    recruiter_sheet_rows = _read_role_recruiter_rows(recruiters_tab)
+    case3, case2 = _split_recruiter_cases(
+        recruiter_sheet_rows,
+        run_date,
+        upstream_run_id=None,
+    )
+    recruiter_rows_for_log = case3 + case2
     linkedin_rows = [
         r for r in _load_rows(linkedin_tab)
         if (str(r.get("run_date") or "").strip() in ("", run_date))
     ]
 
     data_rows: list[list[str]] = []
-    for row in relevant_rows:
-        data_rows.append(_relevant_job_row_to_log_cells(row))
+    for row in recruiter_rows_for_log:
+        data_rows.append(_recruiter_row_to_log_cells(dict(row)))
     for row in linkedin_rows:
         data_rows.append(_linkedin_row_to_log_cells(row))
 
@@ -146,20 +125,19 @@ def sync_role_handover_log_to_sheet(*, run_date: str, role: str) -> dict[str, An
         "run_date": run_date,
         "role": resolved_role,
         "role_slug": role_slug,
-        "relevant_tab": relevant_tab,
+        "recruiters_tab": recruiters_tab,
         "linkedin_tab": linkedin_tab,
-        "relevant_total_rows": len(raw_relevant_rows),
-        "relevant_handed_over_rows": len(relevant_rows),
+        "recruiter_rows_for_log": len(recruiter_rows_for_log),
         "linkedin_relevant_rows": len(linkedin_rows),
         "candidate_rows": len(data_rows),
     }
 
     if not new_rows:
         logger.info(
-            "role_handover_log_sync run_date=%s role=%s no new rows (relevant_sent=%s linkedin=%s)",
+            "role_handover_log_sync run_date=%s role=%s no new rows (recruiters=%s linkedin=%s)",
             run_date,
             resolved_role,
-            len(relevant_rows),
+            len(recruiter_rows_for_log),
             len(linkedin_rows),
         )
         return {"skipped": False, **summary_base, "rows_appended": 0}
@@ -181,11 +159,11 @@ def sync_role_handover_log_to_sheet(*, run_date: str, role: str) -> dict[str, An
         return {"skipped": False, "error": str(exc), **summary_base, "rows_appended": 0}
 
     logger.info(
-        "role_handover_log_sync appended run_date=%s role=%s rows=%s (relevant_sent=%s linkedin=%s) sheet=%s tab=%s",
+        "role_handover_log_sync appended run_date=%s role=%s rows=%s (recruiters=%s linkedin=%s) sheet=%s tab=%s",
         run_date,
         resolved_role,
         len(new_rows),
-        len(relevant_rows),
+        len(recruiter_rows_for_log),
         len(linkedin_rows),
         log_id,
         worksheet_name,

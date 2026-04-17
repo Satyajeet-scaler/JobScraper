@@ -11,7 +11,8 @@ from services.handover_owners import (
     worksheet_row_dicts,
 )
 from services.role_pipeline import _role_slug
-from services.role_recruiter_info_service import _role_recruiters_tab_name
+from services.role_recruiter_info_service import role_recruiters_tab_name_for_role
+from services.slack_relevant_jobs_handover import _resolve_min_candidate_match
 from services.slack_handover_notify import (
     HEADING_INTERNAL_POC,
     HEADING_RECRUITER_DETAIL,
@@ -19,7 +20,7 @@ from services.slack_handover_notify import (
     format_recruiter_detail_lead,
     internal_poc_email_owner_map,
     internal_poc_owner_tag_line,
-    load_candidate_match_count_map,
+    load_candidate_match_count_map_for_role,
     match_internal_poc_owners_ordered,
     owner_tag_for_handover,
     persist_assigned_owner_from_email_map,
@@ -44,13 +45,15 @@ def send_role_handover_notifications(
     if not resolved_role:
         raise ValueError("role is required.")
     role_slug = _role_slug(resolved_role)
-    recruiters_tab = _role_recruiters_tab_name(role_slug=role_slug, run_date=resolved_date)
+    recruiters_tab = role_recruiters_tab_name_for_role(role=resolved_role, run_date=resolved_date)
     defaults = slack_notify_defaults_from_env()
+    min_candidate_match = _resolve_min_candidate_match(resolved_role)
     out = {
         "run_date": resolved_date,
         "role": resolved_role,
         "role_slug": role_slug,
         "recruiters_tab": recruiters_tab,
+        "min_candidate_match": min_candidate_match,
         "recruiter_messages_sent": 0,
         "recruiter_detail_leads": 0,
         "internal_poc_leads": 0,
@@ -74,9 +77,39 @@ def send_role_handover_notifications(
     )
     case3 = [row for row in case3 if _is_assigned_owner_empty(row)]
     case2 = [row for row in case2 if _is_assigned_owner_empty(row)]
+    candidate_match_count_map = load_candidate_match_count_map_for_role(
+        role=resolved_role,
+        run_date=resolved_date,
+    )
+    n_case3_before = len(case3)
+    n_case2_before = len(case2)
+    case3 = [
+        row
+        for row in case3
+        if _row_meets_recruiter_handover_threshold(
+            row, candidate_match_count_map, min_candidate_match
+        )
+    ]
+    case2 = [
+        row
+        for row in case2
+        if _row_meets_recruiter_handover_threshold(
+            row, candidate_match_count_map, min_candidate_match
+        )
+    ]
+    if n_case3_before != len(case3) or n_case2_before != len(case2):
+        logger.info(
+            "role slack handover: role=%s min_candidate_match=%s recruiter cases "
+            "case3 %s->%s case2 %s->%s",
+            resolved_role,
+            min_candidate_match,
+            n_case3_before,
+            len(case3),
+            n_case2_before,
+            len(case2),
+        )
     out["recruiter_detail_leads"] = len(case3)
     out["internal_poc_leads"] = len(case2)
-    candidate_match_count_map = load_candidate_match_count_map(resolved_date)
 
     owner_rows = load_owner_rows_for_handover() or []
     sent_case3_keys: set[tuple[str, str, str, str]] = set()
@@ -193,6 +226,19 @@ def _normalize_job_key(url: str) -> str:
     from services.slack_handover_notify import _normalize_job_url_for_match
 
     return _normalize_job_url_for_match(url)
+
+
+def _row_meets_recruiter_handover_threshold(
+    row: dict[str, str],
+    candidate_match_count_map: dict[str, int],
+    min_count: int,
+) -> bool:
+    """Filter recruiter-sheet rows by ``ai_score_gt_70_count`` (from candidate_match tab)."""
+    job_url = (row.get("job_url") or "").strip()
+    if not job_url or job_url == "-":
+        return min_count <= 0
+    count = candidate_match_count_map.get(_normalize_job_key(job_url), 0)
+    return count >= min_count
 
 
 def _is_assigned_owner_empty(row: dict[str, str]) -> bool:

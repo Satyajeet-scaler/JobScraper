@@ -372,15 +372,6 @@ def _role_slack_handover_work(run_date: str, role: str) -> None:
     _configure_logging()
     logger.info("scheduler triggered role-slack-handover run_date=%s role=%s", run_date, role)
     try:
-        relevant_summary = send_relevant_jobs_handover(run_date=run_date, role=role)
-        logger.info("scheduler role-slack-handover relevant-summary=%s", relevant_summary)
-    except Exception:
-        logger.exception(
-            "scheduler role-slack-handover relevant-jobs failed run_date=%s role=%s",
-            run_date,
-            role,
-        )
-    try:
         recruiter_summary = send_role_handover_notifications(
             run_date=run_date,
             role=role,
@@ -937,10 +928,10 @@ def _build_scheduler() -> BackgroundScheduler:
         # 4 slots per day, 3-hour interval.
         # Pipeline stages are staggered so each stage's inputs exist by the time
         # it runs:
-        #   07:30 scrape -> 08:00 classify -> 08:30 candidate-jd-eval
-        #   -> 09:30 slack handover (relevant + LinkedIn)
-        #   -> 09:35 handover log sync (sources rows from relevant tab)
-        #   -> 09:40 recruiter-info (enrichment; not an input to Slack anymore)
+        #   07:30 scrape -> 08:00 classify -> 08:15 recruiter-info (LinkedIn profiles)
+        #   -> 08:30 candidate-jd-eval (maps from role_recruiters_info -> role_relevant)
+        #   -> 09:30 slack handover (recruiter sheet cases + LinkedIn posts)
+        #   -> 09:35 handover log sync (recruiter + LinkedIn tabs)
         # Repeats at +3h intervals for each stage.
         scheduler.add_job(
             _run_role_scrape_from_scheduler,
@@ -955,6 +946,15 @@ def _build_scheduler() -> BackgroundScheduler:
             _run_role_classify_from_scheduler,
             trigger=CronTrigger(hour="8,11,14,17", minute=0, timezone=timezone),
             id="intraday-role-classify-only",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800,
+        )
+        scheduler.add_job(
+            _run_role_recruiter_info_from_scheduler,
+            trigger=CronTrigger(hour="8,11,14,17", minute=15, timezone=timezone),
+            id="intraday-role-recruiter-info-only",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
@@ -982,15 +982,6 @@ def _build_scheduler() -> BackgroundScheduler:
             _run_role_handover_log_sync_from_scheduler,
             trigger=CronTrigger(hour="9,12,15,18", minute=35, timezone=timezone),
             id="intraday-role-handover-log-sync",
-            replace_existing=True,
-            max_instances=1,
-            coalesce=True,
-            misfire_grace_time=1800,
-        )
-        scheduler.add_job(
-            _run_role_recruiter_info_from_scheduler,
-            trigger=CronTrigger(hour="9,12,15,18", minute=40, timezone=timezone),
-            id="intraday-role-recruiter-info-only",
             replace_existing=True,
             max_instances=1,
             coalesce=True,
@@ -1132,7 +1123,7 @@ def startup_event() -> None:
         "7:30,10:30,13:30,16:30",
         "8:00,11:00,14:00,17:00",
         "8:30,11:30,14:30,17:30",
-        "9:40,12:40,15:40,18:40",
+        "8:15,11:15,14:15,17:15",
         "9:30,12:30,15:30,18:30",
         "9:35,12:35,15:35,18:35",
         "7:50,10:50,13:50,16:50",
@@ -1970,7 +1961,10 @@ def internal_send_role_slack_handover(
     x_internal_token: Optional[str] = Header(default=None),
 ) -> JSONResponse:
     """
-    Send role-pipeline Slack handovers for selected lead cases.
+    Send role-pipeline Slack handovers (same cases as legacy ``send_handover_notifications``).
+
+    Reads ``role_recruiters_info_{role_slug}_{run_date}`` for recruiter profile /
+    internal POC leads, then the role LinkedIn relevant tab for post leads.
 
     JSON body:
     - ``role``: role value (default: ROLE_PIPELINE_CRON_ROLE)
@@ -2053,11 +2047,9 @@ def internal_send_role_relevant_jobs_handover(
     x_internal_token: Optional[str] = Header(default=None),
 ) -> JSONResponse:
     """
-    Send Slack 'Incoming relevant leads' messages for a role's relevant tab.
+    Optional legacy endpoint: bulk Slack messages from ``role_relevant_*`` (not used by cron).
 
-    Reads rows directly from ``role_relevant_{role_slug}_{run_date}`` and
-    applies per-role filtering (``min_candidate_match``). Rows are marked
-    with a ``handover_sent`` timestamp so repeat intraday runs skip them.
+    Prefer ``/internal/send-role-slack-handover`` (recruiter-sheet cases + LinkedIn).
 
     JSON body:
     - ``role``: role value (default: ROLE_PIPELINE_CRON_ROLE)
@@ -2089,9 +2081,9 @@ def internal_run_role_candidate_jd_evaluator(
     """
     Run the role-aware candidate vs JD evaluator.
 
-    Reads JDs directly from ``role_relevant_{role_slug}_{run_date}``, skips
-    job URLs already evaluated in ``candidate_match_{role_slug}_{run_date}``
-    and APPENDS new summary rows there.
+    Maps JDs from ``role_recruiters_info_{role_slug}_{run_date}`` to the relevant
+    tab named in each row (``relevant_jobs_tab``), like the legacy evaluator.
+    Appends to ``candidate_match_{role_slug}_{run_date}``.
 
     JSON body:
     - ``role``: role value (default: ROLE_PIPELINE_CRON_ROLE)

@@ -134,6 +134,259 @@ def get_candidate_jd_evaluator_run_metrics(run_id: str) -> dict[str, Any] | None
     return CANDIDATE_JD_EVALUATOR_RUN_METRICS.get(run_id)
 
 
+def run_candidate_jd_evaluator_for_role(
+    run_id: str | None = None,
+    run_date: str | None = None,
+    role: str | None = None,
+) -> dict[str, Any]:
+    """Role-aware candidate vs JD matching.
+
+    Reads JDs directly from the role pipeline's relevant tab
+    (``role_relevant_{role_slug}_{date}``), skips job URLs that were already
+    evaluated in today's role-specific ``candidate_match_{role_slug}_{date}``
+    tab, and APPENDS new summary rows so repeated intra-day runs never
+    duplicate rows.
+    """
+    from services.role_pipeline import _role_slug, role_relevant_tab_name
+
+    pipeline_run_id = run_id or str(uuid.uuid4())
+    resolved_run_date = _resolve_run_date(run_date)
+    resolved_role = (role or "").strip()
+    if not resolved_role:
+        raise RuntimeError("role is required for run_candidate_jd_evaluator_for_role.")
+    role_slug = _role_slug(resolved_role)
+    started_at = perf_counter()
+
+    output_sheet = _role_candidate_match_tab_name(role_slug=role_slug, run_date=resolved_run_date)
+    CANDIDATE_JD_EVALUATOR_RUN_METRICS[pipeline_run_id] = {
+        "run_id": pipeline_run_id,
+        "status": "running",
+        "run_date": resolved_run_date,
+        "role": resolved_role,
+        "role_slug": role_slug,
+        "output_sheet": output_sheet,
+    }
+    try:
+        candidates_writer = GoogleSheetsWriter(spreadsheet_id=_require_spreadsheet_id())
+        candidates = _read_candidates(candidates_writer)
+
+        role_spreadsheet_id = _require_role_spreadsheet_id()
+        role_writer = GoogleSheetsWriter(spreadsheet_id=role_spreadsheet_id)
+        relevant_tab = role_relevant_tab_name(role=resolved_role, run_date=resolved_run_date)
+        relevant_rows = _load_relevant_rows(role_writer, relevant_tab)
+        if not relevant_rows:
+            raise RuntimeError(f"No rows found in relevant tab '{relevant_tab}'.")
+
+        already_evaluated = _existing_candidate_match_job_urls(
+            spreadsheet_id=_require_spreadsheet_id(),
+            tab=output_sheet,
+        )
+
+        jd_rows: list[dict[str, str]] = []
+        for idx, relevant_row in enumerate(relevant_rows, start=2):
+            job_url = (relevant_row.get("job_url") or "").strip()
+            if not job_url:
+                continue
+            if _normalize_job_url(job_url) in already_evaluated:
+                continue
+            jd_text = _extract_jd_text(relevant_row)
+            if not jd_text:
+                continue
+            merged = dict(relevant_row)
+            merged["jd"] = jd_text
+            merged["job_url"] = job_url
+            merged["_jd_key"] = "jd"
+            merged["_recruiter_sheet_row_number"] = str(idx)
+            jd_rows.append(merged)
+
+        if not jd_rows:
+            metrics = {
+                "run_id": pipeline_run_id,
+                "status": "completed",
+                "run_date": resolved_run_date,
+                "role": resolved_role,
+                "role_slug": role_slug,
+                "candidate_count": len(candidates),
+                "jd_count": 0,
+                "already_evaluated_count": len(already_evaluated),
+                "relevant_rows_total": len(relevant_rows),
+                "output_sheet": output_sheet,
+                "total_rows_written": 0,
+                "appended_rows": 0,
+                "successful_jd_runs": 0,
+                "failed_jd_runs": 0,
+                "jd_results": [],
+                "failures": [],
+                "skipped_reason": "no new JD rows to evaluate",
+                "duration_seconds": round(perf_counter() - started_at, 2),
+            }
+            CANDIDATE_JD_EVALUATOR_RUN_METRICS[pipeline_run_id] = metrics
+            return metrics
+
+        results: list[dict[str, Any]] = []
+        failures: list[dict[str, str]] = []
+        combined_output_rows: list[dict[str, Any]] = []
+
+        for idx, jd_row in enumerate(jd_rows, start=1):
+            try:
+                jd_context = _build_jd_context(jd_row, idx)
+                ranked = _evaluate_candidates_for_jd(candidates, jd_context["jd_text"])
+                summary = _ai_gt_70_summary(ranked)
+                summary_row = _build_candidate_match_summary_row(summary, jd_context)
+                summary_row["requested_role"] = resolved_role
+                summary_row["role_slug"] = role_slug
+                summary_row["run_date"] = resolved_run_date
+                combined_output_rows.append(summary_row)
+                results.append(
+                    {
+                        "jd_index": idx,
+                        "job_id": jd_context["job_id"],
+                        "job_title": jd_context["job_title"],
+                        "output_sheet": output_sheet,
+                        "rows_written": 1,
+                        "top_score": _top_score(ranked),
+                        "ai_unavailable_count": len([row for row in ranked if row.get("ai_score") is None]),
+                        "ai_score_gt_70_count": summary["count"],
+                        "ai_score_gt_70_emails": summary["emails_csv"],
+                    }
+                )
+                logger.info(
+                    "role-candidate-jd-evaluator jd complete run_id=%s role=%s jd_index=%s total_jds=%s job_id=%s job_title=%s ai_gt_70_count=%s",
+                    pipeline_run_id,
+                    resolved_role,
+                    idx,
+                    len(jd_rows),
+                    jd_context["job_id"],
+                    jd_context["job_title"],
+                    summary["count"],
+                )
+            except Exception as exc:
+                logger.exception(
+                    "role-candidate-jd-evaluator failed for role=%s jd_index=%s: %s",
+                    resolved_role,
+                    idx,
+                    exc,
+                )
+                failures.append({"jd_index": str(idx), "error": str(exc)})
+
+        appended = 0
+        if combined_output_rows:
+            appended = _append_candidate_match_rows(
+                spreadsheet_id=_require_spreadsheet_id(),
+                tab=output_sheet,
+                rows=combined_output_rows,
+            )
+
+        metrics = {
+            "run_id": pipeline_run_id,
+            "status": "completed",
+            "run_date": resolved_run_date,
+            "role": resolved_role,
+            "role_slug": role_slug,
+            "candidate_count": len(candidates),
+            "jd_count": len(jd_rows),
+            "already_evaluated_count": len(already_evaluated),
+            "relevant_rows_total": len(relevant_rows),
+            "output_sheet": output_sheet,
+            "total_rows_written": len(combined_output_rows),
+            "appended_rows": appended,
+            "successful_jd_runs": len(results),
+            "failed_jd_runs": len(failures),
+            "jd_results": results,
+            "failures": failures,
+            "duration_seconds": round(perf_counter() - started_at, 2),
+        }
+        CANDIDATE_JD_EVALUATOR_RUN_METRICS[pipeline_run_id] = metrics
+        return metrics
+    except Exception as exc:
+        metrics = {
+            "run_id": pipeline_run_id,
+            "status": "failed",
+            "run_date": resolved_run_date,
+            "role": resolved_role,
+            "role_slug": role_slug,
+            "output_sheet": output_sheet,
+            "error": str(exc),
+            "traceback": traceback.format_exc(),
+            "duration_seconds": round(perf_counter() - started_at, 2),
+        }
+        CANDIDATE_JD_EVALUATOR_RUN_METRICS[pipeline_run_id] = metrics
+        logger.exception(
+            "role-candidate-jd-evaluator[%s] failed role=%s: %s",
+            pipeline_run_id,
+            resolved_role,
+            exc,
+        )
+        raise
+
+
+def _require_role_spreadsheet_id() -> str:
+    spreadsheet_id = (
+        os.getenv("ROLE_PIPELINE_GOOGLE_SPREADSHEET_ID")
+        or os.getenv("GOOGLE_SPREADSHEET_ID")
+        or ""
+    ).strip()
+    if not spreadsheet_id:
+        raise RuntimeError("Set ROLE_PIPELINE_GOOGLE_SPREADSHEET_ID or GOOGLE_SPREADSHEET_ID.")
+    return spreadsheet_id
+
+
+def _role_candidate_match_tab_name(*, role_slug: str, run_date: str) -> str:
+    template = (
+        os.getenv("ROLE_PIPELINE_CANDIDATE_MATCH_TAB_TEMPLATE")
+        or "candidate_match_{role_slug}_{date}"
+    ).strip()
+    return template.format(role_slug=role_slug, date=run_date)
+
+
+def _existing_candidate_match_job_urls(*, spreadsheet_id: str, tab: str) -> set[str]:
+    """Return the set of normalized job_urls already present in the
+    candidate_match tab (so repeat runs don't re-evaluate them)."""
+    try:
+        writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
+        ws = writer.open_worksheet(tab)
+        raw = writer.worksheet_get_all_values(
+            ws,
+            f"role_candidate_jd_eval:{tab}:get_all_values",
+        )
+    except Exception:
+        return set()
+    rows = worksheet_row_dicts(raw)
+    seen: set[str] = set()
+    for row in rows:
+        url = _normalize_job_url(row.get("job_url") or row.get("url") or "")
+        if url:
+            seen.add(url)
+    return seen
+
+
+def _append_candidate_match_rows(
+    *,
+    spreadsheet_id: str,
+    tab: str,
+    rows: list[dict[str, Any]],
+) -> int:
+    if not rows:
+        return 0
+    writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
+    headers_seen: list[str] = []
+    header_set: set[str] = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in header_set:
+                header_set.add(key)
+                headers_seen.append(key)
+    data_rows = [[str(row.get(col) or "") for col in headers_seen] for row in rows]
+    chunk_size = max(1, int(os.getenv("GOOGLE_SHEETS_WRITE_CHUNK_SIZE", "200")))
+    writer.append_to_worksheet(
+        worksheet_title=tab,
+        data_rows=data_rows,
+        header_row=headers_seen,
+        chunk_size=chunk_size,
+    )
+    return len(rows)
+
+
 def _resolve_run_date(run_date: str | None) -> str:
     if run_date and run_date.strip():
         return run_date.strip()

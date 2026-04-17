@@ -24,12 +24,27 @@ ROLE_PIPELINE_ALLOWED_SOURCES = SCRAPER_REGISTRY.available_sources()
 
 # Unified per-role / per-scraper config.  Overridable via env
 # ROLE_PIPELINE_ROLE_CONFIG_JSON (see _load_role_config_map).
+#
+# Each role maps to a dict of per-source config, plus optional top-level keys
+# consumed by the role pipeline itself:
+#   - "ai_relevance_prompt": role-specific prompt override for the classifier.
+#   - "handover":            {"min_candidate_match": N} -- per-role Slack rules.
 ROLE_CONFIG_MAP: dict[str, dict[str, dict[str, Any]]] = {
     "data analyst": {
         "jobspy":     {"query": "Data Analyst"},
         "naukri":     {"query": "Data Analyst"},
         "wellfound":  {"query": "Data Analyst"},
         "hirist":     {"url": "https://www.hirist.tech/c/data-analytics-bi-jobs?ref=topnavigation"},
+    },
+    "software developer": {
+        "jobspy":     {"query": "Software Developer"},
+        "naukri":     {"query": "Software Developer"},
+        "wellfound":  {"query": "Software Developer"},
+    },
+    "devops": {
+        "jobspy":     {"query": "DevOps Engineer"},
+        "naukri":     {"query": "DevOps Engineer"},
+        "wellfound":  {"query": "DevOps Engineer"},
     },
 }
 
@@ -143,7 +158,10 @@ def run_role_classify_only(
         )
 
         if classify_input_rows:
-            relevant, classifier_metrics = _classify_relevant_jobs_for_role_pipeline(classify_input_rows)
+            relevant, classifier_metrics = _classify_relevant_jobs_for_role_pipeline(
+                classify_input_rows,
+                role=resolved_role,
+            )
         else:
             relevant = []
             classifier_metrics = {"classification_errors": 0}
@@ -281,6 +299,11 @@ def _relevant_tab_name(*, role_slug: str, run_date: str) -> str:
         or "role_relevant_{role_slug}_{date}"
     ).strip()
     return template.format(role_slug=role_slug, date=run_date)
+
+
+def role_relevant_tab_name(*, role: str, run_date: str) -> str:
+    """Public helper: return the role pipeline's relevant-jobs tab name."""
+    return _relevant_tab_name(role_slug=_role_slug(role), run_date=run_date)
 
 
 def _read_rows_from_tab(tab_name: str, allow_missing: bool = False) -> list[dict[str, Any]]:
@@ -482,13 +505,16 @@ def _attach_run_tracking(
     return out
 
 
-def _resolve_role_config(role: str) -> dict[str, dict[str, Any]]:
-    """Return per-source config dicts for *role*.
+def _resolve_role_config(role: str) -> dict[str, Any]:
+    """Return per-source + reserved-key config for *role*.
 
     Resolution order:
     1. ``ROLE_PIPELINE_ROLE_CONFIG_JSON`` env variable (highest priority)
     2. In-code ``ROLE_CONFIG_MAP`` constant
     3. Fallback: ``{"query": role}`` for every registered source
+
+    Returned dict may contain per-source entries (``jobspy``, ``naukri``, ...)
+    and reserved keys (``ai_relevance_prompt``, ``handover``).
     """
     key = (role or "").strip().lower()
     if not key:
@@ -507,15 +533,32 @@ def _resolve_role_config(role: str) -> dict[str, dict[str, Any]]:
 
 def _classify_relevant_jobs_for_role_pipeline(
     jobs: list[dict[str, Any]],
+    role: str | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, int]]:
     """
     Role-pipeline wrapper around shared classifier.
 
-    Allows a role-specific system prompt via:
-    - ROLE_PIPELINE_AI_RELEVANCE_PROMPT (preferred)
-    Falls back to existing AI_RELEVANCE_PROMPT behavior when unset.
+    Per-role prompt resolution order:
+    1. ``ai_relevance_prompt`` key inside the role's entry in
+       ``ROLE_PIPELINE_ROLE_CONFIG_JSON`` / ``ROLE_CONFIG_MAP``.
+    2. ``ROLE_PIPELINE_AI_RELEVANCE_PROMPT`` (global role-pipeline override).
+    3. Default ``AI_RELEVANCE_PROMPT`` / built-in prompt (existing fallback).
     """
-    role_prompt = os.getenv("ROLE_PIPELINE_AI_RELEVANCE_PROMPT")
+    role_prompt: str | None = None
+    if role:
+        try:
+            role_cfg = _resolve_role_config(role)
+        except Exception:
+            role_cfg = {}
+        candidate = (role_cfg or {}).get("ai_relevance_prompt")
+        if isinstance(candidate, dict):
+            candidate = candidate.get("prompt") or candidate.get("value")
+        if isinstance(candidate, str) and candidate.strip():
+            role_prompt = candidate
+
+    if not role_prompt:
+        role_prompt = os.getenv("ROLE_PIPELINE_AI_RELEVANCE_PROMPT")
+
     if not role_prompt:
         return _classify_relevant_jobs(jobs)
 
@@ -548,6 +591,11 @@ def _load_role_config_map() -> dict[str, dict[str, dict[str, Any]]]:
 
     Also accepts the *old* format where each source value is a plain
     string (treated as ``{"query": value}``) for backward compatibility.
+
+    Reserved top-level keys under each role (preserved as-is, not wrapped):
+    - ``ai_relevance_prompt`` (str): per-role classifier prompt override.
+    - ``handover`` (dict): per-role Slack handover rules, e.g.
+      ``{"min_candidate_match": 10}``.
     """
     raw = (os.getenv("ROLE_PIPELINE_ROLE_CONFIG_JSON") or "").strip()
     if not raw:
@@ -561,17 +609,25 @@ def _load_role_config_map() -> dict[str, dict[str, dict[str, Any]]]:
         logger.warning("ROLE_PIPELINE_ROLE_CONFIG_JSON must be a JSON object")
         return {}
 
-    out: dict[str, dict[str, dict[str, Any]]] = {}
+    reserved_role_keys = {"ai_relevance_prompt", "handover"}
+
+    out: dict[str, dict[str, Any]] = {}
     for role_key, source_map in parsed.items():
         if not isinstance(role_key, str) or not isinstance(source_map, dict):
             continue
-        normalised_sources: dict[str, dict[str, Any]] = {}
+        normalised_sources: dict[str, Any] = {}
         for src_name, src_val in source_map.items():
+            if not isinstance(src_name, str):
+                continue
+            key_lower = src_name.strip().lower()
+            if key_lower in reserved_role_keys:
+                normalised_sources[key_lower] = src_val
+                continue
             if isinstance(src_val, str):
                 # Backward compat: plain string → {"query": value}
-                normalised_sources[src_name.strip().lower()] = {"query": src_val.strip()}
+                normalised_sources[key_lower] = {"query": src_val.strip()}
             elif isinstance(src_val, dict):
-                normalised_sources[src_name.strip().lower()] = src_val
+                normalised_sources[key_lower] = src_val
             else:
                 logger.warning(
                     "ROLE_PIPELINE_ROLE_CONFIG_JSON: ignoring invalid value for role=%s source=%s",

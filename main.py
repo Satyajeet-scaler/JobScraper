@@ -58,6 +58,7 @@ from services.recruiter_info_service import get_recruiter_info_run_metrics, run_
 from services.candidate_jd_evaluator_service import (
     get_candidate_jd_evaluator_run_metrics,
     run_candidate_jd_evaluator,
+    run_candidate_jd_evaluator_for_role,
 )
 from services.relevant_jobs_tab_fix_service import (
     get_relevant_jobs_tab_fix_run_metrics,
@@ -78,6 +79,7 @@ from services.role_linkedin_posts_pipeline import (
     send_role_linkedin_posts_notifications,
 )
 from services.slack_role_pipeline_notify import send_role_handover_notifications
+from services.slack_relevant_jobs_handover import send_relevant_jobs_handover
 from services.handover_log_sync import sync_handover_log_to_sheet
 from services.role_handover_log_sync import sync_role_handover_log_to_sheet
 from services.slack_handover_notify import send_handover_notifications
@@ -281,16 +283,50 @@ def _role_linkedin_posts_classify_work(run_id: str, run_date: str, role: str) ->
 def _role_slack_handover_work(run_date: str, role: str) -> None:
     _configure_logging()
     logger.info("scheduler triggered role-slack-handover run_date=%s role=%s", run_date, role)
-    recruiter_summary = send_role_handover_notifications(
-        run_date=run_date,
-        role=role,
+    try:
+        relevant_summary = send_relevant_jobs_handover(run_date=run_date, role=role)
+        logger.info("scheduler role-slack-handover relevant-summary=%s", relevant_summary)
+    except Exception:
+        logger.exception(
+            "scheduler role-slack-handover relevant-jobs failed run_date=%s role=%s",
+            run_date,
+            role,
+        )
+    try:
+        recruiter_summary = send_role_handover_notifications(
+            run_date=run_date,
+            role=role,
+        )
+        logger.info("scheduler role-slack-handover recruiter-summary=%s", recruiter_summary)
+    except Exception:
+        logger.exception(
+            "scheduler role-slack-handover recruiter failed run_date=%s role=%s",
+            run_date,
+            role,
+        )
+    try:
+        linkedin_summary = send_role_linkedin_posts_notifications(
+            run_date=run_date,
+            role=role,
+        )
+        logger.info("scheduler role-slack-handover linkedin-summary=%s", linkedin_summary)
+    except Exception:
+        logger.exception(
+            "scheduler role-slack-handover linkedin failed run_date=%s role=%s",
+            run_date,
+            role,
+        )
+
+
+def _role_candidate_jd_eval_work(run_id: str, run_date: str, role: str) -> None:
+    _configure_logging()
+    logger.info(
+        "scheduler triggered role-candidate-jd-eval run_id=%s run_date=%s role=%s",
+        run_id,
+        run_date,
+        role,
     )
-    logger.info("scheduler role-slack-handover recruiter-summary=%s", recruiter_summary)
-    linkedin_summary = send_role_linkedin_posts_notifications(
-        run_date=run_date,
-        role=role,
-    )
-    logger.info("scheduler role-slack-handover linkedin-summary=%s", linkedin_summary)
+    run_candidate_jd_evaluator_for_role(run_id=run_id, run_date=run_date, role=role)
 
 
 def _recruiter_info_work(run_id: str, run_date: str) -> None:
@@ -354,58 +390,82 @@ def _role_pipeline_cron_role() -> str:
     return (os.getenv("ROLE_PIPELINE_CRON_ROLE") or "Data Analyst").strip() or "Data Analyst"
 
 
+def _resolve_cron_roles() -> list[str]:
+    """Resolve the list of roles the role-pipeline cron should process.
+
+    Prefers ``ROLE_PIPELINE_CRON_ROLES`` (comma-separated). Falls back to the
+    single ``ROLE_PIPELINE_CRON_ROLE`` value for backward compatibility.
+    """
+    roles = _role_pipeline_cron_roles()
+    return roles if roles else [_role_pipeline_cron_role()]
+
+
 def _run_role_scrape_from_scheduler() -> None:
     run_date = _cron_today()
-    role = _role_pipeline_cron_role()
     sources = _role_scrape_sources_for_current_slot()
-    _run_in_subprocess(_role_scrape_work, str(uuid.uuid4()), run_date, role, sources)
+    for role in _resolve_cron_roles():
+        _run_in_subprocess(_role_scrape_work, str(uuid.uuid4()), run_date, role, sources)
 
 
 def _run_role_classify_from_scheduler() -> None:
     run_date = _cron_today()
-    _run_in_subprocess(_role_classify_work, str(uuid.uuid4()), run_date, _role_pipeline_cron_role())
+    for role in _resolve_cron_roles():
+        _run_in_subprocess(_role_classify_work, str(uuid.uuid4()), run_date, role)
 
 
 def _run_role_recruiter_info_from_scheduler() -> None:
     run_date = _cron_today()
-    _run_in_subprocess(_role_recruiter_info_work, str(uuid.uuid4()), run_date, _role_pipeline_cron_role())
+    for role in _resolve_cron_roles():
+        _run_in_subprocess(_role_recruiter_info_work, str(uuid.uuid4()), run_date, role)
+
+
+def _run_role_candidate_jd_eval_from_scheduler() -> None:
+    run_date = _cron_today()
+    for role in _resolve_cron_roles():
+        _run_in_subprocess(_role_candidate_jd_eval_work, str(uuid.uuid4()), run_date, role)
 
 
 def _run_role_linkedin_posts_scrape_from_scheduler() -> None:
     run_date = _cron_today()
-    _run_in_subprocess(
-        _role_linkedin_posts_scrape_work,
-        str(uuid.uuid4()),
-        run_date,
-        _role_pipeline_cron_role(),
-    )
+    for role in _resolve_cron_roles():
+        _run_in_subprocess(
+            _role_linkedin_posts_scrape_work,
+            str(uuid.uuid4()),
+            run_date,
+            role,
+        )
 
 
 def _run_role_linkedin_posts_classify_from_scheduler() -> None:
     run_date = _cron_today()
-    _run_in_subprocess(
-        _role_linkedin_posts_classify_work,
-        str(uuid.uuid4()),
-        run_date,
-        _role_pipeline_cron_role(),
-    )
+    for role in _resolve_cron_roles():
+        _run_in_subprocess(
+            _role_linkedin_posts_classify_work,
+            str(uuid.uuid4()),
+            run_date,
+            role,
+        )
 
 
 def _run_role_slack_handover_from_scheduler() -> None:
     run_date = _cron_today()
-    role = _role_pipeline_cron_role()
-    _run_in_subprocess(_role_slack_handover_work, run_date, role)
+    for role in _resolve_cron_roles():
+        _run_in_subprocess(_role_slack_handover_work, run_date, role)
 
 
 def _run_role_handover_log_sync_from_scheduler() -> None:
     """Append role handover rows to shared handover log after role slack slot."""
     run_date = _cron_today()
-    role = _role_pipeline_cron_role()
-    try:
-        result = sync_role_handover_log_to_sheet(run_date=run_date, role=role)
-        logger.info("scheduler role-handover-log-sync result=%s", result)
-    except Exception:
-        logger.exception("scheduler role-handover-log-sync failed run_date=%s role=%s", run_date, role)
+    for role in _resolve_cron_roles():
+        try:
+            result = sync_role_handover_log_to_sheet(run_date=run_date, role=role)
+            logger.info("scheduler role-handover-log-sync role=%s result=%s", role, result)
+        except Exception:
+            logger.exception(
+                "scheduler role-handover-log-sync failed run_date=%s role=%s",
+                run_date,
+                role,
+            )
 
 
 def _role_scrape_sources_for_current_slot() -> list[str]:
@@ -414,13 +474,13 @@ def _role_scrape_sources_for_current_slot() -> list[str]:
     tz = ZoneInfo(os.getenv("CRON_TIMEZONE", "Asia/Kolkata"))
     current_hour = datetime.now(tz).hour
     hirecafe_enabled = os.getenv("ROLE_PIPELINE_HIRECAFE_ENABLED", "false").lower() in ("1", "true", "yes")
-    # First and last scrape cron slots: 08:30 and 17:30 -> run all major sources.
-    if current_hour in (8, 17):
+    # First and last scrape cron slots (07:30, 16:30) run every major source.
+    # Middle slots (10:30, 13:30) skip Naukri to reduce Apify spend.
+    if current_hour in (7, 16):
         sources = ["jobspy", "naukri", "wellfound", "hirist"]
         if hirecafe_enabled:
             sources.append("hirecafe")
         return sources
-    # Middle slots (11:30, 14:30): JobSpy + Hirist + Wellfound (Wellfound on every scrape run).
     sources = ["jobspy", "hirist", "wellfound"]
     if hirecafe_enabled:
         sources.append("hirecafe")
@@ -626,7 +686,6 @@ def _build_scheduler() -> BackgroundScheduler:
     role_linkedin_posts_enabled = (
         os.getenv("ENABLE_ROLE_LINKEDIN_POSTS_PIPELINE_CRON", "false").lower() == "true"
     )
-    role_pipeline_role = _role_pipeline_cron_role()
 
     scheduler = BackgroundScheduler(timezone=timezone)
     if legacy_pipeline_enabled:
@@ -649,9 +708,15 @@ def _build_scheduler() -> BackgroundScheduler:
             misfire_grace_time=1800,
         )
     if role_pipeline_enabled:
+        # 4 slots per day, 3-hour interval.
+        # Pipeline stages are staggered so each stage's inputs exist by the time
+        # it runs:
+        #   07:30 scrape  -> 08:00 classify  -> 08:30 candidate-jd-eval
+        #   -> 09:00 recruiter-info -> 09:30 slack handover -> 09:40 log sync
+        # Repeats at +3h: 10:30/11:00/11:30/12:00/12:30/12:40, etc.
         scheduler.add_job(
             _run_role_scrape_from_scheduler,
-            trigger=CronTrigger(hour="8-17/3", minute=30, timezone=timezone),
+            trigger=CronTrigger(hour="7,10,13,16", minute=30, timezone=timezone),
             id="intraday-role-scrape-only",
             replace_existing=True,
             max_instances=1,
@@ -660,7 +725,7 @@ def _build_scheduler() -> BackgroundScheduler:
         )
         scheduler.add_job(
             _run_role_classify_from_scheduler,
-            trigger=CronTrigger(hour="9-18/3", minute=0, timezone=timezone),
+            trigger=CronTrigger(hour="8,11,14,17", minute=0, timezone=timezone),
             id="intraday-role-classify-only",
             replace_existing=True,
             max_instances=1,
@@ -668,8 +733,17 @@ def _build_scheduler() -> BackgroundScheduler:
             misfire_grace_time=1800,
         )
         scheduler.add_job(
+            _run_role_candidate_jd_eval_from_scheduler,
+            trigger=CronTrigger(hour="8,11,14,17", minute=30, timezone=timezone),
+            id="intraday-role-candidate-jd-eval",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800,
+        )
+        scheduler.add_job(
             _run_role_recruiter_info_from_scheduler,
-            trigger=CronTrigger(hour="9-18/3", minute=10, timezone=timezone),
+            trigger=CronTrigger(hour="9,12,15,18", minute=0, timezone=timezone),
             id="intraday-role-recruiter-info-only",
             replace_existing=True,
             max_instances=1,
@@ -678,7 +752,7 @@ def _build_scheduler() -> BackgroundScheduler:
         )
         scheduler.add_job(
             _run_role_slack_handover_from_scheduler,
-            trigger=CronTrigger(hour="9-18/3", minute=30, timezone=timezone),
+            trigger=CronTrigger(hour="9,12,15,18", minute=30, timezone=timezone),
             id="intraday-role-slack-handover",
             replace_existing=True,
             max_instances=1,
@@ -687,7 +761,7 @@ def _build_scheduler() -> BackgroundScheduler:
         )
         scheduler.add_job(
             _run_role_handover_log_sync_from_scheduler,
-            trigger=CronTrigger(hour="9-18/3", minute=40, timezone=timezone),
+            trigger=CronTrigger(hour="9,12,15,18", minute=40, timezone=timezone),
             id="intraday-role-handover-log-sync",
             replace_existing=True,
             max_instances=1,
@@ -697,7 +771,7 @@ def _build_scheduler() -> BackgroundScheduler:
     if role_linkedin_posts_enabled:
         scheduler.add_job(
             _run_role_linkedin_posts_scrape_from_scheduler,
-            trigger=CronTrigger(hour="8-17/3", minute=50, timezone=timezone),
+            trigger=CronTrigger(hour="7,10,13,16", minute=50, timezone=timezone),
             id="intraday-role-linkedin-posts-scrape-only",
             replace_existing=True,
             max_instances=1,
@@ -706,7 +780,7 @@ def _build_scheduler() -> BackgroundScheduler:
         )
         scheduler.add_job(
             _run_role_linkedin_posts_classify_from_scheduler,
-            trigger=CronTrigger(hour="9-18/3", minute=20, timezone=timezone),
+            trigger=CronTrigger(hour="8,11,14,17", minute=20, timezone=timezone),
             id="intraday-role-linkedin-posts-classify-only",
             replace_existing=True,
             max_instances=1,
@@ -799,15 +873,15 @@ def startup_event() -> None:
     role_linkedin_posts_enabled = (
         os.getenv("ENABLE_ROLE_LINKEDIN_POSTS_PIPELINE_CRON", "false").lower() == "true"
     )
-    role_pipeline_role = _role_pipeline_cron_role()
     logger.info(
         (
             "internal scheduler started timezone=%s "
             "scrape=%s classify=%s recruiter=%s linkedin_scrape=%s linkedin_classify=%s "
             "candidate_jd_eval=%s slack=%s handover_log=%s memory_cleanup=%s "
             "legacy_pipeline_enabled=%s role_pipeline_enabled=%s role_linkedin_posts_enabled=%s "
-            "role_pipeline_role=%s role_scrape_slots=%s role_classify_slots=%s role_recruiter_info_slots=%s role_slack_slots=%s role_handover_log_slots=%s "
-            "role_linkedin_posts_scrape_slots=%s role_linkedin_posts_classify_slots=%s"
+            "role_pipeline_roles=%s role_scrape_slots=%s role_classify_slots=%s "
+            "role_candidate_jd_eval_slots=%s role_recruiter_info_slots=%s role_slack_slots=%s "
+            "role_handover_log_slots=%s role_linkedin_posts_scrape_slots=%s role_linkedin_posts_classify_slots=%s"
         ),
         os.getenv("CRON_TIMEZONE", "Asia/Kolkata"),
         "00:10",
@@ -822,14 +896,15 @@ def startup_event() -> None:
         legacy_pipeline_enabled,
         role_pipeline_enabled,
         role_linkedin_posts_enabled,
-        role_pipeline_role,
+        ",".join(_resolve_cron_roles()),
+        "7:30,10:30,13:30,16:30",
+        "8:00,11:00,14:00,17:00",
         "8:30,11:30,14:30,17:30",
         "9:00,12:00,15:00,18:00",
-        "9:10,12:10,15:10,18:10",
         "9:30,12:30,15:30,18:30",
         "9:40,12:40,15:40,18:40",
-        "8:50,11:50,14:50,17:50",
-        "9:20,12:20,15:20,18:20",
+        "7:50,10:50,13:50,16:50",
+        "8:20,11:20,14:20,17:20",
     )
 
 
@@ -1737,6 +1812,78 @@ def internal_send_role_slack_handover(
             }
         )
     )
+
+
+@app.post("/internal/send-role-relevant-jobs-handover")
+def internal_send_role_relevant_jobs_handover(
+    body: dict[str, Any] = Body(default_factory=dict),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """
+    Send Slack 'Incoming relevant leads' messages for a role's relevant tab.
+
+    Reads rows directly from ``role_relevant_{role_slug}_{run_date}`` and
+    applies per-role filtering (``min_candidate_match``). Rows are marked
+    with a ``handover_sent`` timestamp so repeat intraday runs skip them.
+
+    JSON body:
+    - ``role``: role value (default: ROLE_PIPELINE_CRON_ROLE)
+    - ``run_date``: YYYY-MM-DD (default: today in cron timezone)
+    """
+    validate_internal_trigger_token(x_internal_token)
+    run_date = body.get("run_date")
+    if run_date is not None and not isinstance(run_date, str):
+        raise HTTPException(status_code=400, detail="run_date must be a string YYYY-MM-DD or omitted.")
+    if run_date is None:
+        run_date = _cron_today()
+
+    role = body.get("role")
+    if role is not None and not isinstance(role, str):
+        raise HTTPException(status_code=400, detail="role must be a string or omitted.")
+    resolved_role = (role or _role_pipeline_cron_role()).strip()
+    if not resolved_role:
+        raise HTTPException(status_code=400, detail="role must be non-empty.")
+
+    summary = send_relevant_jobs_handover(run_date=run_date, role=resolved_role)
+    return JSONResponse(content=jsonable_encoder(summary))
+
+
+@app.post("/internal/run-role-candidate-jd-evaluator")
+def internal_run_role_candidate_jd_evaluator(
+    body: dict[str, Any] = Body(default_factory=dict),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """
+    Run the role-aware candidate vs JD evaluator.
+
+    Reads JDs directly from ``role_relevant_{role_slug}_{run_date}``, skips
+    job URLs already evaluated in ``candidate_match_{role_slug}_{run_date}``
+    and APPENDS new summary rows there.
+
+    JSON body:
+    - ``role``: role value (default: ROLE_PIPELINE_CRON_ROLE)
+    - ``run_date``: YYYY-MM-DD (default: today in cron timezone)
+    """
+    validate_internal_trigger_token(x_internal_token)
+    run_date = body.get("run_date")
+    if run_date is not None and not isinstance(run_date, str):
+        raise HTTPException(status_code=400, detail="run_date must be a string YYYY-MM-DD or omitted.")
+    if run_date is None:
+        run_date = _cron_today()
+
+    role = body.get("role")
+    if role is not None and not isinstance(role, str):
+        raise HTTPException(status_code=400, detail="role must be a string or omitted.")
+    resolved_role = (role or _role_pipeline_cron_role()).strip()
+    if not resolved_role:
+        raise HTTPException(status_code=400, detail="role must be non-empty.")
+
+    summary = run_candidate_jd_evaluator_for_role(
+        run_id=str(uuid.uuid4()),
+        run_date=run_date,
+        role=resolved_role,
+    )
+    return JSONResponse(content=jsonable_encoder(summary))
 
 
 @app.post("/internal/sync-handover-log")

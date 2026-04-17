@@ -147,27 +147,20 @@ def send_relevant_jobs_handover(
     for idx, row in enumerate(eligible):
         owner_buckets[idx % len(owner_rows)].append(row)
 
+    # Iterate owner-by-owner so all leads for one owner are posted back-to-back.
+    # Owner tag is inlined on each lead (no separate sub-heading).
     for owner_idx, owner in enumerate(owner_rows):
         bucket = owner_buckets.get(owner_idx, [])
         if not bucket:
             continue
         owner_tag = owner_tag_for_handover(owner)
-
-        # Owner sub-heading: groups all of this owner's leads visually.
-        if not send_slack_text(
-            f"{owner_tag} — {len(bucket)} lead(s)",
-            defaults=defaults,
-            sleep_after=1.0,
-        ):
-            continue
-        out["messages_sent"] += 1
-
         for row in bucket:
             company = (row.get("company") or "-").strip() or "-"
             lead_role = (row.get("matched_role") or row.get("role_category") or row.get("title") or "-").strip() or "-"
             job_url = (row.get("job_url") or "-").strip() or "-"
             count = int(row.get("_candidate_match_count") or 0)
             msg = format_relevant_jobs_lead(
+                owner_tag=owner_tag,
                 company=company,
                 role=lead_role,
                 job_url=job_url,

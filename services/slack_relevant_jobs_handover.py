@@ -41,6 +41,11 @@ ASSIGNED_OWNER_COLUMN = "assigned owner"
 HEADING_RELEVANT_LEADS = ":rotating_light: *INCOMING RELEVANT LEADS*"
 
 
+def _role_heading(role: str) -> str:
+    """Top-level Slack heading for one role's batch."""
+    return f"{HEADING_RELEVANT_LEADS} — *{role.strip()}*"
+
+
 # Default per-role handover rules. Overridable per role via the
 # ``handover`` key inside ROLE_PIPELINE_ROLE_CONFIG_JSON / ROLE_CONFIG_MAP.
 DEFAULT_HANDOVER_RULES: dict[str, dict[str, Any]] = {
@@ -127,7 +132,8 @@ def send_relevant_jobs_handover(
         out["skipped_reason"] = "no owner rows from handover_owners sheet"
         return out
 
-    if not send_slack_text(HEADING_RELEVANT_LEADS, defaults=defaults, sleep_after=1.0):
+    # Top-level heading per role (one per call -> "group by roles" in Slack).
+    if not send_slack_text(_role_heading(resolved_role), defaults=defaults, sleep_after=1.0):
         out["skipped_reason"] = "failed to post heading"
         return out
     out["messages_sent"] += 1
@@ -135,19 +141,33 @@ def send_relevant_jobs_handover(
     sent_identities: set[tuple[str, str]] = set()
     sent_timestamp = _now_iso()
 
+    # Round-robin allocation, then group consecutively by owner so each owner
+    # receives one sub-heading followed by all of their leads.
     owner_buckets: dict[int, list[dict[str, str]]] = {i: [] for i in range(len(owner_rows))}
     for idx, row in enumerate(eligible):
         owner_buckets[idx % len(owner_rows)].append(row)
 
     for owner_idx, owner in enumerate(owner_rows):
-        for row in owner_buckets.get(owner_idx, []):
-            tag = owner_tag_for_handover(owner)
+        bucket = owner_buckets.get(owner_idx, [])
+        if not bucket:
+            continue
+        owner_tag = owner_tag_for_handover(owner)
+
+        # Owner sub-heading: groups all of this owner's leads visually.
+        if not send_slack_text(
+            f"{owner_tag} — {len(bucket)} lead(s)",
+            defaults=defaults,
+            sleep_after=1.0,
+        ):
+            continue
+        out["messages_sent"] += 1
+
+        for row in bucket:
             company = (row.get("company") or "-").strip() or "-"
             lead_role = (row.get("matched_role") or row.get("role_category") or row.get("title") or "-").strip() or "-"
             job_url = (row.get("job_url") or "-").strip() or "-"
             count = int(row.get("_candidate_match_count") or 0)
             msg = format_relevant_jobs_lead(
-                owner_tag=tag,
                 company=company,
                 role=lead_role,
                 job_url=job_url,
@@ -173,15 +193,22 @@ def send_relevant_jobs_handover(
 
 def format_relevant_jobs_lead(
     *,
-    owner_tag: str,
     company: str,
     role: str,
     job_url: str,
     candidate_match_count: int,
+    owner_tag: str | None = None,
 ) -> str:
-    """Slack message body matching the 'Incoming relevant leads' sample."""
+    """Slack message body for a single relevant-jobs lead.
+
+    ``owner_tag`` is optional: when leads are posted as part of an
+    owner-grouped batch the tag is sent once as a sub-heading, so each
+    individual lead body omits it. Pass ``owner_tag`` to render the
+    legacy single-message format with the tag inlined.
+    """
+    head = f"{owner_tag.strip()}\n" if owner_tag and owner_tag.strip() else ""
     return (
-        f"{owner_tag}\n"
+        f"{head}"
         f"Company: {company}\n"
         f"Role: {role}\n"
         f"Job Url: {job_url}\n"

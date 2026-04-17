@@ -413,11 +413,18 @@ def _role_scrape_sources_for_current_slot() -> list[str]:
 
     tz = ZoneInfo(os.getenv("CRON_TIMEZONE", "Asia/Kolkata"))
     current_hour = datetime.now(tz).hour
+    hirecafe_enabled = os.getenv("ROLE_PIPELINE_HIRECAFE_ENABLED", "false").lower() in ("1", "true", "yes")
     # First and last scrape cron slots: 08:30 and 17:30 -> run all major sources.
     if current_hour in (8, 17):
-        return ["jobspy", "naukri", "wellfound", "hirist"]
+        sources = ["jobspy", "naukri", "wellfound", "hirist"]
+        if hirecafe_enabled:
+            sources.append("hirecafe")
+        return sources
     # Middle slots (11:30, 14:30): JobSpy + Hirist + Wellfound (Wellfound on every scrape run).
-    return ["jobspy", "hirist", "wellfound"]
+    sources = ["jobspy", "hirist", "wellfound"]
+    if hirecafe_enabled:
+        sources.append("hirecafe")
+    return sources
 
 
 def _run_recruiter_info_from_scheduler() -> None:

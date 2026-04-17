@@ -1,5 +1,4 @@
 import logging
-import math
 import os
 import re
 import json
@@ -10,27 +9,27 @@ from time import perf_counter
 from typing import Any
 
 import gspread
-from jobspy import scrape_jobs
 
-from services.apify_naukri import normalize_naukri_item, scrape_naukri_jobs
-from services.apify_wellfound import normalize_wellfound_item, scrape_wellfound_jobs
 from services.description_text_parts import apply_three_part_text_columns
 from services.google_sheets import GoogleSheetsWriter
 from services.handover_owners import worksheet_row_dicts
-from services.hirist import HiristTechService, normalize_hirist_item
 from services.pipeline import _classify_relevant_jobs, _dedupe_jobs, _parse_csv_env, _retry
+from services.role_scrapers import SCRAPER_REGISTRY
 
 logger = logging.getLogger(__name__)
 
 ROLE_SCRAPE_RUN_METRICS: dict[str, dict[str, Any]] = {}
 ROLE_CLASSIFY_RUN_METRICS: dict[str, dict[str, Any]] = {}
-ROLE_PIPELINE_ALLOWED_SOURCES = {"jobspy", "naukri", "wellfound", "hirist"}
-ROLE_PIPELINE_HIRIST_FIXED_URL = "https://www.hirist.tech/c/data-analytics-bi-jobs?ref=topnavigation"
-ROLE_QUERY_MAP: dict[str, dict[str, str]] = {
+ROLE_PIPELINE_ALLOWED_SOURCES = SCRAPER_REGISTRY.available_sources()
+
+# Unified per-role / per-scraper config.  Overridable via env
+# ROLE_PIPELINE_ROLE_CONFIG_JSON (see _load_role_config_map).
+ROLE_CONFIG_MAP: dict[str, dict[str, dict[str, Any]]] = {
     "data analyst": {
-        "jobspy": "Data Analyst",
-        "naukri": "Data Analyst",
-        "wellfound": "Data Analyst",
+        "jobspy":     {"query": "Data Analyst"},
+        "naukri":     {"query": "Data Analyst"},
+        "wellfound":  {"query": "Data Analyst"},
+        "hirist":     {"url": "https://www.hirist.tech/c/data-analytics-bi-jobs?ref=topnavigation"},
     },
 }
 
@@ -335,147 +334,30 @@ def _get_writer() -> GoogleSheetsWriter:
 
 
 def _scrape_role_jobs(role: str, enabled_sources: set[str]) -> list[dict[str, Any]]:
+    """Scrape jobs for *role* from every enabled source using the scraper registry."""
     all_jobs: list[dict[str, Any]] = []
     role_label = role.strip()
-    source_queries = _resolve_source_role_queries(role_label)
-    naukri_query = source_queries["naukri"]
-    wellfound_query = source_queries["wellfound"]
-    jobspy_query = source_queries["jobspy"]
+    full_role_config = _resolve_role_config(role_label)
 
-    # Naukri via Apify
-    if "naukri" in enabled_sources and os.getenv("APIFY_TOKEN"):
-        naukri_max_jobs = int(os.getenv("APIFY_MAX_JOBS_NAUKRI", os.getenv("DAILY_PIPELINE_RESULTS_WANTED", "30")))
-        naukri_freshness = os.getenv("APIFY_FRESHNESS", "1")
-        naukri_fetch_details = os.getenv("APIFY_FETCH_DETAILS", "false").lower() == "true"
+    for source_name in sorted(enabled_sources):
+        adapter = SCRAPER_REGISTRY.get(source_name)
+        if adapter is None:
+            logger.warning("role-pipeline: no adapter registered for source=%s, skipping", source_name)
+            continue
+
+        source_cfg = full_role_config.get(source_name) or {}
         try:
-            naukri_raw = _retry(
-                action=lambda: scrape_naukri_jobs(
-                    keyword=naukri_query,
-                    max_jobs=naukri_max_jobs,
-                    freshness=naukri_freshness,
-                    fetch_details=naukri_fetch_details,
-                ),
-                retries=2,
-                initial_delay_seconds=2.0,
+            source_jobs = adapter.scrape_for_role(role_label, source_cfg)
+            all_jobs.extend(source_jobs)
+            logger.info(
+                "role-pipeline source=%s role=%s scraped_count=%s",
+                source_name, role_label, len(source_jobs),
             )
-            for raw in naukri_raw:
-                normalized = normalize_naukri_item(raw)
-                normalized["requested_role"] = role_label
-                normalized["role_query"] = naukri_query
-                all_jobs.append(normalized)
         except Exception as exc:
-            logger.warning("role-pipeline naukri scrape failed role=%s err=%s", role_label, exc)
-
-    # Wellfound via Apify
-    wellfound_enabled = os.getenv("APIFY_WELLFOUND_ENABLED", "true").lower() in ("1", "true", "yes")
-    if "wellfound" in enabled_sources and os.getenv("APIFY_TOKEN") and wellfound_enabled:
-        wellfound_location = os.getenv("APIFY_WELLFOUND_LOCATION", "india")
-        wellfound_results = int(os.getenv("APIFY_MAX_JOBS_WELLFOUND_PER_ROLE", "50"))
-        wellfound_max_pages = int(os.getenv("APIFY_WELLFOUND_MAX_PAGES", "20"))
-        wellfound_use_proxy = os.getenv("APIFY_WELLFOUND_USE_PROXY", "true").lower() in ("1", "true", "yes")
-        wellfound_proxy_groups = _parse_csv_env(os.getenv("APIFY_WELLFOUND_PROXY_GROUPS", "RESIDENTIAL"))
-        try:
-            wellfound_raw = _retry(
-                action=lambda: scrape_wellfound_jobs(
-                    location=wellfound_location,
-                    results_wanted=wellfound_results,
-                    max_pages=wellfound_max_pages,
-                    keyword=wellfound_query,
-                    use_apify_proxy=wellfound_use_proxy,
-                    apify_proxy_groups=wellfound_proxy_groups,
-                ),
-                retries=2,
-                initial_delay_seconds=2.0,
+            logger.warning(
+                "role-pipeline %s scrape failed role=%s err=%s",
+                source_name, role_label, exc,
             )
-            for raw in wellfound_raw:
-                normalized = normalize_wellfound_item(raw)
-                normalized["requested_role"] = role_label
-                normalized["role_query"] = wellfound_query
-                all_jobs.append(normalized)
-        except Exception as exc:
-            logger.warning("role-pipeline wellfound scrape failed role=%s err=%s", role_label, exc)
-
-    # JobSpy (linkedin + indeed)
-    if "jobspy" in enabled_sources:
-        location = os.getenv("DAILY_PIPELINE_LOCATION", "India")
-        country_indeed = os.getenv("DAILY_PIPELINE_COUNTRY_INDEED", "india")
-        default_results_wanted = int(os.getenv("DAILY_PIPELINE_RESULTS_WANTED", "30"))
-        linkedin_results = int(os.getenv("JOBSPY_RESULTS_WANTED_LINKEDIN", str(default_results_wanted)))
-        indeed_results = int(os.getenv("JOBSPY_RESULTS_WANTED_INDEED", str(default_results_wanted)))
-
-        linkedin_df = _retry(
-            action=lambda: scrape_jobs(
-                site_name=["linkedin"],
-                search_term=jobspy_query,
-                location=location,
-                results_wanted=linkedin_results,
-                hours_old=24,
-                linkedin_fetch_description=True,
-                offset=0,
-                verbose=0,
-            ),
-            retries=3,
-            initial_delay_seconds=1.5,
-        )
-        linkedin_items = _sanitize_for_json(_dataframe_to_response(linkedin_df))
-        for item in linkedin_items:
-            item["requested_role"] = role_label
-            item["role_query"] = jobspy_query
-        all_jobs.extend(linkedin_items)
-
-        indeed_df = _retry(
-            action=lambda: scrape_jobs(
-                site_name=["indeed"],
-                search_term=jobspy_query,
-                location=location,
-                country_indeed=country_indeed,
-                results_wanted=indeed_results,
-                hours_old=24,
-                offset=0,
-                verbose=0,
-            ),
-            retries=3,
-            initial_delay_seconds=1.5,
-        )
-        indeed_items = _sanitize_for_json(_dataframe_to_response(indeed_df))
-        for item in indeed_items:
-            item["requested_role"] = role_label
-            item["role_query"] = jobspy_query
-        all_jobs.extend(indeed_items)
-
-    # Hirist via existing scraper implementation, but force only Data Analytics & BI category URL.
-    if "hirist" in enabled_sources:
-        hirist_max_scrolls = int(os.getenv("HIRIST_MAX_SCROLLS", "250"))
-        hirist_max_runtime = int(os.getenv("HIRIST_MAX_RUNTIME_SECONDS", "300"))
-        hirist_max_idle = int(os.getenv("HIRIST_MAX_IDLE_SECONDS", "90"))
-        hirist_min_scroll_delay = float(os.getenv("HIRIST_MIN_SCROLL_DELAY_SECONDS", "1.0"))
-        hirist_max_scroll_delay = float(os.getenv("HIRIST_MAX_SCROLL_DELAY_SECONDS", "2.0"))
-        hirist_headless = os.getenv("HIRIST_HEADLESS", "true").lower() not in ("0", "false", "no")
-        hirist_recent_hours = int(os.getenv("HIRIST_RECENT_MAX_AGE_HOURS", "24"))
-        hirist_include_desc = os.getenv("HIRIST_INCLUDE_JOB_DESCRIPTION", "true").lower() not in ("0", "false", "no")
-        try:
-            hirist_result = _retry(
-                action=lambda: HiristTechService.scrape_hirist_categories(
-                    max_scrolls=hirist_max_scrolls,
-                    max_runtime_seconds=hirist_max_runtime,
-                    max_idle_seconds=hirist_max_idle,
-                    min_scroll_delay_seconds=hirist_min_scroll_delay,
-                    max_scroll_delay_seconds=hirist_max_scroll_delay,
-                    headless=hirist_headless,
-                    recent_job_max_age_hours=hirist_recent_hours,
-                    include_job_description=hirist_include_desc,
-                    target_urls=[ROLE_PIPELINE_HIRIST_FIXED_URL],
-                ),
-                retries=2,
-                initial_delay_seconds=5.0,
-            )
-            for card in hirist_result.get("recent_jobs") or []:
-                normalized = normalize_hirist_item(card)
-                normalized["requested_role"] = role_label
-                normalized["role_query"] = "hirist_data_analytics_bi"
-                all_jobs.append(normalized)
-        except Exception as exc:
-            logger.warning("role-pipeline hirist scrape failed role=%s err=%s", role_label, exc)
 
     normalized_jobs = [_normalize_job(job) for job in all_jobs]
     return normalized_jobs
@@ -517,19 +399,7 @@ def _normalize_job(job: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _dataframe_to_response(jobs_df):
-    normalized_df = jobs_df.where(jobs_df.notna(), None)
-    return normalized_df.to_dict(orient="records")
 
-
-def _sanitize_for_json(value: Any):
-    if isinstance(value, float) and not math.isfinite(value):
-        return None
-    if isinstance(value, dict):
-        return {k: _sanitize_for_json(v) for k, v in value.items()}
-    if isinstance(value, list):
-        return [_sanitize_for_json(item) for item in value]
-    return value
 
 
 def _derive_headers(rows: list[dict[str, Any]]) -> list[str]:
@@ -612,23 +482,27 @@ def _attach_run_tracking(
     return out
 
 
-def _resolve_source_role_queries(role: str) -> dict[str, str]:
+def _resolve_role_config(role: str) -> dict[str, dict[str, Any]]:
+    """Return per-source config dicts for *role*.
+
+    Resolution order:
+    1. ``ROLE_PIPELINE_ROLE_CONFIG_JSON`` env variable (highest priority)
+    2. In-code ``ROLE_CONFIG_MAP`` constant
+    3. Fallback: ``{"query": role}`` for every registered source
+    """
     key = (role or "").strip().lower()
     if not key:
         raise ValueError("role is required.")
 
-    # Optional override via env to avoid code edits for new role mappings.
-    # Example:
-    # ROLE_PIPELINE_ROLE_QUERY_MAP_JSON='{"data analyst":{"jobspy":"Data Analyst","naukri":"Data Analyst, Business Analyst","wellfound":"Data Analyst"}}'
-    env_map = _load_role_query_map_from_env()
+    env_map = _load_role_config_map()
     if key in env_map:
         return env_map[key]
 
-    if key in ROLE_QUERY_MAP:
-        return ROLE_QUERY_MAP[key]
+    if key in ROLE_CONFIG_MAP:
+        return ROLE_CONFIG_MAP[key]
 
-    # Default fallback: same role value to all sources.
-    return {"jobspy": role, "naukri": role, "wellfound": role}
+    # Default fallback — every source gets the role as a query string.
+    return {src: {"query": role} for src in SCRAPER_REGISTRY.available_sources()}
 
 
 def _classify_relevant_jobs_for_role_pipeline(
@@ -656,31 +530,53 @@ def _classify_relevant_jobs_for_role_pipeline(
             os.environ["AI_RELEVANCE_PROMPT"] = previous_prompt
 
 
-def _load_role_query_map_from_env() -> dict[str, dict[str, str]]:
-    raw = (os.getenv("ROLE_PIPELINE_ROLE_QUERY_MAP_JSON") or "").strip()
+def _load_role_config_map() -> dict[str, dict[str, dict[str, Any]]]:
+    """Parse the unified ``ROLE_PIPELINE_ROLE_CONFIG_JSON`` env variable.
+
+    Expected shape::
+
+        {
+          "data analyst": {
+            "jobspy":    {"query": "Data Analyst"},
+            "naukri":    {"query": "Data Analyst"},
+            "wellfound": {"query": "Data Analyst"},
+            "hirist":    {"url": "https://..."},
+            "hirecafe":  {"search_url": "https://..."}
+          },
+          "software engineer": { ... }
+        }
+
+    Also accepts the *old* format where each source value is a plain
+    string (treated as ``{"query": value}``) for backward compatibility.
+    """
+    raw = (os.getenv("ROLE_PIPELINE_ROLE_CONFIG_JSON") or "").strip()
     if not raw:
         return {}
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
-        logger.warning("invalid ROLE_PIPELINE_ROLE_QUERY_MAP_JSON: %s", exc)
+        logger.warning("invalid ROLE_PIPELINE_ROLE_CONFIG_JSON: %s", exc)
         return {}
     if not isinstance(parsed, dict):
-        logger.warning("ROLE_PIPELINE_ROLE_QUERY_MAP_JSON must be a JSON object")
+        logger.warning("ROLE_PIPELINE_ROLE_CONFIG_JSON must be a JSON object")
         return {}
 
-    out: dict[str, dict[str, str]] = {}
+    out: dict[str, dict[str, dict[str, Any]]] = {}
     for role_key, source_map in parsed.items():
         if not isinstance(role_key, str) or not isinstance(source_map, dict):
             continue
-        jobspy = str(source_map.get("jobspy") or "").strip()
-        naukri = str(source_map.get("naukri") or "").strip()
-        wellfound = str(source_map.get("wellfound") or "").strip()
-        if not (jobspy and naukri and wellfound):
-            continue
-        out[role_key.strip().lower()] = {
-            "jobspy": jobspy,
-            "naukri": naukri,
-            "wellfound": wellfound,
-        }
+        normalised_sources: dict[str, dict[str, Any]] = {}
+        for src_name, src_val in source_map.items():
+            if isinstance(src_val, str):
+                # Backward compat: plain string → {"query": value}
+                normalised_sources[src_name.strip().lower()] = {"query": src_val.strip()}
+            elif isinstance(src_val, dict):
+                normalised_sources[src_name.strip().lower()] = src_val
+            else:
+                logger.warning(
+                    "ROLE_PIPELINE_ROLE_CONFIG_JSON: ignoring invalid value for role=%s source=%s",
+                    role_key, src_name,
+                )
+        if normalised_sources:
+            out[role_key.strip().lower()] = normalised_sources
     return out

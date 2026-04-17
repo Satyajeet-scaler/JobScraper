@@ -11,8 +11,7 @@ from services.handover_log_sync import HANDOVER_LOG_HEADER
 from services.handover_owners import worksheet_row_dicts
 from services.linkedin_posts_slack_row import slack_post_url_from_row
 from services.role_linkedin_posts_pipeline import _role_linkedin_relevant_tab_name
-from services.role_pipeline import _role_slug
-from services.role_recruiter_info_service import _role_recruiters_tab_name
+from services.role_pipeline import _role_slug, role_relevant_tab_name
 
 logger = logging.getLogger(__name__)
 
@@ -31,16 +30,23 @@ def _load_rows(tab: str) -> list[dict[str, Any]]:
     return [dict(r) for r in worksheet_row_dicts(raw)]
 
 
-def _recruiter_row_to_log_cells(row: dict[str, Any]) -> list[str]:
+def _relevant_job_row_to_log_cells(row: dict[str, Any]) -> list[str]:
+    """Map a role_relevant_* row to the shared handover log schema.
+
+    Uses ``matched_role`` / ``role_category`` as the Title column so the log
+    reflects the AI-matched role rather than the raw scraped job title.
+    """
+
     def g(key: str) -> str:
         return str(row.get(key) or "").strip()
 
+    title = g("matched_role") or g("role_category") or g("title")
     return [
         g("run_date"),
         g("job_url"),
         g("company"),
-        g("title"),
-        g("assigned owner"),
+        title,
+        g("assigned owner") or g("assigned_owner"),
         "",
         "",
         "",
@@ -86,8 +92,12 @@ def _load_existing_log_keys(*, log_id: str, worksheet_name: str) -> set[tuple[st
 
 def sync_role_handover_log_to_sheet(*, run_date: str, role: str) -> dict[str, Any]:
     """
-    Append role recruiter + role LinkedIn relevant rows to HANDOVER_LOG sheet.
-    Uses the same target schema/header as the original handover log sync.
+    Append role relevant-jobs + role LinkedIn rows to HANDOVER_LOG sheet.
+
+    Relevant jobs are sourced from ``role_relevant_{slug}_{date}`` and only
+    rows that were actually handed over on Slack are logged (i.e. rows with
+    a non-empty ``handover_sent`` column). LinkedIn rows continue to come
+    from the role LinkedIn relevant tab (unchanged).
     """
     log_id = (os.getenv("HANDOVER_LOG_SPREADSHEET_ID") or "").strip()
     if not log_id:
@@ -103,14 +113,23 @@ def sync_role_handover_log_to_sheet(*, run_date: str, role: str) -> dict[str, An
         return {"skipped": True, "reason": "role is required"}
     role_slug = _role_slug(resolved_role)
 
-    recruiters_tab = _role_recruiters_tab_name(role_slug=role_slug, run_date=run_date)
+    relevant_tab = role_relevant_tab_name(role=resolved_role, run_date=run_date)
     linkedin_tab = _role_linkedin_relevant_tab_name(role_slug=role_slug, run_date=run_date)
-    recruiter_rows = [r for r in _load_rows(recruiters_tab) if (str(r.get("run_date") or "").strip() in ("", run_date))]
-    linkedin_rows = [r for r in _load_rows(linkedin_tab) if (str(r.get("run_date") or "").strip() in ("", run_date))]
+
+    raw_relevant_rows = _load_rows(relevant_tab)
+    relevant_rows = [
+        r for r in raw_relevant_rows
+        if str(r.get("handover_sent") or "").strip()
+        and (str(r.get("run_date") or "").strip() in ("", run_date))
+    ]
+    linkedin_rows = [
+        r for r in _load_rows(linkedin_tab)
+        if (str(r.get("run_date") or "").strip() in ("", run_date))
+    ]
 
     data_rows: list[list[str]] = []
-    for row in recruiter_rows:
-        data_rows.append(_recruiter_row_to_log_cells(row))
+    for row in relevant_rows:
+        data_rows.append(_relevant_job_row_to_log_cells(row))
     for row in linkedin_rows:
         data_rows.append(_linkedin_row_to_log_cells(row))
 
@@ -123,26 +142,27 @@ def sync_role_handover_log_to_sheet(*, run_date: str, role: str) -> dict[str, An
         existing_keys.add(key)
         new_rows.append(row)
 
+    summary_base = {
+        "run_date": run_date,
+        "role": resolved_role,
+        "role_slug": role_slug,
+        "relevant_tab": relevant_tab,
+        "linkedin_tab": linkedin_tab,
+        "relevant_total_rows": len(raw_relevant_rows),
+        "relevant_handed_over_rows": len(relevant_rows),
+        "linkedin_relevant_rows": len(linkedin_rows),
+        "candidate_rows": len(data_rows),
+    }
+
     if not new_rows:
         logger.info(
-            "role_handover_log_sync run_date=%s role=%s no new rows (recruiters=%s linkedin=%s)",
+            "role_handover_log_sync run_date=%s role=%s no new rows (relevant_sent=%s linkedin=%s)",
             run_date,
             resolved_role,
-            len(recruiter_rows),
+            len(relevant_rows),
             len(linkedin_rows),
         )
-        return {
-            "skipped": False,
-            "run_date": run_date,
-            "role": resolved_role,
-            "role_slug": role_slug,
-            "recruiters_tab": recruiters_tab,
-            "linkedin_tab": linkedin_tab,
-            "recruiter_handover_rows": len(recruiter_rows),
-            "linkedin_relevant_rows": len(linkedin_rows),
-            "candidate_rows": len(data_rows),
-            "rows_appended": 0,
-        }
+        return {"skipped": False, **summary_base, "rows_appended": 0}
 
     try:
         writer = GoogleSheetsWriter(spreadsheet_id=log_id)
@@ -152,41 +172,27 @@ def sync_role_handover_log_to_sheet(*, run_date: str, role: str) -> dict[str, An
             header_row=HANDOVER_LOG_HEADER,
         )
     except Exception as exc:
-        logger.exception("role_handover_log_sync append failed run_date=%s role=%s err=%s", run_date, resolved_role, exc)
-        return {
-            "skipped": False,
-            "error": str(exc),
-            "run_date": run_date,
-            "role": resolved_role,
-            "role_slug": role_slug,
-            "recruiters_tab": recruiters_tab,
-            "linkedin_tab": linkedin_tab,
-            "recruiter_handover_rows": len(recruiter_rows),
-            "linkedin_relevant_rows": len(linkedin_rows),
-            "candidate_rows": len(data_rows),
-            "rows_appended": 0,
-        }
+        logger.exception(
+            "role_handover_log_sync append failed run_date=%s role=%s err=%s",
+            run_date,
+            resolved_role,
+            exc,
+        )
+        return {"skipped": False, "error": str(exc), **summary_base, "rows_appended": 0}
 
     logger.info(
-        "role_handover_log_sync appended run_date=%s role=%s rows=%s (recruiters=%s linkedin=%s) sheet=%s tab=%s",
+        "role_handover_log_sync appended run_date=%s role=%s rows=%s (relevant_sent=%s linkedin=%s) sheet=%s tab=%s",
         run_date,
         resolved_role,
         len(new_rows),
-        len(recruiter_rows),
+        len(relevant_rows),
         len(linkedin_rows),
         log_id,
         worksheet_name,
     )
     return {
         "skipped": False,
-        "run_date": run_date,
-        "role": resolved_role,
-        "role_slug": role_slug,
-        "recruiters_tab": recruiters_tab,
-        "linkedin_tab": linkedin_tab,
-        "recruiter_handover_rows": len(recruiter_rows),
-        "linkedin_relevant_rows": len(linkedin_rows),
-        "candidate_rows": len(data_rows),
+        **summary_base,
         "rows_appended": len(new_rows),
         "worksheet": worksheet_name,
     }

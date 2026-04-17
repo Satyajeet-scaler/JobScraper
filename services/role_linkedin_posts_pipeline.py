@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import traceback
@@ -50,6 +51,7 @@ def run_role_linkedin_posts_scrape_only(
     }
     try:
         actor_input = _build_actor_input()
+        actor_input = _apply_role_scrape_overrides(actor_input, resolved_role)
         actor_input["searchQueries"] = _resolve_role_queries(resolved_role, queries)
         raw_rows = scrape_linkedin_posts(actor_input)
         normalized = [normalize_linkedin_post_item(row) for row in raw_rows]
@@ -126,7 +128,10 @@ def run_role_linkedin_posts_classify_only(
         relevant_run_seq = _next_run_sequence(existing_relevant_rows, seq_field="role_linkedin_posts_classify_run_seq")
         classify_input_rows = _filter_new_rows_by_post_url(deduped_scraped, existing_relevant_rows)
         if classify_input_rows:
-            relevant_rows, classification_errors = _classify_relevant_posts_for_role_pipeline(classify_input_rows)
+            relevant_rows, classification_errors = _classify_relevant_posts_for_role_pipeline(
+                classify_input_rows,
+                role=resolved_role,
+            )
         else:
             relevant_rows, classification_errors = [], 0
         relevant_rows = _enrich_role_context(relevant_rows, resolved_role, role_slug)
@@ -292,10 +297,27 @@ def _role_linkedin_relevant_tab_name(*, role_slug: str, run_date: str) -> str:
 
 
 def _resolve_role_queries(role: str, override_queries: list[str] | None) -> list[str]:
+    """
+    Resolution order (highest first):
+      1. ``override_queries`` arg (e.g. from API call)
+      2. ``ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON`` -> role -> ``scrape.queries``
+      3. ``ROLE_LINKEDIN_POSTS_QUERY_TEMPLATE`` env (single template, all roles)
+      4. Built-in default template.
+    """
     if override_queries:
         cleaned = [q.strip() for q in override_queries if q and q.strip()]
         if cleaned:
             return cleaned
+
+    role_cfg = _resolve_linkedin_role_config(role)
+    scrape_cfg = role_cfg.get("scrape") if isinstance(role_cfg, dict) else None
+    if isinstance(scrape_cfg, dict):
+        raw_queries = scrape_cfg.get("queries")
+        if isinstance(raw_queries, list):
+            cleaned = [str(q).strip() for q in raw_queries if str(q or "").strip()]
+            if cleaned:
+                return cleaned
+
     raw_template = (
         os.getenv("ROLE_LINKEDIN_POSTS_QUERY_TEMPLATE")
         or "hiring {role} India|hiring {role} Bangalore|hiring {role} Hyderabad"
@@ -308,17 +330,31 @@ def _resolve_role_queries(role: str, override_queries: list[str] | None) -> list
 
 def _classify_relevant_posts_for_role_pipeline(
     rows: list[dict[str, Any]],
+    role: str | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
     """
     Role pipeline wrapper around LinkedIn-post classifier prompt.
 
-    Preferred role-specific env:
-    - ROLE_LINKEDIN_POSTS_AI_RELEVANCE_PROMPT
-
-    Fallback remains shared LinkedIn-post prompt behavior:
-    - AI_RELEVANCE_PROMPT_LINKEDIN_POSTS
+    Resolution order (highest first):
+      1. ``ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON`` -> role -> ``ai_relevance_prompt``
+      2. ``ROLE_LINKEDIN_POSTS_AI_RELEVANCE_PROMPT`` (global role-pipeline override)
+      3. ``AI_RELEVANCE_PROMPT_LINKEDIN_POSTS`` / built-in (existing fallback)
     """
-    role_prompt = os.getenv("ROLE_LINKEDIN_POSTS_AI_RELEVANCE_PROMPT")
+    role_prompt: str | None = None
+    if role:
+        try:
+            role_cfg = _resolve_linkedin_role_config(role)
+        except Exception:
+            role_cfg = {}
+        candidate = role_cfg.get("ai_relevance_prompt") if isinstance(role_cfg, dict) else None
+        if isinstance(candidate, dict):
+            candidate = candidate.get("prompt") or candidate.get("value")
+        if isinstance(candidate, str) and candidate.strip():
+            role_prompt = candidate
+
+    if not role_prompt:
+        role_prompt = os.getenv("ROLE_LINKEDIN_POSTS_AI_RELEVANCE_PROMPT")
+
     if not role_prompt:
         return _classify_relevant_posts(rows)
 
@@ -331,6 +367,186 @@ def _classify_relevant_posts_for_role_pipeline(
             os.environ.pop("AI_RELEVANCE_PROMPT_LINKEDIN_POSTS", None)
         else:
             os.environ["AI_RELEVANCE_PROMPT_LINKEDIN_POSTS"] = previous_prompt
+
+
+# ---------------------------------------------------------------------------
+# Per-role config (ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON)
+# ---------------------------------------------------------------------------
+#
+# Single env var drives all per-role behaviour for the LinkedIn-posts role
+# pipeline. Shape::
+#
+#     {
+#       "data analyst": {
+#         "scrape": {
+#           "queries": ["hiring Data Analyst India", ...],
+#           "max_posts": 30,
+#           "posted_limit": "24h",
+#           "posted_limit_date": "",
+#           "content_type": "all",
+#           "sort_by": "date",
+#           "scrape_comments": false,
+#           "scrape_reactions": false,
+#           "post_nested_comments": false,
+#           "post_nested_reactions": false
+#         },
+#         "ai_relevance_prompt": "..."
+#       },
+#       "software developer": { ... },
+#       "devops": { ... }
+#     }
+#
+# ``scrape`` keys map onto the Apify actor input fields used by
+# ``services.linkedin_posts_pipeline._build_actor_input`` (snake_case here ->
+# camelCase in the actor input). Any unset key falls back to the existing env
+# var for that field.
+
+_LINKEDIN_SCRAPE_KEY_MAP: dict[str, str] = {
+    "queries": "searchQueries",
+    "max_posts": "maxPosts",
+    "posted_limit": "postedLimit",
+    "posted_limit_date": "postedLimitDate",
+    "content_type": "contentType",
+    "sort_by": "sortBy",
+    "scrape_comments": "scrapeComments",
+    "scrape_reactions": "scrapeReactions",
+    "post_nested_comments": "postNestedComments",
+    "post_nested_reactions": "postNestedReactions",
+}
+
+_LINKEDIN_SCRAPE_INT_KEYS = {"max_posts"}
+_LINKEDIN_SCRAPE_BOOL_KEYS = {
+    "scrape_comments",
+    "scrape_reactions",
+    "post_nested_comments",
+    "post_nested_reactions",
+}
+
+
+def _load_role_linkedin_config_map() -> dict[str, dict[str, Any]]:
+    """Parse ``ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON`` into a per-role dict.
+
+    Returns ``{}`` when the env var is unset, empty, malformed JSON, or not a
+    JSON object. Role keys are normalised to lowercase + stripped.
+    """
+    raw = (os.getenv("ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON") or "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.warning("invalid ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON: %s", exc)
+        return {}
+    if not isinstance(parsed, dict):
+        logger.warning("ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON must be a JSON object")
+        return {}
+
+    out: dict[str, dict[str, Any]] = {}
+    for role_key, role_cfg in parsed.items():
+        if not isinstance(role_key, str) or not isinstance(role_cfg, dict):
+            continue
+        out[role_key.strip().lower()] = role_cfg
+    return out
+
+
+def linkedin_posts_config_role_labels() -> list[str]:
+    """Top-level role keys from ``ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON``, in order.
+
+    Used by the role LinkedIn posts cron to decide which roles to scrape/classify
+    when that env var is set. Each label is the JSON key after ``strip()`` (so
+    casing matches what you wrote in the file). Empty list if unset, invalid
+    JSON, or no valid entries.
+    """
+    raw = (os.getenv("ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON") or "").strip()
+    if not raw:
+        return []
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(parsed, dict):
+        return []
+    out: list[str] = []
+    for role_key, role_cfg in parsed.items():
+        if not isinstance(role_key, str) or not isinstance(role_cfg, dict):
+            continue
+        label = role_key.strip()
+        if label:
+            out.append(label)
+    return out
+
+
+def _resolve_linkedin_role_config(role: str) -> dict[str, Any]:
+    """Return the per-role config dict for *role* or ``{}`` if not configured."""
+    key = (role or "").strip().lower()
+    if not key:
+        return {}
+    return _load_role_linkedin_config_map().get(key, {})
+
+
+def _coerce_bool(value: Any) -> bool | None:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in ("1", "true", "yes", "on"):
+            return True
+        if lowered in ("0", "false", "no", "off"):
+            return False
+    return None
+
+
+def _coerce_int(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
+
+
+def _apply_role_scrape_overrides(actor_input: dict[str, Any], role: str) -> dict[str, Any]:
+    """Overlay per-role ``scrape`` overrides on top of ``actor_input``.
+
+    Non-destructive: keys absent from the role's ``scrape`` block are left
+    untouched, so existing env-driven defaults still apply.
+    """
+    role_cfg = _resolve_linkedin_role_config(role)
+    scrape_cfg = role_cfg.get("scrape") if isinstance(role_cfg, dict) else None
+    if not isinstance(scrape_cfg, dict):
+        return actor_input
+
+    for snake_key, actor_key in _LINKEDIN_SCRAPE_KEY_MAP.items():
+        if snake_key not in scrape_cfg:
+            continue
+        raw_value = scrape_cfg[snake_key]
+        if snake_key == "queries":
+            # queries handled by _resolve_role_queries; skip to avoid double work.
+            continue
+        if snake_key in _LINKEDIN_SCRAPE_BOOL_KEYS:
+            coerced = _coerce_bool(raw_value)
+            if coerced is None:
+                logger.warning(
+                    "ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON: ignoring non-bool %s for role=%s",
+                    snake_key, role,
+                )
+                continue
+            actor_input[actor_key] = coerced
+        elif snake_key in _LINKEDIN_SCRAPE_INT_KEYS:
+            coerced = _coerce_int(raw_value)
+            if coerced is None:
+                logger.warning(
+                    "ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON: ignoring non-int %s for role=%s",
+                    snake_key, role,
+                )
+                continue
+            actor_input[actor_key] = coerced
+        else:
+            actor_input[actor_key] = raw_value
+    return actor_input
 
 
 def _enrich_role_context(rows: list[dict[str, Any]], role: str, role_slug: str) -> list[dict[str, Any]]:

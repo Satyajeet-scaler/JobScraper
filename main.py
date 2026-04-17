@@ -44,6 +44,7 @@ from services.scrape_relevance_service import (
     run_scrape_jobs_only,
 )
 from services.role_pipeline import (
+    ROLE_PIPELINE_ALLOWED_SOURCES,
     get_role_classify_run_metrics,
     get_role_scrape_run_metrics,
     run_role_classify_only,
@@ -400,6 +401,20 @@ def _resolve_cron_roles() -> list[str]:
     return roles if roles else [_role_pipeline_cron_role()]
 
 
+def _resolve_linkedin_cron_roles() -> list[str]:
+    """Roles for the role LinkedIn posts scrape/classify cron.
+
+    If ``ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON`` is set and contains at least one
+    role entry, uses those JSON top-level keys (in order). Otherwise falls back
+    to ``_resolve_cron_roles()`` so behaviour matches the rest of the role
+    pipeline when no LinkedIn-specific config is present.
+    """
+    from services.role_linkedin_posts_pipeline import linkedin_posts_config_role_labels
+
+    configured = linkedin_posts_config_role_labels()
+    return configured if configured else _resolve_cron_roles()
+
+
 def _run_role_scrape_from_scheduler() -> None:
     run_date = _cron_today()
     sources = _role_scrape_sources_for_current_slot()
@@ -427,7 +442,7 @@ def _run_role_candidate_jd_eval_from_scheduler() -> None:
 
 def _run_role_linkedin_posts_scrape_from_scheduler() -> None:
     run_date = _cron_today()
-    for role in _resolve_cron_roles():
+    for role in _resolve_linkedin_cron_roles():
         _run_in_subprocess(
             _role_linkedin_posts_scrape_work,
             str(uuid.uuid4()),
@@ -438,7 +453,7 @@ def _run_role_linkedin_posts_scrape_from_scheduler() -> None:
 
 def _run_role_linkedin_posts_classify_from_scheduler() -> None:
     run_date = _cron_today()
-    for role in _resolve_cron_roles():
+    for role in _resolve_linkedin_cron_roles():
         _run_in_subprocess(
             _role_linkedin_posts_classify_work,
             str(uuid.uuid4()),
@@ -466,6 +481,130 @@ def _run_role_handover_log_sync_from_scheduler() -> None:
                 run_date,
                 role,
             )
+
+
+# --- Manual triggers: same work as intraday role-pipeline crons (all roles) ---
+
+
+def _parse_run_date_from_body(body: dict[str, Any]) -> str:
+    rd = body.get("run_date")
+    if rd is None:
+        return _cron_today()
+    if not isinstance(rd, str) or not rd.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="run_date must be a non-empty YYYY-MM-DD string.",
+        )
+    return rd.strip()
+
+
+def _parse_optional_roles_list(body: dict[str, Any]) -> list[str] | None:
+    """Return None if ``roles`` omitted — caller uses default cron role list."""
+    if "roles" not in body:
+        return None
+    raw = body["roles"]
+    if raw is None:
+        return None
+    if isinstance(raw, list):
+        out = [str(x).strip() for x in raw if str(x).strip()]
+    elif isinstance(raw, str):
+        out = [p.strip() for p in raw.split(",") if p.strip()]
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="roles must be a comma-separated string or JSON array of strings.",
+        )
+    return out if out else None
+
+
+def _resolve_batch_roles(body: dict[str, Any], *, linkedin: bool) -> list[str]:
+    custom = _parse_optional_roles_list(body)
+    if custom is not None:
+        return custom
+    return _resolve_linkedin_cron_roles() if linkedin else _resolve_cron_roles()
+
+
+def _resolve_batch_scrape_sources(body: dict[str, Any]) -> list[str]:
+    """Intraday cron slot sources (default), or explicit ``sources`` when ``use_cron_slot_sources`` is false."""
+    use_slot = body.get("use_cron_slot_sources")
+    if use_slot is not False:
+        return _role_scrape_sources_for_current_slot()
+    raw = body.get("sources")
+    if raw is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="When use_cron_slot_sources is false, sources must be set (array or comma-separated string).",
+        )
+    if isinstance(raw, list):
+        cleaned = [str(x).strip().lower() for x in raw if str(x).strip()]
+    elif isinstance(raw, str):
+        cleaned = [p.strip().lower() for p in raw.split(",") if p.strip()]
+    else:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="sources must be a string or JSON array.",
+        )
+    if not cleaned:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="sources must not be empty.",
+        )
+    invalid = sorted(set(cleaned) - ROLE_PIPELINE_ALLOWED_SOURCES)
+    if invalid:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid sources: {invalid}. Allowed: {sorted(ROLE_PIPELINE_ALLOWED_SOURCES)}",
+        )
+    return cleaned
+
+
+def _trigger_role_pipeline_scrape_cron_work(run_date: str, roles: list[str], sources: list[str]) -> None:
+    for role in roles:
+        _run_in_subprocess(_role_scrape_work, str(uuid.uuid4()), run_date, role, sources)
+
+
+def _trigger_role_pipeline_classify_cron_work(run_date: str, roles: list[str]) -> None:
+    for role in roles:
+        _run_in_subprocess(_role_classify_work, str(uuid.uuid4()), run_date, role)
+
+
+def _trigger_role_pipeline_candidate_jd_eval_cron_work(run_date: str, roles: list[str]) -> None:
+    for role in roles:
+        _run_in_subprocess(_role_candidate_jd_eval_work, str(uuid.uuid4()), run_date, role)
+
+
+def _trigger_role_pipeline_slack_handover_cron_work(run_date: str, roles: list[str]) -> None:
+    for role in roles:
+        _run_in_subprocess(_role_slack_handover_work, run_date, role)
+
+
+def _trigger_role_pipeline_handover_log_sync_cron_work(run_date: str, roles: list[str]) -> None:
+    _configure_logging()
+    for role in roles:
+        try:
+            result = sync_role_handover_log_to_sheet(run_date=run_date, role=role)
+            logger.info("manual trigger role-handover-log-sync role=%s result=%s", role, result)
+        except Exception:
+            logger.exception(
+                "manual trigger role-handover-log-sync failed run_date=%s role=%s",
+                run_date,
+                role,
+            )
+
+
+def _trigger_role_pipeline_recruiter_info_cron_work(run_date: str, roles: list[str]) -> None:
+    for role in roles:
+        _run_in_subprocess(_role_recruiter_info_work, str(uuid.uuid4()), run_date, role)
+
+
+def _trigger_role_linkedin_posts_scrape_cron_work(run_date: str, roles: list[str]) -> None:
+    for role in roles:
+        _run_in_subprocess(_role_linkedin_posts_scrape_work, str(uuid.uuid4()), run_date, role)
+
+
+def _trigger_role_linkedin_posts_classify_cron_work(run_date: str, roles: list[str]) -> None:
+    for role in roles:
+        _run_in_subprocess(_role_linkedin_posts_classify_work, str(uuid.uuid4()), run_date, role)
 
 
 def _role_scrape_sources_for_current_slot() -> list[str]:
@@ -771,6 +910,9 @@ def _build_scheduler() -> BackgroundScheduler:
             misfire_grace_time=1800,
         )
     if role_linkedin_posts_enabled:
+        # Role LinkedIn posts: scrape 7/10/13/16 :50, classify 8/11/14/17 :20 (CRON_TIMEZONE).
+        # Runs once per role from ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON keys when set,
+        # else same roles as ROLE_PIPELINE_CRON_ROLES / ROLE_PIPELINE_CRON_ROLE.
         scheduler.add_job(
             _run_role_linkedin_posts_scrape_from_scheduler,
             trigger=CronTrigger(hour="7,10,13,16", minute=50, timezone=timezone),
@@ -883,7 +1025,8 @@ def startup_event() -> None:
             "legacy_pipeline_enabled=%s role_pipeline_enabled=%s role_linkedin_posts_enabled=%s "
             "role_pipeline_roles=%s role_scrape_slots=%s role_classify_slots=%s "
             "role_candidate_jd_eval_slots=%s role_recruiter_info_slots=%s role_slack_slots=%s "
-            "role_handover_log_slots=%s role_linkedin_posts_scrape_slots=%s role_linkedin_posts_classify_slots=%s"
+            "role_handover_log_slots=%s role_linkedin_posts_scrape_slots=%s role_linkedin_posts_classify_slots=%s "
+            "role_linkedin_cron_roles=%s"
         ),
         os.getenv("CRON_TIMEZONE", "Asia/Kolkata"),
         "00:10",
@@ -907,6 +1050,7 @@ def startup_event() -> None:
         "9:35,12:35,15:35,18:35",
         "7:50,10:50,13:50,16:50",
         "8:20,11:20,14:20,17:20",
+        ",".join(_resolve_linkedin_cron_roles()),
     )
 
 
@@ -1937,6 +2081,214 @@ def internal_sync_role_handover_log(
         raise HTTPException(status_code=400, detail="role must be non-empty.")
     result = sync_role_handover_log_to_sheet(run_date=resolved_date, role=resolved_role)
     return JSONResponse(content=jsonable_encoder(result))
+
+
+@app.post("/internal/trigger-role-pipeline-cron-scrape")
+def trigger_role_pipeline_cron_scrape(
+    background_tasks: BackgroundTasks,
+    body: dict[str, Any] = Body(default_factory=dict),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """
+    Run the same work as ``intraday-role-scrape-only``: one subprocess per role
+    (``ROLE_PIPELINE_CRON_ROLES`` / ``ROLE_PIPELINE_CRON_ROLE``), defaulting to
+    current-slot sources via ``_role_scrape_sources_for_current_slot``.
+
+    JSON body (all optional):
+    - ``run_date``: YYYY-MM-DD (default: today in cron timezone)
+    - ``roles``: comma-separated string or JSON array to override which roles run
+    - ``use_cron_slot_sources``: bool (default true). If false, pass ``sources`` explicitly.
+    - ``sources``: when ``use_cron_slot_sources`` is false — array or comma-separated
+      list (e.g. ``jobspy,naukri,wellfound,hirist``).
+    """
+    validate_internal_trigger_token(x_internal_token)
+    run_date = _parse_run_date_from_body(body)
+    roles = _resolve_batch_roles(body, linkedin=False)
+    sources = _resolve_batch_scrape_sources(body)
+    trigger_id = str(uuid.uuid4())
+    background_tasks.add_task(_trigger_role_pipeline_scrape_cron_work, run_date, roles, sources)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "trigger_id": trigger_id,
+            "status": "accepted",
+            "cron_job_id": "intraday-role-scrape-only",
+            "run_date": run_date,
+            "roles": roles,
+            "sources": sources,
+        },
+    )
+
+
+@app.post("/internal/trigger-role-pipeline-cron-classify")
+def trigger_role_pipeline_cron_classify(
+    background_tasks: BackgroundTasks,
+    body: dict[str, Any] = Body(default_factory=dict),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """Same as ``intraday-role-classify-only`` (subprocess per role, post_classify_chain disabled)."""
+    validate_internal_trigger_token(x_internal_token)
+    run_date = _parse_run_date_from_body(body)
+    roles = _resolve_batch_roles(body, linkedin=False)
+    trigger_id = str(uuid.uuid4())
+    background_tasks.add_task(_trigger_role_pipeline_classify_cron_work, run_date, roles)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "trigger_id": trigger_id,
+            "status": "accepted",
+            "cron_job_id": "intraday-role-classify-only",
+            "run_date": run_date,
+            "roles": roles,
+        },
+    )
+
+
+@app.post("/internal/trigger-role-pipeline-cron-candidate-jd-eval")
+def trigger_role_pipeline_cron_candidate_jd_eval(
+    background_tasks: BackgroundTasks,
+    body: dict[str, Any] = Body(default_factory=dict),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """Same as ``intraday-role-candidate-jd-eval``."""
+    validate_internal_trigger_token(x_internal_token)
+    run_date = _parse_run_date_from_body(body)
+    roles = _resolve_batch_roles(body, linkedin=False)
+    trigger_id = str(uuid.uuid4())
+    background_tasks.add_task(_trigger_role_pipeline_candidate_jd_eval_cron_work, run_date, roles)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "trigger_id": trigger_id,
+            "status": "accepted",
+            "cron_job_id": "intraday-role-candidate-jd-eval",
+            "run_date": run_date,
+            "roles": roles,
+        },
+    )
+
+
+@app.post("/internal/trigger-role-pipeline-cron-slack-handover")
+def trigger_role_pipeline_cron_slack_handover(
+    background_tasks: BackgroundTasks,
+    body: dict[str, Any] = Body(default_factory=dict),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """Same as ``intraday-role-slack-handover`` (relevant jobs + recruiter + LinkedIn post notify per role)."""
+    validate_internal_trigger_token(x_internal_token)
+    run_date = _parse_run_date_from_body(body)
+    roles = _resolve_batch_roles(body, linkedin=False)
+    trigger_id = str(uuid.uuid4())
+    background_tasks.add_task(_trigger_role_pipeline_slack_handover_cron_work, run_date, roles)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "trigger_id": trigger_id,
+            "status": "accepted",
+            "cron_job_id": "intraday-role-slack-handover",
+            "run_date": run_date,
+            "roles": roles,
+        },
+    )
+
+
+@app.post("/internal/trigger-role-pipeline-cron-handover-log-sync")
+def trigger_role_pipeline_cron_handover_log_sync(
+    background_tasks: BackgroundTasks,
+    body: dict[str, Any] = Body(default_factory=dict),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """Same as ``intraday-role-handover-log-sync`` (in-process per role, like the scheduler)."""
+    validate_internal_trigger_token(x_internal_token)
+    run_date = _parse_run_date_from_body(body)
+    roles = _resolve_batch_roles(body, linkedin=False)
+    trigger_id = str(uuid.uuid4())
+    background_tasks.add_task(_trigger_role_pipeline_handover_log_sync_cron_work, run_date, roles)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "trigger_id": trigger_id,
+            "status": "accepted",
+            "cron_job_id": "intraday-role-handover-log-sync",
+            "run_date": run_date,
+            "roles": roles,
+        },
+    )
+
+
+@app.post("/internal/trigger-role-pipeline-cron-recruiter-info")
+def trigger_role_pipeline_cron_recruiter_info(
+    background_tasks: BackgroundTasks,
+    body: dict[str, Any] = Body(default_factory=dict),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """Same as ``intraday-role-recruiter-info-only``."""
+    validate_internal_trigger_token(x_internal_token)
+    run_date = _parse_run_date_from_body(body)
+    roles = _resolve_batch_roles(body, linkedin=False)
+    trigger_id = str(uuid.uuid4())
+    background_tasks.add_task(_trigger_role_pipeline_recruiter_info_cron_work, run_date, roles)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "trigger_id": trigger_id,
+            "status": "accepted",
+            "cron_job_id": "intraday-role-recruiter-info-only",
+            "run_date": run_date,
+            "roles": roles,
+        },
+    )
+
+
+@app.post("/internal/trigger-role-linkedin-posts-cron-scrape")
+def trigger_role_linkedin_posts_cron_scrape(
+    background_tasks: BackgroundTasks,
+    body: dict[str, Any] = Body(default_factory=dict),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """
+    Same as ``intraday-role-linkedin-posts-scrape-only``. Roles default to
+    ``ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON`` keys when set, else pipeline cron roles.
+    """
+    validate_internal_trigger_token(x_internal_token)
+    run_date = _parse_run_date_from_body(body)
+    roles = _resolve_batch_roles(body, linkedin=True)
+    trigger_id = str(uuid.uuid4())
+    background_tasks.add_task(_trigger_role_linkedin_posts_scrape_cron_work, run_date, roles)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "trigger_id": trigger_id,
+            "status": "accepted",
+            "cron_job_id": "intraday-role-linkedin-posts-scrape-only",
+            "run_date": run_date,
+            "roles": roles,
+        },
+    )
+
+
+@app.post("/internal/trigger-role-linkedin-posts-cron-classify")
+def trigger_role_linkedin_posts_cron_classify(
+    background_tasks: BackgroundTasks,
+    body: dict[str, Any] = Body(default_factory=dict),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """Same as ``intraday-role-linkedin-posts-classify-only``."""
+    validate_internal_trigger_token(x_internal_token)
+    run_date = _parse_run_date_from_body(body)
+    roles = _resolve_batch_roles(body, linkedin=True)
+    trigger_id = str(uuid.uuid4())
+    background_tasks.add_task(_trigger_role_linkedin_posts_classify_cron_work, run_date, roles)
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "trigger_id": trigger_id,
+            "status": "accepted",
+            "cron_job_id": "intraday-role-linkedin-posts-classify-only",
+            "run_date": run_date,
+            "roles": roles,
+        },
+    )
 
 
 @app.post("/internal/linkedin-auto-login")

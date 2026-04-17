@@ -89,6 +89,30 @@ def owner_tag_for_handover(owner: dict[str, str]) -> str:
     return f"*{name}* (<@{sid}>)" if sid else f"*{name}*"
 
 
+def recruiter_row_role_label_for_slack(row: dict[str, str]) -> str:
+    """Best label for the ``Role:`` line in recruiter handover messages.
+
+    Reads ``role_category`` / ``matched_role`` (and space-separated header variants
+    from human-edited sheets). If those are empty, uses the job listing ``title``.
+
+    The JSON/API ``role`` (e.g. Software Developer) only selects *which tab* to read;
+    it is not copied onto each row — per-row text comes from the recruiter sheet.
+    """
+    for key in (
+        "role_category",
+        "role category",
+        "matched_role",
+        "matched role",
+    ):
+        v = (row.get(key) or "").strip()
+        if v:
+            return v
+    title = (row.get("title") or "").strip()
+    if title:
+        return title
+    return "-"
+
+
 def normalize_email(value: str | None) -> str:
     """Strip and lowercase for matching ``recruiter_email`` to internal POC sheet rows."""
     if not value:
@@ -365,7 +389,7 @@ def send_recruiter_handover_case(
         tag = owner_tag_for_handover(owner)
         for row in bucket:
             company = (row.get("company") or "-").strip() or "-"
-            role = (row.get("role_category") or row.get("matched_role") or "-").strip() or "-"
+            role = recruiter_row_role_label_for_slack(row)
             job_url = (row.get("job_url") or "-").strip() or "-"
             profile_url = (row.get("recruiter_profile_url") or "-").strip() or "-"
             matched_count = candidate_match_count_map.get(_normalize_job_url_for_match(job_url), 0)
@@ -425,7 +449,7 @@ def send_internal_poc_handover_case(
             )
         tag = internal_poc_owner_tag_line(matched_owners)
         company = (row.get("company") or "-").strip() or "-"
-        role = (row.get("role_category") or row.get("matched_role") or "-").strip() or "-"
+        role = recruiter_row_role_label_for_slack(row)
         job_url = (row.get("job_url") or "-").strip() or "-"
         matched_count = candidate_match_count_map.get(_normalize_job_url_for_match(job_url), 0)
         msg = format_internal_poc_lead(tag, company, role, job_url, poc_email, matched_count)

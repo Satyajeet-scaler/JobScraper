@@ -25,6 +25,7 @@ from services.slack_handover_notify import (
     owner_tag_for_handover,
     persist_assigned_owner_from_email_map,
     persist_assigned_owner_round_robin,
+    recruiter_row_role_label_for_slack,
     send_slack_text,
     slack_notify_defaults_from_env,
 )
@@ -123,7 +124,7 @@ def send_role_handover_notifications(
                 for row in owner_buckets.get(owner_idx, []):
                     tag = owner_tag_for_handover(owner)
                     company = (row.get("company") or "-").strip() or "-"
-                    role_category = (row.get("role_category") or row.get("matched_role") or "-").strip() or "-"
+                    role_category = recruiter_row_role_label_for_slack(row)
                     job_url = (row.get("job_url") or "-").strip() or "-"
                     profile_url = (row.get("recruiter_profile_url") or "-").strip() or "-"
                     count = candidate_match_count_map.get(_normalize_job_key(job_url), 0)
@@ -157,7 +158,7 @@ def send_role_handover_notifications(
                 matched_owners = match_internal_poc_owners_ordered(raw_email, poc_email_map)
                 tag = internal_poc_owner_tag_line(matched_owners)
                 company = (row.get("company") or "-").strip() or "-"
-                role_category = (row.get("role_category") or row.get("matched_role") or "-").strip() or "-"
+                role_category = recruiter_row_role_label_for_slack(row)
                 job_url = (row.get("job_url") or "-").strip() or "-"
                 count = candidate_match_count_map.get(_normalize_job_key(job_url), 0)
                 msg = format_internal_poc_lead(tag, company, role_category, job_url, raw_email or "-", count)

@@ -178,6 +178,7 @@ def run_candidate_jd_evaluator_for_role(
             resolved_run_date,
             recruiters_tab,
             allow_empty=True,
+            pipeline_role=resolved_role,
         )
 
         already_evaluated = _existing_candidate_match_job_urls(
@@ -435,16 +436,25 @@ def _read_candidates(writer: GoogleSheetsWriter) -> list[dict[str, Any]]:
     return out
 
 
+def _is_iso_date_only(value: str) -> bool:
+    """True for ``YYYY-MM-DD`` (pipeline run_date style), not a worksheet name."""
+    s = (value or "").strip()
+    return bool(re.fullmatch(r"\d{4}-\d{2}-\d{2}", s))
+
+
 def _resolve_relevant_tab_and_row_number(
     *,
     raw_tab_value: str,
     run_date: str,
+    pipeline_role: str | None = None,
 ) -> tuple[str, int | None]:
     """Map ``relevant_jobs_tab`` cell to a worksheet name and optional row index.
 
-    Legacy shorthand: a cell that is only digits means row ``N`` in
-    ``relevant_jobs_{run_date}``. Any other non-empty value is treated as the
-    full relevant worksheet name (e.g. ``role_relevant_{slug}_{date}``).
+    - Empty cell → ``relevant_jobs_{run_date}`` (legacy default for this evaluator run).
+    - Only digits → row ``N`` in ``relevant_jobs_{run_date}`` (legacy row shorthand).
+    - **ISO date** ``YYYY-MM-DD`` → ``relevant_jobs_{that_date}`` for legacy; for
+      role-pipeline JD eval (``pipeline_role`` set) → ``role_relevant_{slug}_{that_date}``.
+    - Any other non-empty value → full worksheet name (e.g. ``role_relevant_foo_2026-04-17``).
     """
     default_tab = f"relevant_jobs_{run_date}"
     if not raw_tab_value:
@@ -452,6 +462,13 @@ def _resolve_relevant_tab_and_row_number(
     parsed = _parse_int(raw_tab_value)
     if parsed is not None and str(raw_tab_value).strip() == str(parsed):
         return default_tab, parsed
+    if _is_iso_date_only(raw_tab_value):
+        d = raw_tab_value.strip()
+        if pipeline_role:
+            from services.role_pipeline import role_relevant_tab_name
+
+            return role_relevant_tab_name(role=pipeline_role, run_date=d), None
+        return f"relevant_jobs_{d}", None
     return raw_tab_value, None
 
 
@@ -461,6 +478,7 @@ def _read_jd_rows_for_date(
     recruiters_tab: str,
     *,
     allow_empty: bool = False,
+    pipeline_role: str | None = None,
 ) -> list[dict[str, str]]:
     recruiters_ws = writer.open_worksheet(recruiters_tab)
     recruiter_rows = worksheet_row_dicts(
@@ -493,6 +511,7 @@ def _read_jd_rows_for_date(
         relevant_tab, row_number = _resolve_relevant_tab_and_row_number(
             raw_tab_value=raw_tab_value,
             run_date=run_date,
+            pipeline_role=pipeline_role,
         )
         if relevant_tab not in relevant_rows_cache:
             relevant_rows_cache[relevant_tab] = _load_relevant_rows(writer, relevant_tab)

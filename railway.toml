@@ -6,6 +6,9 @@
 #   LINKEDIN_PASSWORD
 #   LINKEDIN_HEADLESS          — use true on Railway (no display). POST local linkedin_storage.json to /internal/linkedin-session.
 #   LINKEDIN_STORAGE_PATH=/data/linkedin_storage.json  — mount a Railway volume at /data; session survives redeploys
+#   ROLE_PIPELINE_ROLE_CONFIG_FILE=/data/role_pipeline_role_config.json — large per-role job pipeline JSON (POST /internal/role-pipeline-role-config)
+#   ROLE_LINKEDIN_POSTS_ROLE_CONFIG_FILE=/data/role_linkedin_posts_role_config.json — LinkedIn-posts per-role JSON (POST /internal/role-linkedin-posts-role-config)
+#   Optional split prompts: ROLE_PIPELINE_AI_PROMPTS_FILE, ROLE_LINKEDIN_POSTS_AI_PROMPTS_FILE (same volume paths pattern)
 # Local manual login: set LINKEDIN_SESSION_UPLOAD_URL=https://<app>/internal/linkedin-session + INTERNAL_TRIGGER_TOKEN to auto-upload from linkedin_manual_login.py
 # Optional: LINKEDIN_RECRUITER_SHEET_ENABLED=true — after classification, scrape LinkedIn recruiters into tab recruiters_info_{date} (or RECRUITERS_INFO_WORKSHEET)
 # Optional: LINKEDIN_RECRUITER_MAX_URLS_PER_RUN=0 (0 = no cap; set e.g. 60 to limit per run)

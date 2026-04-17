@@ -4,6 +4,7 @@ import os
 import traceback
 import uuid
 from datetime import date
+from pathlib import Path
 from time import perf_counter
 from typing import Any
 from urllib.parse import urlparse
@@ -29,6 +30,21 @@ logger = logging.getLogger(__name__)
 ROLE_LINKEDIN_POSTS_SCRAPE_RUN_METRICS: dict[str, dict[str, Any]] = {}
 ROLE_LINKEDIN_POSTS_CLASSIFY_RUN_METRICS: dict[str, dict[str, Any]] = {}
 ROLE_LINKEDIN_POSTS_NOTIFY_RUN_METRICS: dict[str, dict[str, Any]] = {}
+
+_linkedin_posts_role_config_file_cache: dict[str, Any] | None = None
+_linkedin_posts_role_config_file_cache_valid: bool = False
+_linkedin_posts_ai_prompts_file_cache: dict[str, str] | None = None
+_linkedin_posts_ai_prompts_file_cache_valid: bool = False
+
+
+def invalidate_role_linkedin_posts_role_config_cache() -> None:
+    """Clear cached file-backed LinkedIn-posts role config and optional AI prompts map."""
+    global _linkedin_posts_role_config_file_cache, _linkedin_posts_role_config_file_cache_valid
+    global _linkedin_posts_ai_prompts_file_cache, _linkedin_posts_ai_prompts_file_cache_valid
+    _linkedin_posts_role_config_file_cache = None
+    _linkedin_posts_role_config_file_cache_valid = False
+    _linkedin_posts_ai_prompts_file_cache = None
+    _linkedin_posts_ai_prompts_file_cache_valid = False
 
 
 def run_role_linkedin_posts_scrape_only(
@@ -300,7 +316,7 @@ def _resolve_role_queries(role: str, override_queries: list[str] | None) -> list
     """
     Resolution order (highest first):
       1. ``override_queries`` arg (e.g. from API call)
-      2. ``ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON`` -> role -> ``scrape.queries``
+      2. ``ROLE_LINKEDIN_POSTS_ROLE_CONFIG_FILE`` / ``ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON`` -> role -> ``scrape.queries``
       3. ``ROLE_LINKEDIN_POSTS_QUERY_TEMPLATE`` env (single template, all roles)
       4. Built-in default template.
     """
@@ -328,6 +344,42 @@ def _resolve_role_queries(role: str, override_queries: list[str] | None) -> list
     return queries
 
 
+def _load_linkedin_ai_prompts_from_file() -> dict[str, str]:
+    """Optional map from ``ROLE_LINKEDIN_POSTS_AI_PROMPTS_FILE``."""
+    global _linkedin_posts_ai_prompts_file_cache, _linkedin_posts_ai_prompts_file_cache_valid
+    raw_path = (os.getenv("ROLE_LINKEDIN_POSTS_AI_PROMPTS_FILE") or "").strip()
+    if not raw_path:
+        return {}
+    if _linkedin_posts_ai_prompts_file_cache_valid and _linkedin_posts_ai_prompts_file_cache is not None:
+        return _linkedin_posts_ai_prompts_file_cache
+    p = Path(raw_path).expanduser().resolve()
+    if not p.is_file():
+        logger.warning("ROLE_LINKEDIN_POSTS_AI_PROMPTS_FILE not found: %s", p)
+        _linkedin_posts_ai_prompts_file_cache = {}
+        _linkedin_posts_ai_prompts_file_cache_valid = True
+        return _linkedin_posts_ai_prompts_file_cache
+    try:
+        parsed = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        logger.warning("invalid ROLE_LINKEDIN_POSTS_AI_PROMPTS_FILE %s: %s", p, exc)
+        _linkedin_posts_ai_prompts_file_cache = {}
+        _linkedin_posts_ai_prompts_file_cache_valid = True
+        return _linkedin_posts_ai_prompts_file_cache
+    out: dict[str, str] = {}
+    if isinstance(parsed, dict):
+        for role_key, val in parsed.items():
+            if isinstance(role_key, str) and isinstance(val, str) and val.strip():
+                out[role_key.strip().lower()] = val
+    _linkedin_posts_ai_prompts_file_cache = out
+    _linkedin_posts_ai_prompts_file_cache_valid = True
+    logger.info(
+        "Loaded ROLE_LINKEDIN_POSTS_AI_PROMPTS_FILE: %d roles from %s",
+        len(out),
+        p,
+    )
+    return out
+
+
 def _classify_relevant_posts_for_role_pipeline(
     rows: list[dict[str, Any]],
     role: str | None = None,
@@ -336,21 +388,27 @@ def _classify_relevant_posts_for_role_pipeline(
     Role pipeline wrapper around LinkedIn-post classifier prompt.
 
     Resolution order (highest first):
-      1. ``ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON`` -> role -> ``ai_relevance_prompt``
-      2. ``ROLE_LINKEDIN_POSTS_AI_RELEVANCE_PROMPT`` (global role-pipeline override)
-      3. ``AI_RELEVANCE_PROMPT_LINKEDIN_POSTS`` / built-in (existing fallback)
+      1. ``ROLE_LINKEDIN_POSTS_AI_PROMPTS_FILE`` map entry for the role
+      2. ``ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON`` / file -> role -> ``ai_relevance_prompt``
+      3. ``ROLE_LINKEDIN_POSTS_AI_RELEVANCE_PROMPT`` (global role-pipeline override)
+      4. ``AI_RELEVANCE_PROMPT_LINKEDIN_POSTS`` / built-in (existing fallback)
     """
     role_prompt: str | None = None
     if role:
-        try:
-            role_cfg = _resolve_linkedin_role_config(role)
-        except Exception:
-            role_cfg = {}
-        candidate = role_cfg.get("ai_relevance_prompt") if isinstance(role_cfg, dict) else None
-        if isinstance(candidate, dict):
-            candidate = candidate.get("prompt") or candidate.get("value")
-        if isinstance(candidate, str) and candidate.strip():
-            role_prompt = candidate
+        key_lc = (role or "").strip().lower()
+        prompts_map = _load_linkedin_ai_prompts_from_file()
+        if key_lc and key_lc in prompts_map:
+            role_prompt = prompts_map[key_lc]
+        if not role_prompt:
+            try:
+                role_cfg = _resolve_linkedin_role_config(role)
+            except Exception:
+                role_cfg = {}
+            candidate = role_cfg.get("ai_relevance_prompt") if isinstance(role_cfg, dict) else None
+            if isinstance(candidate, dict):
+                candidate = candidate.get("prompt") or candidate.get("value")
+            if isinstance(candidate, str) and candidate.strip():
+                role_prompt = candidate
 
     if not role_prompt:
         role_prompt = os.getenv("ROLE_LINKEDIN_POSTS_AI_RELEVANCE_PROMPT")
@@ -370,10 +428,10 @@ def _classify_relevant_posts_for_role_pipeline(
 
 
 # ---------------------------------------------------------------------------
-# Per-role config (ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON)
+# Per-role config (ROLE_LINKEDIN_POSTS_ROLE_CONFIG_FILE or ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON)
 # ---------------------------------------------------------------------------
 #
-# Single env var drives all per-role behaviour for the LinkedIn-posts role
+# A JSON file path or env string drives per-role behaviour for the LinkedIn-posts role
 # pipeline. Shape::
 #
 #     {
@@ -423,24 +481,57 @@ _LINKEDIN_SCRAPE_BOOL_KEYS = {
 }
 
 
-def _load_role_linkedin_config_map() -> dict[str, dict[str, Any]]:
-    """Parse ``ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON`` into a per-role dict.
-
-    Returns ``{}`` when the env var is unset, empty, malformed JSON, or not a
-    JSON object. Role keys are normalised to lowercase + stripped.
-    """
+def _resolve_linkedin_posts_role_config_parsed() -> dict[str, Any] | None:
+    """Load top-level JSON object from ``ROLE_LINKEDIN_POSTS_ROLE_CONFIG_FILE`` or env string."""
+    global _linkedin_posts_role_config_file_cache, _linkedin_posts_role_config_file_cache_valid
+    file_raw = (os.getenv("ROLE_LINKEDIN_POSTS_ROLE_CONFIG_FILE") or "").strip()
+    if file_raw:
+        p = Path(file_raw).expanduser().resolve()
+        if p.is_file():
+            if _linkedin_posts_role_config_file_cache_valid and _linkedin_posts_role_config_file_cache is not None:
+                return _linkedin_posts_role_config_file_cache
+            try:
+                parsed = json.loads(p.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                logger.warning("invalid ROLE_LINKEDIN_POSTS_ROLE_CONFIG_FILE %s: %s", p, exc)
+            else:
+                if not isinstance(parsed, dict):
+                    logger.warning(
+                        "ROLE_LINKEDIN_POSTS_ROLE_CONFIG_FILE must be a JSON object: %s",
+                        p,
+                    )
+                else:
+                    _linkedin_posts_role_config_file_cache = parsed
+                    _linkedin_posts_role_config_file_cache_valid = True
+                    logger.info(
+                        "Loaded ROLE_LINKEDIN_POSTS_ROLE_CONFIG_FILE: %d roles from %s",
+                        len(parsed),
+                        p,
+                    )
+                    return parsed
     raw = (os.getenv("ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON") or "").strip()
     if not raw:
-        return {}
+        return None
     try:
         parsed = json.loads(raw)
     except json.JSONDecodeError as exc:
         logger.warning("invalid ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON: %s", exc)
-        return {}
+        return None
     if not isinstance(parsed, dict):
         logger.warning("ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON must be a JSON object")
-        return {}
+        return None
+    return parsed
 
+
+def _load_role_linkedin_config_map() -> dict[str, dict[str, Any]]:
+    """Parse LinkedIn-posts role config from file or ``ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON``.
+
+    Returns ``{}`` when unset, empty, malformed JSON, or not a JSON object.
+    Role keys are normalised to lowercase + stripped.
+    """
+    parsed = _resolve_linkedin_posts_role_config_parsed()
+    if not parsed:
+        return {}
     out: dict[str, dict[str, Any]] = {}
     for role_key, role_cfg in parsed.items():
         if not isinstance(role_key, str) or not isinstance(role_cfg, dict):
@@ -450,21 +541,15 @@ def _load_role_linkedin_config_map() -> dict[str, dict[str, Any]]:
 
 
 def linkedin_posts_config_role_labels() -> list[str]:
-    """Top-level role keys from ``ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON``, in order.
+    """Top-level role keys from LinkedIn-posts role config (file or env), in order.
 
     Used by the role LinkedIn posts cron to decide which roles to scrape/classify
-    when that env var is set. Each label is the JSON key after ``strip()`` (so
+    when that config is set. Each label is the JSON key after ``strip()`` (so
     casing matches what you wrote in the file). Empty list if unset, invalid
     JSON, or no valid entries.
     """
-    raw = (os.getenv("ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON") or "").strip()
-    if not raw:
-        return []
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(parsed, dict):
+    parsed = _resolve_linkedin_posts_role_config_parsed()
+    if not parsed:
         return []
     out: list[str] = []
     for role_key, role_cfg in parsed.items():

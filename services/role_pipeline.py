@@ -5,6 +5,7 @@ import json
 import traceback
 import uuid
 from datetime import date
+from pathlib import Path
 from time import perf_counter
 from typing import Any
 
@@ -22,8 +23,8 @@ ROLE_SCRAPE_RUN_METRICS: dict[str, dict[str, Any]] = {}
 ROLE_CLASSIFY_RUN_METRICS: dict[str, dict[str, Any]] = {}
 ROLE_PIPELINE_ALLOWED_SOURCES = SCRAPER_REGISTRY.available_sources()
 
-# Unified per-role / per-scraper config.  Overridable via env
-# ROLE_PIPELINE_ROLE_CONFIG_JSON (see _load_role_config_map).
+# Unified per-role / per-scraper config. Overridable via env
+# ROLE_PIPELINE_ROLE_CONFIG_JSON or ROLE_PIPELINE_ROLE_CONFIG_FILE (see _load_role_config_map).
 #
 # Each role maps to a dict of per-source config, plus optional top-level keys
 # consumed by the role pipeline itself:
@@ -47,6 +48,22 @@ ROLE_CONFIG_MAP: dict[str, dict[str, dict[str, Any]]] = {
         "wellfound":  {"query": "DevOps Engineer"},
     },
 }
+
+# Caches for ROLE_PIPELINE_ROLE_CONFIG_FILE / ROLE_PIPELINE_AI_PROMPTS_FILE (invalidated after POST upload).
+_role_pipeline_config_file_cache: dict[str, dict[str, Any]] | None = None
+_role_pipeline_config_file_cache_valid: bool = False
+_role_pipeline_ai_prompts_file_cache: dict[str, str] | None = None
+_role_pipeline_ai_prompts_file_cache_valid: bool = False
+
+
+def invalidate_role_pipeline_role_config_cache() -> None:
+    """Clear cached file-backed role config and optional AI prompts file maps."""
+    global _role_pipeline_config_file_cache, _role_pipeline_config_file_cache_valid
+    global _role_pipeline_ai_prompts_file_cache, _role_pipeline_ai_prompts_file_cache_valid
+    _role_pipeline_config_file_cache = None
+    _role_pipeline_config_file_cache_valid = False
+    _role_pipeline_ai_prompts_file_cache = None
+    _role_pipeline_ai_prompts_file_cache_valid = False
 
 
 def run_role_scrape_only(
@@ -509,7 +526,8 @@ def _resolve_role_config(role: str) -> dict[str, Any]:
     """Return per-source + reserved-key config for *role*.
 
     Resolution order:
-    1. ``ROLE_PIPELINE_ROLE_CONFIG_JSON`` env variable (highest priority)
+    1. ``ROLE_PIPELINE_ROLE_CONFIG_FILE`` (if set and file exists) or
+       ``ROLE_PIPELINE_ROLE_CONFIG_JSON`` env variable (highest priority)
     2. In-code ``ROLE_CONFIG_MAP`` constant
     3. Fallback: ``{"query": role}`` for every registered source
 
@@ -531,6 +549,42 @@ def _resolve_role_config(role: str) -> dict[str, Any]:
     return {src: {"query": role} for src in SCRAPER_REGISTRY.available_sources()}
 
 
+def _load_role_ai_prompts_from_file() -> dict[str, str]:
+    """Optional JSON map ``{ "role label": "prompt", ... }`` from ``ROLE_PIPELINE_AI_PROMPTS_FILE``."""
+    global _role_pipeline_ai_prompts_file_cache, _role_pipeline_ai_prompts_file_cache_valid
+    raw_path = (os.getenv("ROLE_PIPELINE_AI_PROMPTS_FILE") or "").strip()
+    if not raw_path:
+        return {}
+    if _role_pipeline_ai_prompts_file_cache_valid and _role_pipeline_ai_prompts_file_cache is not None:
+        return _role_pipeline_ai_prompts_file_cache
+    p = Path(raw_path).expanduser().resolve()
+    if not p.is_file():
+        logger.warning("ROLE_PIPELINE_AI_PROMPTS_FILE not found: %s", p)
+        _role_pipeline_ai_prompts_file_cache = {}
+        _role_pipeline_ai_prompts_file_cache_valid = True
+        return _role_pipeline_ai_prompts_file_cache
+    try:
+        parsed = json.loads(p.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        logger.warning("invalid ROLE_PIPELINE_AI_PROMPTS_FILE %s: %s", p, exc)
+        _role_pipeline_ai_prompts_file_cache = {}
+        _role_pipeline_ai_prompts_file_cache_valid = True
+        return _role_pipeline_ai_prompts_file_cache
+    out: dict[str, str] = {}
+    if isinstance(parsed, dict):
+        for role_key, val in parsed.items():
+            if isinstance(role_key, str) and isinstance(val, str) and val.strip():
+                out[role_key.strip().lower()] = val
+    _role_pipeline_ai_prompts_file_cache = out
+    _role_pipeline_ai_prompts_file_cache_valid = True
+    logger.info(
+        "Loaded ROLE_PIPELINE_AI_PROMPTS_FILE: %d roles from %s",
+        len(out),
+        p,
+    )
+    return out
+
+
 def _classify_relevant_jobs_for_role_pipeline(
     jobs: list[dict[str, Any]],
     role: str | None = None,
@@ -539,22 +593,28 @@ def _classify_relevant_jobs_for_role_pipeline(
     Role-pipeline wrapper around shared classifier.
 
     Per-role prompt resolution order:
-    1. ``ai_relevance_prompt`` key inside the role's entry in
+    1. ``ROLE_PIPELINE_AI_PROMPTS_FILE`` map entry for the role (highest).
+    2. ``ai_relevance_prompt`` key inside the role's entry in
        ``ROLE_PIPELINE_ROLE_CONFIG_JSON`` / ``ROLE_CONFIG_MAP``.
-    2. ``ROLE_PIPELINE_AI_RELEVANCE_PROMPT`` (global role-pipeline override).
-    3. Default ``AI_RELEVANCE_PROMPT`` / built-in prompt (existing fallback).
+    3. ``ROLE_PIPELINE_AI_RELEVANCE_PROMPT`` (global role-pipeline override).
+    4. Default ``AI_RELEVANCE_PROMPT`` / built-in prompt (existing fallback).
     """
     role_prompt: str | None = None
     if role:
-        try:
-            role_cfg = _resolve_role_config(role)
-        except Exception:
-            role_cfg = {}
-        candidate = (role_cfg or {}).get("ai_relevance_prompt")
-        if isinstance(candidate, dict):
-            candidate = candidate.get("prompt") or candidate.get("value")
-        if isinstance(candidate, str) and candidate.strip():
-            role_prompt = candidate
+        key_lc = (role or "").strip().lower()
+        prompts_map = _load_role_ai_prompts_from_file()
+        if key_lc and key_lc in prompts_map:
+            role_prompt = prompts_map[key_lc]
+        if not role_prompt:
+            try:
+                role_cfg = _resolve_role_config(role)
+            except Exception:
+                role_cfg = {}
+            candidate = (role_cfg or {}).get("ai_relevance_prompt")
+            if isinstance(candidate, dict):
+                candidate = candidate.get("prompt") or candidate.get("value")
+            if isinstance(candidate, str) and candidate.strip():
+                role_prompt = candidate
 
     if not role_prompt:
         role_prompt = os.getenv("ROLE_PIPELINE_AI_RELEVANCE_PROMPT")
@@ -573,44 +633,9 @@ def _classify_relevant_jobs_for_role_pipeline(
             os.environ["AI_RELEVANCE_PROMPT"] = previous_prompt
 
 
-def _load_role_config_map() -> dict[str, dict[str, dict[str, Any]]]:
-    """Parse the unified ``ROLE_PIPELINE_ROLE_CONFIG_JSON`` env variable.
-
-    Expected shape::
-
-        {
-          "data analyst": {
-            "jobspy":    {"query": "Data Analyst"},
-            "naukri":    {"query": "Data Analyst"},
-            "wellfound": {"query": "Data Analyst"},
-            "hirist":    {"url": "https://..."},
-            "hirecafe":  {"search_url": "https://..."}
-          },
-          "software engineer": { ... }
-        }
-
-    Also accepts the *old* format where each source value is a plain
-    string (treated as ``{"query": value}``) for backward compatibility.
-
-    Reserved top-level keys under each role (preserved as-is, not wrapped):
-    - ``ai_relevance_prompt`` (str): per-role classifier prompt override.
-    - ``handover`` (dict): per-role Slack handover rules, e.g.
-      ``{"min_candidate_match": 10}``.
-    """
-    raw = (os.getenv("ROLE_PIPELINE_ROLE_CONFIG_JSON") or "").strip()
-    if not raw:
-        return {}
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError as exc:
-        logger.warning("invalid ROLE_PIPELINE_ROLE_CONFIG_JSON: %s", exc)
-        return {}
-    if not isinstance(parsed, dict):
-        logger.warning("ROLE_PIPELINE_ROLE_CONFIG_JSON must be a JSON object")
-        return {}
-
+def _normalize_role_pipeline_parsed(parsed: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Normalise a top-level role map from JSON (env string or file)."""
     reserved_role_keys = {"ai_relevance_prompt", "handover"}
-
     out: dict[str, dict[str, Any]] = {}
     for role_key, source_map in parsed.items():
         if not isinstance(role_key, str) or not isinstance(source_map, dict):
@@ -624,7 +649,6 @@ def _load_role_config_map() -> dict[str, dict[str, dict[str, Any]]]:
                 normalised_sources[key_lower] = src_val
                 continue
             if isinstance(src_val, str):
-                # Backward compat: plain string → {"query": value}
                 normalised_sources[key_lower] = {"query": src_val.strip()}
             elif isinstance(src_val, dict):
                 normalised_sources[key_lower] = src_val
@@ -636,3 +660,66 @@ def _load_role_config_map() -> dict[str, dict[str, dict[str, Any]]]:
         if normalised_sources:
             out[role_key.strip().lower()] = normalised_sources
     return out
+
+
+def _load_role_config_map_from_env() -> dict[str, dict[str, Any]]:
+    raw = (os.getenv("ROLE_PIPELINE_ROLE_CONFIG_JSON") or "").strip()
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        logger.warning("invalid ROLE_PIPELINE_ROLE_CONFIG_JSON: %s", exc)
+        return {}
+    if not isinstance(parsed, dict):
+        logger.warning("ROLE_PIPELINE_ROLE_CONFIG_JSON must be a JSON object")
+        return {}
+    return _normalize_role_pipeline_parsed(parsed)
+
+
+def _load_role_config_map() -> dict[str, dict[str, dict[str, Any]]]:
+    """Load unified per-role config from ``ROLE_PIPELINE_ROLE_CONFIG_FILE`` or env JSON.
+
+    Expected shape::
+
+        {
+          "data analyst": {
+            "jobspy":    {"query": "Data Analyst"},
+            ...
+          },
+          "software engineer": { ... }
+        }
+
+    Also accepts the *old* format where each source value is a plain
+    string (treated as ``{"query": value}``) for backward compatibility.
+
+    Reserved top-level keys under each role (preserved as-is, not wrapped):
+    - ``ai_relevance_prompt`` (str): per-role classifier prompt override.
+    - ``handover`` (dict): per-role Slack handover rules, e.g.
+      ``{"min_candidate_match": 10}``.
+    """
+    global _role_pipeline_config_file_cache, _role_pipeline_config_file_cache_valid
+    file_raw = (os.getenv("ROLE_PIPELINE_ROLE_CONFIG_FILE") or "").strip()
+    if file_raw:
+        p = Path(file_raw).expanduser().resolve()
+        if p.is_file():
+            if _role_pipeline_config_file_cache_valid and _role_pipeline_config_file_cache is not None:
+                return _role_pipeline_config_file_cache
+            try:
+                parsed = json.loads(p.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                logger.warning("invalid ROLE_PIPELINE_ROLE_CONFIG_FILE %s: %s", p, exc)
+                return _load_role_config_map_from_env()
+            if not isinstance(parsed, dict):
+                logger.warning("ROLE_PIPELINE_ROLE_CONFIG_FILE must be a JSON object: %s", p)
+                return _load_role_config_map_from_env()
+            out = _normalize_role_pipeline_parsed(parsed)
+            _role_pipeline_config_file_cache = out
+            _role_pipeline_config_file_cache_valid = True
+            logger.info(
+                "Loaded ROLE_PIPELINE_ROLE_CONFIG_FILE: %d roles from %s",
+                len(out),
+                p,
+            )
+            return out
+    return _load_role_config_map_from_env()

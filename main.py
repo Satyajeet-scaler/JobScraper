@@ -5,6 +5,7 @@ import math
 import multiprocessing
 import os
 import sys
+import tempfile
 import uuid
 import logging
 from pathlib import Path
@@ -47,6 +48,7 @@ from services.role_pipeline import (
     ROLE_PIPELINE_ALLOWED_SOURCES,
     get_role_classify_run_metrics,
     get_role_scrape_run_metrics,
+    invalidate_role_pipeline_role_config_cache,
     run_role_classify_only,
     run_role_scrape_only,
 )
@@ -75,6 +77,7 @@ from services.role_linkedin_posts_pipeline import (
     get_role_linkedin_posts_classify_run_metrics,
     get_role_linkedin_posts_notify_run_metrics,
     get_role_linkedin_posts_scrape_run_metrics,
+    invalidate_role_linkedin_posts_role_config_cache,
     run_role_linkedin_posts_classify_only,
     run_role_linkedin_posts_scrape_only,
     send_role_linkedin_posts_notifications,
@@ -170,6 +173,49 @@ def validate_internal_trigger_token(internal_token: Optional[str]) -> None:
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Unauthorized internal trigger.",
         )
+
+
+def _is_path_under(parent: Path, child: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _assert_writable_role_config_path(path_str: str) -> Path:
+    """Resolve path and restrict writes to ``/data`` or the app ``data/`` directory."""
+    p = Path(path_str).expanduser().resolve()
+    data_vol = Path("/data").resolve()
+    app_data = (BASE_DIR / "data").resolve()
+    if _is_path_under(data_vol, p) or _is_path_under(app_data, p):
+        return p
+    raise ValueError(
+        f"Path must be under {data_vol} or {app_data}, got {p}",
+    )
+
+
+def _atomic_write_json_config_file(path: Path, data: Any) -> int:
+    """Write JSON atomically; returns UTF-8 byte length."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(data, ensure_ascii=False, indent=2) + "\n"
+    raw = payload.encode("utf-8")
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent),
+        prefix=".tmp_role_cfg_",
+        suffix=".json",
+    )
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(raw)
+        os.replace(tmp_name, path)
+    except Exception:
+        try:
+            Path(tmp_name).unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return len(raw)
 
 
 def _cron_today() -> str:
@@ -2367,6 +2413,116 @@ async def save_linkedin_session(
             "status": "saved",
             "path": str(path),
             "cookies": len(data.get("cookies", [])),
+        }
+    )
+
+
+@app.post("/internal/role-pipeline-role-config")
+async def save_role_pipeline_role_config(
+    request: Request,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """
+    Save JSON to ``ROLE_PIPELINE_ROLE_CONFIG_FILE`` (e.g. Railway volume under ``/data``).
+    Requires that env var to be set; body must be a JSON object.
+    """
+    validate_internal_trigger_token(x_internal_token)
+    path_str = (os.getenv("ROLE_PIPELINE_ROLE_CONFIG_FILE") or "").strip()
+    if not path_str:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="ROLE_PIPELINE_ROLE_CONFIG_FILE is not set.",
+        )
+    try:
+        path = _assert_writable_role_config_path(path_str)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    body = await request.body()
+    if not body.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Empty body.",
+        )
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid JSON: {exc}",
+        ) from exc
+    if not isinstance(data, dict):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="JSON body must be an object.",
+        )
+
+    nbytes = _atomic_write_json_config_file(path, data)
+    invalidate_role_pipeline_role_config_cache()
+    logger.info("Saved role pipeline role config to %s (%d bytes)", path, nbytes)
+    return JSONResponse(
+        content={
+            "status": "saved",
+            "path": str(path),
+            "bytes": nbytes,
+        }
+    )
+
+
+@app.post("/internal/role-linkedin-posts-role-config")
+async def save_role_linkedin_posts_role_config(
+    request: Request,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """
+    Save JSON to ``ROLE_LINKEDIN_POSTS_ROLE_CONFIG_FILE`` (e.g. under ``/data``).
+    Requires that env var to be set; body must be a JSON object.
+    """
+    validate_internal_trigger_token(x_internal_token)
+    path_str = (os.getenv("ROLE_LINKEDIN_POSTS_ROLE_CONFIG_FILE") or "").strip()
+    if not path_str:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="ROLE_LINKEDIN_POSTS_ROLE_CONFIG_FILE is not set.",
+        )
+    try:
+        path = _assert_writable_role_config_path(path_str)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    body = await request.body()
+    if not body.strip():
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Empty body.",
+        )
+    try:
+        data = json.loads(body)
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Invalid JSON: {exc}",
+        ) from exc
+    if not isinstance(data, dict):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="JSON body must be an object.",
+        )
+
+    nbytes = _atomic_write_json_config_file(path, data)
+    invalidate_role_linkedin_posts_role_config_cache()
+    logger.info("Saved LinkedIn-posts role config to %s (%d bytes)", path, nbytes)
+    return JSONResponse(
+        content={
+            "status": "saved",
+            "path": str(path),
+            "bytes": nbytes,
         }
     )
 

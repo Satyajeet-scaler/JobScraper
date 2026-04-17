@@ -218,6 +218,47 @@ def _atomic_write_json_config_file(path: Path, data: Any) -> int:
     return len(raw)
 
 
+def _volume_role_config_file_status(env_key: str) -> dict[str, Any]:
+    """Resolve env path and report whether the file exists (for Railway volume checks)."""
+    raw = (os.getenv(env_key) or "").strip()
+    if not raw:
+        return {
+            "env_var": env_key,
+            "configured": False,
+            "path": None,
+            "path_allowed": None,
+            "exists": False,
+            "is_file": False,
+            "bytes": None,
+            "error": None,
+        }
+    p = Path(raw).expanduser().resolve()
+    data_vol = Path("/data").resolve()
+    app_data = (BASE_DIR / "data").resolve()
+    allowed = _is_path_under(data_vol, p) or _is_path_under(app_data, p)
+    err: str | None = None
+    if not allowed:
+        err = f"Path must be under {data_vol} or {app_data}"
+    exists = p.exists()
+    is_file = p.is_file()
+    nbytes: int | None = None
+    if is_file:
+        try:
+            nbytes = p.stat().st_size
+        except OSError as exc:
+            err = str(exc)
+    return {
+        "env_var": env_key,
+        "configured": True,
+        "path": str(p),
+        "path_allowed": allowed,
+        "exists": exists,
+        "is_file": is_file,
+        "bytes": nbytes,
+        "error": err,
+    }
+
+
 def _cron_today() -> str:
     """Return today's date as YYYY-MM-DD in the cron timezone, not the server system timezone."""
     from datetime import datetime
@@ -2523,6 +2564,34 @@ async def save_role_linkedin_posts_role_config(
             "status": "saved",
             "path": str(path),
             "bytes": nbytes,
+        }
+    )
+
+
+@app.get("/internal/volume-role-config-status")
+def get_volume_role_config_status(
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """
+    Report whether volume-backed role config JSON paths exist (and size).
+    Covers ``ROLE_PIPELINE_ROLE_CONFIG_FILE``, ``ROLE_LINKEDIN_POSTS_ROLE_CONFIG_FILE``,
+    and optional ``ROLE_PIPELINE_AI_PROMPTS_FILE`` / ``ROLE_LINKEDIN_POSTS_AI_PROMPTS_FILE``.
+    """
+    validate_internal_trigger_token(x_internal_token)
+    return JSONResponse(
+        content={
+            "role_pipeline_role_config": _volume_role_config_file_status(
+                "ROLE_PIPELINE_ROLE_CONFIG_FILE"
+            ),
+            "role_linkedin_posts_role_config": _volume_role_config_file_status(
+                "ROLE_LINKEDIN_POSTS_ROLE_CONFIG_FILE"
+            ),
+            "role_pipeline_ai_prompts": _volume_role_config_file_status(
+                "ROLE_PIPELINE_AI_PROMPTS_FILE"
+            ),
+            "role_linkedin_posts_ai_prompts": _volume_role_config_file_status(
+                "ROLE_LINKEDIN_POSTS_AI_PROMPTS_FILE"
+            ),
         }
     )
 

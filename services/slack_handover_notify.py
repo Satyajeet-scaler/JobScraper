@@ -701,15 +701,19 @@ def format_recruiter_detail_lead(
     job_url: str,
     recruiter_profile_url: str,
     candidate_match_count: int,
+    *,
+    include_candidate_match: bool = True,
 ) -> str:
-    return (
+    body = (
         f"{owner_tag}\n"
         f"Company: {company}\n"
         f"Role: {role}\n"
         f"Job URL: {job_url}\n"
         f"Recruiter Profile: {recruiter_profile_url}\n"
-        f"Candidate match — {candidate_match_count} candidate(s) with AI score > 70"
     )
+    if include_candidate_match:
+        body += f"Candidate match — {candidate_match_count} candidate(s) with AI score > 70"
+    return body.rstrip("\n")
 
 
 def format_internal_poc_lead(
@@ -719,15 +723,19 @@ def format_internal_poc_lead(
     job_url: str,
     poc_email: str,
     candidate_match_count: int,
+    *,
+    include_candidate_match: bool = True,
 ) -> str:
-    return (
+    body = (
         f"{owner_tag}\n"
         f"Company: {company}\n"
         f"Role: {role}\n"
         f"Job URL: {job_url}\n"
         f"Internal POC Email: {poc_email}\n"
-        f"Candidate match — {candidate_match_count} candidate(s) with AI score > 70"
     )
+    if include_candidate_match:
+        body += f"Candidate match — {candidate_match_count} candidate(s) with AI score > 70"
+    return body.rstrip("\n")
 
 
 def send_handover_case_batch(

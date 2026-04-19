@@ -5,25 +5,18 @@ from datetime import date
 from typing import Any
 
 from services.google_sheets import GoogleSheetsWriter
-from services.handover_owners import (
-    load_internal_poc_tag_rows,
-    load_owner_rows_for_handover,
-    worksheet_row_dicts,
-)
+from services.handover_owners import load_owner_rows_for_handover, worksheet_row_dicts
 from services.role_pipeline import _role_slug
 from services.role_recruiter_info_service import role_recruiters_tab_name_for_role
-from services.slack_relevant_jobs_handover import _resolve_min_candidate_match
+from services.slack_relevant_jobs_handover import (
+    _resolve_min_candidate_match,
+    _role_includes_candidate_match_in_slack,
+)
 from services.slack_handover_notify import (
-    HEADING_INTERNAL_POC,
     HEADING_RECRUITER_DETAIL,
-    format_internal_poc_lead,
     format_recruiter_detail_lead,
-    internal_poc_email_owner_map,
-    internal_poc_owner_tag_line,
     load_candidate_match_count_map_for_role,
-    match_internal_poc_owners_ordered,
     owner_tag_for_handover,
-    persist_assigned_owner_from_email_map,
     persist_assigned_owner_round_robin,
     recruiter_row_role_label_for_slack,
     send_slack_text,
@@ -39,8 +32,12 @@ def send_role_handover_notifications(
     role: str | None = None,
     upstream_run_id: str | None = None,
     send_recruiter_info: bool = True,
-    send_internal_poc: bool = True,
 ) -> dict[str, Any]:
+    """Post Case 3 (recruiter LinkedIn profile) Slack handovers for a role.
+
+    Internal POC (Case 2) Slack messages are intentionally not sent from this
+    notifier; use the global ``send_handover_notifications`` if needed.
+    """
     resolved_date = (run_date or date.today().isoformat()).strip()
     resolved_role = (role or "").strip()
     if not resolved_role:
@@ -49,6 +46,7 @@ def send_role_handover_notifications(
     recruiters_tab = role_recruiters_tab_name_for_role(role=resolved_role, run_date=resolved_date)
     defaults = slack_notify_defaults_from_env()
     min_candidate_match = _resolve_min_candidate_match(resolved_role)
+    include_cm_slack = _role_includes_candidate_match_in_slack(resolved_role)
     out = {
         "run_date": resolved_date,
         "role": resolved_role,
@@ -128,7 +126,15 @@ def send_role_handover_notifications(
                     job_url = (row.get("job_url") or "-").strip() or "-"
                     profile_url = (row.get("recruiter_profile_url") or "-").strip() or "-"
                     count = candidate_match_count_map.get(_normalize_job_key(job_url), 0)
-                    msg = format_recruiter_detail_lead(tag, company, role_category, job_url, profile_url, count)
+                    msg = format_recruiter_detail_lead(
+                        tag,
+                        company,
+                        role_category,
+                        job_url,
+                        profile_url,
+                        count,
+                        include_candidate_match=include_cm_slack,
+                    )
                     if send_slack_text(msg, defaults=defaults, sleep_after=1.0):
                         out["recruiter_messages_sent"] += 1
                         sent_case3_keys.add(_recruiter_row_identity(row))
@@ -147,37 +153,6 @@ def send_role_handover_notifications(
             ),
         )
         out["assigned_owner_rows_updated"] += len(sent_case3_keys)
-
-    sent_case2_keys: set[tuple[str, str, str]] = set()
-    if send_internal_poc and case2:
-        if send_slack_text(HEADING_INTERNAL_POC, defaults=defaults, sleep_after=1.0):
-            out["recruiter_messages_sent"] += 1
-            poc_email_map = internal_poc_email_owner_map(load_internal_poc_tag_rows())
-            for row in case2:
-                raw_email = (row.get("recruiter_email") or "").strip()
-                matched_owners = match_internal_poc_owners_ordered(raw_email, poc_email_map)
-                tag = internal_poc_owner_tag_line(matched_owners)
-                company = (row.get("company") or "-").strip() or "-"
-                role_category = recruiter_row_role_label_for_slack(row)
-                job_url = (row.get("job_url") or "-").strip() or "-"
-                count = candidate_match_count_map.get(_normalize_job_key(job_url), 0)
-                msg = format_internal_poc_lead(tag, company, role_category, job_url, raw_email or "-", count)
-                if send_slack_text(msg, defaults=defaults, sleep_after=1.0):
-                    out["recruiter_messages_sent"] += 1
-                    sent_case2_keys.add(_recruiter_case2_identity(row))
-            if sent_case2_keys and spreadsheet_id:
-                persist_assigned_owner_from_email_map(
-                    spreadsheet_id=spreadsheet_id,
-                    worksheet_title=recruiters_tab,
-                    email_map=poc_email_map,
-                    selector=lambda row: _is_recruiter_case2_selected(
-                        row,
-                        run_date=resolved_date,
-                        upstream_run_id=upstream_run_id,
-                        selected_keys=sent_case2_keys,
-                    ),
-                )
-                out["assigned_owner_rows_updated"] += len(sent_case2_keys)
 
     return out
 
@@ -260,13 +235,6 @@ def _recruiter_row_identity(row: dict[str, str]) -> tuple[str, str, str, str]:
     return (job, profile, email, source)
 
 
-def _recruiter_case2_identity(row: dict[str, str]) -> tuple[str, str, str]:
-    job = _normalize_job_key(str(row.get("job_url") or ""))
-    email = str(row.get("recruiter_email") or "").strip().lower()
-    source = str(row.get("recruiter_source") or "").strip().lower()
-    return (job, email, source)
-
-
 def _is_recruiter_case3_selected(
     row: dict[str, str],
     *,
@@ -286,27 +254,3 @@ def _is_recruiter_case3_selected(
         return False
     key = _recruiter_row_identity(row)
     return key in selected_keys
-
-
-def _is_recruiter_case2_selected(
-    row: dict[str, str],
-    *,
-    run_date: str,
-    upstream_run_id: str | None,
-    selected_keys: set[tuple[str, str, str]],
-) -> bool:
-    row_date = (row.get("run_date") or "").strip()
-    if row_date and row_date != run_date:
-        return False
-    if upstream_run_id:
-        if (row.get("role_pipeline_upstream_run_id") or "").strip() != upstream_run_id:
-            return False
-    has_profile = bool((row.get("recruiter_profile_url") or "").strip())
-    has_email = bool((row.get("recruiter_email") or "").strip())
-    if has_profile or not has_email:
-        return False
-    if not _is_assigned_owner_empty(row):
-        return False
-    key = _recruiter_case2_identity(row)
-    return key in selected_keys
-

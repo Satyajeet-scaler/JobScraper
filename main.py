@@ -1961,17 +1961,17 @@ def internal_send_role_slack_handover(
     x_internal_token: Optional[str] = Header(default=None),
 ) -> JSONResponse:
     """
-    Send role-pipeline Slack handovers (same cases as legacy ``send_handover_notifications``).
+    Send role-pipeline Slack handovers (recruiter LinkedIn profile case + LinkedIn posts).
 
-    Reads ``role_recruiters_info_{role_slug}_{run_date}`` for recruiter profile /
-    internal POC leads, then the role LinkedIn relevant tab for post leads.
+    Reads ``role_recruiters_info_{role_slug}_{run_date}`` for recruiter profile leads,
+    then the role LinkedIn relevant tab for post leads. Internal POC (email-only) leads
+    are not posted to Slack from this endpoint.
 
     JSON body:
     - ``role``: role value (default: ROLE_PIPELINE_CRON_ROLE)
     - ``run_date``: YYYY-MM-DD (default: today in cron timezone)
     - ``send_linkedin_post``: bool (default true)
     - ``send_recruiter_info``: recruiter LinkedIn profile case (default true)
-    - ``send_internal_poc``: internal POC email case (default true)
     - ``upstream_run_id``: optional role classify run_id to narrow recruiter and LinkedIn rows
     """
     validate_internal_trigger_token(x_internal_token)
@@ -2002,14 +2002,12 @@ def internal_send_role_slack_handover(
 
     send_linkedin_post = _bool_flag("send_linkedin_post", True)
     send_recruiter_info = _bool_flag("send_recruiter_info", True)
-    send_internal_poc = _bool_flag("send_internal_poc", True)
 
     recruiter_summary = send_role_handover_notifications(
         run_date=run_date,
         role=resolved_role,
         upstream_run_id=upstream_run_id,
         send_recruiter_info=send_recruiter_info,
-        send_internal_poc=send_internal_poc,
     )
 
     linkedin_summary: dict[str, Any] = {
@@ -2033,7 +2031,6 @@ def internal_send_role_slack_handover(
                 "upstream_run_id": upstream_run_id or "",
                 "send_linkedin_post": send_linkedin_post,
                 "send_recruiter_info": send_recruiter_info,
-                "send_internal_poc": send_internal_poc,
                 "role_recruiter_handover_summary": recruiter_summary,
                 "role_linkedin_posts_notify_summary": linkedin_summary,
             }

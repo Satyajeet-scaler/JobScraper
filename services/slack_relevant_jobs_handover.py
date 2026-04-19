@@ -6,7 +6,7 @@ This service reads rows directly from a role's relevant-jobs tab
 and posts incoming lead messages to Slack with per-role filtering rules.
 
 Per-role rules (``handover.min_candidate_match``):
-  - Data Analyst:       all relevant jobs are handed over.
+  - Data Analyst:       all relevant jobs are handed over (Slack text omits candidate-match line).
   - Software Developer: only jobs with candidate match count >= 10.
   - DevOps:             only jobs with candidate match count >= 10.
 
@@ -107,6 +107,7 @@ def send_relevant_jobs_handover(
     )
 
     min_count = out["min_candidate_match"]
+    include_cm_slack = _role_includes_candidate_match_in_slack(resolved_role)
     eligible: list[dict[str, str]] = []
     for row in relevant_rows:
         if not _is_handover_sent_empty(row):
@@ -165,6 +166,7 @@ def send_relevant_jobs_handover(
                 role=lead_role,
                 job_url=job_url,
                 candidate_match_count=count,
+                include_candidate_match=include_cm_slack,
             )
             if send_slack_text(msg, defaults=defaults, sleep_after=1.0):
                 out["messages_sent"] += 1
@@ -191,6 +193,7 @@ def format_relevant_jobs_lead(
     job_url: str,
     candidate_match_count: int,
     owner_tag: str | None = None,
+    include_candidate_match: bool = True,
 ) -> str:
     """Slack message body for a single relevant-jobs lead.
 
@@ -200,13 +203,19 @@ def format_relevant_jobs_lead(
     legacy single-message format with the tag inlined.
     """
     head = f"{owner_tag.strip()}\n" if owner_tag and owner_tag.strip() else ""
-    return (
+    body = (
         f"{head}"
         f"Company: {company}\n"
         f"Role: {role}\n"
         f"Job Url: {job_url}\n"
-        f"Candidate match: {candidate_match_count} candidate(s) with AI score > 70"
     )
+    if include_candidate_match:
+        body += f"Candidate match: {candidate_match_count} candidate(s) with AI score > 70"
+    return body.rstrip("\n")
+
+
+def _role_includes_candidate_match_in_slack(role: str) -> bool:
+    return role.strip().lower() != "data analyst"
 
 
 # ---------------------------------------------------------------------------

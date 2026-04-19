@@ -701,7 +701,8 @@ def _load_role_config_map() -> dict[str, dict[str, dict[str, Any]]]:
       are posted (``0`` = all jobs). Overridable per role; defaults match
       ``slack_relevant_jobs_handover.DEFAULT_HANDOVER_RULES``. Also used by
       ``/internal/send-role-relevant-jobs-handover`` for bulk ``role_relevant_*``
-      messages.
+      messages. Internal POC email-only leads are not posted by the role
+      recruiter notifier; Data Analyst Slack bodies omit the candidate-match line.
     """
     global _role_pipeline_config_file_cache, _role_pipeline_config_file_cache_valid
     file_raw = (os.getenv("ROLE_PIPELINE_ROLE_CONFIG_FILE") or "").strip()

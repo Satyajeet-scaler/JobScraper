@@ -337,7 +337,13 @@ class HireCafeAdapter:
         role_config: dict[str, Any],
     ) -> list[dict[str, Any]]:
         from services.hire_cafe import normalize_hirecafe_item, scrape_hirecafe_jobs
-        search_url = (role_config.get("search_url") or "").strip() or None
+        search_url = (
+            role_config.get("search_url")
+            or role_config.get("url")
+            or role_config.get("hiring_cafe_url")
+            or ""
+        )
+        search_url = str(search_url).strip() or None
 
         max_samples = int(role_config.get("max_samples") or os.getenv("HIRECAFE_MAX_SAMPLES", "200"))
 

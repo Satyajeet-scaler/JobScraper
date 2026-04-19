@@ -19,6 +19,9 @@
       "results_wanted": 50,
       "max_pages": 20
     },
+    "hirecafe": {
+      "search_url": "https://hiring.cafe/?searchState=%7B%22locations%22%3A%5B%7B%22formatted_address%22%3A%22India%22%2C%22types%22%3A%5B%22country%22%5D%2C%22geometry%22%3A%7B%22location%22%3A%7B%22lat%22%3A19.0748%2C%22lon%22%3A72.8856%7D%7D%2C%22id%22%3A%22user_country%22%2C%22address_components%22%3A%5B%7B%22long_name%22%3A%22India%22%2C%22short_name%22%3A%22IN%22%2C%22types%22%3A%5B%22country%22%5D%7D%5D%2C%22options%22%3A%7B%22flexible_regions%22%3A%5B%22anywhere_in_continent%22%2C%22anywhere_in_world%22%5D%7D%7D%5D%2C%22jobTitleQuery%22%3A%22%5C%22data+analyst%5C%22%22%7D&page=4"
+    },
     "hirist": {
       "url": "https://www.hirist.tech/c/data-analytics-bi-jobs?ref=topnavigation",
       "role_query": "hirist_data_analytics_bi",
@@ -51,6 +54,9 @@
       "results_wanted": 50,
       "max_pages": 20
     },
+    "hirecafe": {
+      "search_url": "https://hiring.cafe/?searchState=%7B%22dateFetchedPastNDays%22%3A2%2C%22locations%22%3A%5B%7B%22id%22%3A%22lhY1yZQBoEtHp_8UEq3V%22%2C%22types%22%3A%5B%22country%22%5D%2C%22address_components%22%3A%5B%7B%22long_name%22%3A%22India%22%2C%22short_name%22%3A%22IN%22%2C%22types%22%3A%5B%22country%22%5D%7D%5D%2C%22formatted_address%22%3A%22India%22%2C%22population%22%3A1352617328%2C%22workplace_types%22%3A%5B%5D%2C%22options%22%3A%7B%22flexible_regions%22%3A%5B%22anywhere_in_continent%22%2C%22anywhere_in_world%22%5D%7D%7D%5D%2C%22jobTitleQuery%22%3A%22%5C%22software+developer%5C%22%22%7D"
+    },
     "hirist": {
       "url": "https://www.hirist.tech/c/backend-development-jobs?ref=topnavigation",
       "role_query": "hirist_backend_development",
@@ -82,6 +88,9 @@
       "location": "india",
       "results_wanted": 50,
       "max_pages": 20
+    },
+    "hirecafe": {
+      "search_url": "https://hiring.cafe/?searchState=%7B%22locations%22%3A%5B%7B%22id%22%3A%22lhY1yZQBoEtHp_8UEq3V%22%2C%22types%22%3A%5B%22country%22%5D%2C%22address_components%22%3A%5B%7B%22long_name%22%3A%22India%22%2C%22short_name%22%3A%22IN%22%2C%22types%22%3A%5B%22country%22%5D%7D%5D%2C%22formatted_address%22%3A%22India%22%2C%22population%22%3A1352617328%2C%22workplace_types%22%3A%5B%5D%2C%22options%22%3A%7B%22flexible_regions%22%3A%5B%22anywhere_in_continent%22%2C%22anywhere_in_world%22%5D%7D%7D%5D%2C%22dateFetchedPastNDays%22%3A2%2C%22jobTitleQuery%22%3A%22%5C%22devops%5C%22%22%7D"
     },
     "hirist": {
       "url": "https://www.hirist.tech/k/it-operations-jobs?ref=topnavigation",

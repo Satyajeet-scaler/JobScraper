@@ -22,6 +22,12 @@ logger = logging.getLogger(__name__)
 ROLE_SCRAPE_RUN_METRICS: dict[str, dict[str, Any]] = {}
 ROLE_CLASSIFY_RUN_METRICS: dict[str, dict[str, Any]] = {}
 ROLE_PIPELINE_ALLOWED_SOURCES = SCRAPER_REGISTRY.available_sources()
+ROLE_PIPELINE_SOURCE_ALIASES: dict[str, str] = {
+    "hiring.cafe": "hirecafe",
+    "hiring_cafe": "hirecafe",
+    "hiringcafe": "hirecafe",
+    "hire_cafe": "hirecafe",
+}
 
 # Unified per-role / per-scraper config. Overridable via env
 # ROLE_PIPELINE_ROLE_CONFIG_JSON or ROLE_PIPELINE_ROLE_CONFIG_FILE (see _load_role_config_map).
@@ -406,7 +412,11 @@ def _scrape_role_jobs(role: str, enabled_sources: set[str]) -> list[dict[str, An
 def _resolve_sources(sources: list[str] | None) -> set[str]:
     if not sources:
         return set(ROLE_PIPELINE_ALLOWED_SOURCES)
-    normalized = {(source or "").strip().lower() for source in sources if (source or "").strip()}
+    normalized = {
+        _canonical_role_pipeline_source_name((source or "").strip().lower())
+        for source in sources
+        if (source or "").strip()
+    }
     if not normalized:
         return set(ROLE_PIPELINE_ALLOWED_SOURCES)
     invalid = sorted(normalized - ROLE_PIPELINE_ALLOWED_SOURCES)
@@ -648,10 +658,27 @@ def _normalize_role_pipeline_parsed(parsed: dict[str, Any]) -> dict[str, dict[st
             if key_lower in reserved_role_keys:
                 normalised_sources[key_lower] = src_val
                 continue
+
+            canonical_source = _canonical_role_pipeline_source_name(key_lower)
             if isinstance(src_val, str):
-                normalised_sources[key_lower] = {"query": src_val.strip()}
+                value = src_val.strip()
+                if canonical_source == "hirecafe":
+                    normalised_sources[canonical_source] = {"search_url": value}
+                else:
+                    normalised_sources[canonical_source] = {"query": value}
             elif isinstance(src_val, dict):
-                normalised_sources[key_lower] = src_val
+                if canonical_source == "hirecafe":
+                    cfg = dict(src_val)
+                    search_url = (
+                        cfg.get("search_url")
+                        or cfg.get("url")
+                        or cfg.get("hiring_cafe_url")
+                    )
+                    if isinstance(search_url, str) and search_url.strip():
+                        cfg["search_url"] = search_url.strip()
+                    normalised_sources[canonical_source] = cfg
+                else:
+                    normalised_sources[canonical_source] = src_val
             else:
                 logger.warning(
                     "ROLE_PIPELINE_ROLE_CONFIG_JSON: ignoring invalid value for role=%s source=%s",
@@ -660,6 +687,11 @@ def _normalize_role_pipeline_parsed(parsed: dict[str, Any]) -> dict[str, dict[st
         if normalised_sources:
             out[role_key.strip().lower()] = normalised_sources
     return out
+
+
+def _canonical_role_pipeline_source_name(source_name: str) -> str:
+    key = (source_name or "").strip().lower()
+    return ROLE_PIPELINE_SOURCE_ALIASES.get(key, key)
 
 
 def _load_role_config_map_from_env() -> dict[str, dict[str, Any]]:

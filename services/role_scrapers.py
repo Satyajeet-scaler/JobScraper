@@ -337,25 +337,18 @@ class HireCafeAdapter:
         role_config: dict[str, Any],
     ) -> list[dict[str, Any]]:
         from services.hire_cafe import normalize_hirecafe_item, scrape_hirecafe_jobs
-        import services.hire_cafe as hire_cafe_module
-
-        # Allow per-role search URL override (otherwise use module default / env).
-        original_url = hire_cafe_module.HIRECAFE_SEARCH_URL
-        search_url = role_config.get("search_url")
-        if search_url:
-            hire_cafe_module.HIRECAFE_SEARCH_URL = search_url
+        search_url = (role_config.get("search_url") or "").strip() or None
 
         max_samples = int(role_config.get("max_samples") or os.getenv("HIRECAFE_MAX_SAMPLES", "200"))
 
-        try:
-            raw_items = _retry(
-                action=lambda: scrape_hirecafe_jobs(max_samples=max_samples),
-                retries=2,
-                initial_delay_seconds=5.0,
-            )
-        finally:
-            # Restore original URL so other callers are unaffected.
-            hire_cafe_module.HIRECAFE_SEARCH_URL = original_url
+        raw_items = _retry(
+            action=lambda: scrape_hirecafe_jobs(
+                max_samples=max_samples,
+                search_url=search_url,
+            ),
+            retries=2,
+            initial_delay_seconds=5.0,
+        )
 
         jobs: list[dict[str, Any]] = []
         for raw in raw_items:

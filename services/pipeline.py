@@ -323,10 +323,14 @@ def _scrape_target_jobs() -> list[dict[str, Any]]:
     # Default behavior is enabled; only skip when explicitly set to false/0/no.
     if os.getenv("HIRECAFE_ENABLED", "true").lower() not in ("0", "false", "no"):
         hirecafe_max = int(os.getenv("HIRECAFE_MAX_SAMPLES", "200"))
+        hirecafe_search_url = os.getenv("HIRECAFE_SEARCH_URL", "").strip() or None
         logger.info("hirecafe scrape starting max_samples=%s", hirecafe_max)
         try:
             hirecafe_raw = _retry(
-                action=lambda: scrape_hirecafe_jobs(max_samples=hirecafe_max),
+                action=lambda: scrape_hirecafe_jobs(
+                    max_samples=hirecafe_max,
+                    search_url=hirecafe_search_url,
+                ),
                 retries=2,
                 initial_delay_seconds=5.0,
             )

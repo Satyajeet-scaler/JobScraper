@@ -21,7 +21,10 @@ def _sheet_run_date_ist() -> str:
     return datetime.now(tz).strftime("%Y-%m-%d")
 
 
-def run_hirecafe_scrape_only_pipeline(run_id: str | None = None) -> dict[str, Any]:
+def run_hirecafe_scrape_only_pipeline(
+    run_id: str | None = None,
+    search_url: str | None = None,
+) -> dict[str, Any]:
     """
     Scrape only HireCafe and write normalized rows to a dedicated sheet tab.
     No classification and no Slack delivery.
@@ -43,7 +46,10 @@ def run_hirecafe_scrape_only_pipeline(run_id: str | None = None) -> dict[str, An
             pipeline_run_id,
             max_samples,
         )
-        raw_jobs = scrape_hirecafe_jobs(max_samples=max_samples)
+        raw_jobs = scrape_hirecafe_jobs(
+            max_samples=max_samples,
+            search_url=(search_url or "").strip() or None,
+        )
 
         enriched_rows: list[dict[str, Any]] = []
         for raw in raw_jobs:

@@ -9,7 +9,9 @@ be launched via ``xvfb-run -a``).
 import html
 import json
 import logging
+import math
 import os
+import random
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -19,8 +21,6 @@ import undetected_chromedriver as uc
 from bs4 import BeautifulSoup
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 
 from services.hirecafe_carousel import (
     _click_carousel_next,
@@ -41,8 +41,21 @@ CLOUDFLARE_WAIT_SECONDS = int(os.getenv("HIRECAFE_CLOUDFLARE_WAIT_SECONDS", "10"
 CLOUDFLARE_CLEAR_TIMEOUT_SECONDS = int(os.getenv("HIRECAFE_CF_CLEAR_TIMEOUT_SECONDS", "35"))
 POST_VERIFY_WAIT_SECONDS = int(os.getenv("HIRECAFE_POST_VERIFY_WAIT_SECONDS", "8"))
 
-HARDCODED_CF_CLICK_X = int(os.getenv("HIRECAFE_CF_CLICK_X", "544"))
-HARDCODED_CF_CLICK_Y = int(os.getenv("HIRECAFE_CF_CLICK_Y", "334"))
+HARDCODED_CF_CLICK_X = int(os.getenv("HIRECAFE_CF_CLICK_X", "532"))
+HARDCODED_CF_CLICK_Y = int(os.getenv("HIRECAFE_CF_CLICK_Y", "336"))
+HIRECAFE_CF_MULTI_CLICK_DELAY_SECONDS = float(
+    os.getenv("HIRECAFE_CF_MULTI_CLICK_DELAY_SECONDS", "0.9")
+)
+HIRECAFE_CF_POST_CLICK_SETTLE_SECONDS = float(
+    os.getenv("HIRECAFE_CF_POST_CLICK_SETTLE_SECONDS", "1.8")
+)
+HIRECAFE_INITIAL_PAGE_EXTRA_WAIT_SECONDS = float(
+    os.getenv("HIRECAFE_INITIAL_PAGE_EXTRA_WAIT_SECONDS", "0")
+)
+HIRECAFE_CHALLENGE_STABILIZE_SECONDS = float(
+    os.getenv("HIRECAFE_CHALLENGE_STABILIZE_SECONDS", "0")
+)
+HIRECAFE_CF_CLICK_STRATEGY_VERSION = "2026-04-20.v4.verify-text-square-probe"
 
 SCROLL_PIXELS = int(os.getenv("HIRECAFE_SCROLL_PIXELS", "1200"))
 MIN_SCROLL_DELAY_SECONDS = float(os.getenv("HIRECAFE_MIN_SCROLL_DELAY_SECONDS", "0.7"))
@@ -65,6 +78,21 @@ HIRECAFE_DETECTABLE_HEADLESS = os.getenv("HIRECAFE_DETECTABLE_HEADLESS", "true")
 )
 HIRECAFE_CHROMEDRIVER_PATH = os.getenv("HIRECAFE_CHROMEDRIVER_PATH", "").strip()
 HIRECAFE_CHROME_BINARY = os.getenv("HIRECAFE_CHROME_BINARY", "").strip()
+HIRECAFE_USE_SYSTEM_BINARIES = os.getenv("HIRECAFE_USE_SYSTEM_BINARIES", "auto").strip().lower()
+HIRECAFE_CHROME_USER_DATA_DIR = os.getenv("HIRECAFE_CHROME_USER_DATA_DIR", "").strip()
+HIRECAFE_CHROME_PROFILE_DIR = os.getenv("HIRECAFE_CHROME_PROFILE_DIR", "").strip()
+HIRECAFE_HEADLESS = os.getenv("HIRECAFE_HEADLESS", "true").strip().lower() not in (
+    "false", "0", "no",
+)
+_HIRECAFE_UC_VERSION_MAIN_RAW = os.getenv("HIRECAFE_UC_VERSION_MAIN", "147").strip()
+try:
+    HIRECAFE_UC_VERSION_MAIN: int | None = int(_HIRECAFE_UC_VERSION_MAIN_RAW)
+except ValueError:
+    logger.warning(
+        "hirecafe invalid HIRECAFE_UC_VERSION_MAIN=%r; falling back to uc auto version",
+        _HIRECAFE_UC_VERSION_MAIN_RAW,
+    )
+    HIRECAFE_UC_VERSION_MAIN = None
 
 HIRECAFE_OBSERVE_PAGES = os.getenv("HIRECAFE_OBSERVE_PAGES", "false").lower() not in (
     "false", "0", "no",
@@ -73,6 +101,7 @@ HIRECAFE_OBSERVE_DIR = os.getenv(
     "HIRECAFE_OBSERVE_DIR",
     "debug_screenshots/hirecafe_cloudflare",
 ).strip()
+_HIRECAFE_OBSERVE_STEP_COUNTER = 0
 
 HIRECAFE_PAGE_READY_TIMEOUT_SECONDS = int(
     os.getenv("HIRECAFE_PAGE_READY_TIMEOUT_SECONDS", "45")
@@ -92,6 +121,12 @@ HIRECAFE_PAGINATION_BOTTOM_SCROLL_PAUSE_SECONDS = float(
     os.getenv("HIRECAFE_PAGINATION_BOTTOM_SCROLL_PAUSE_SECONDS", "0.35")
 )
 
+_PRODUCTION_ENV_KEYS = (
+    "RAILWAY_ENVIRONMENT",
+    "RAILWAY_PROJECT_ID",
+    "RAILWAY_SERVICE_ID",
+)
+
 CLOUDFLARE_MARKERS = (
     "just a moment",
     "performing security verification",
@@ -109,6 +144,185 @@ CLOUDFLARE_HTML_MARKERS = (
     "challenge-success-text",
     "challenge-error-text",
 )
+
+# ---------------------------------------------------------------------------
+#  Browser identity constants — must match the Chromium version in the Docker
+#  image (Debian bookworm chromium package ≈ 131).
+# ---------------------------------------------------------------------------
+_CHROME_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36"
+)
+_CHROME_SEC_CH_UA = '"Chromium";v="147", "Not_A Brand";v="24"'
+_CHROME_SEC_CH_UA_PLATFORM = '"Linux"'
+
+
+# ---------------------------------------------------------------------------
+#  Stealth JS injection — runs before any page loads.
+# ---------------------------------------------------------------------------
+_STEALTH_JS = r"""
+// --- navigator.webdriver ---------------------------------------------------
+delete Object.getPrototypeOf(navigator).webdriver;
+
+// --- navigator.hardwareConcurrency ----------------------------------------
+Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+
+// --- navigator.deviceMemory -----------------------------------------------
+Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+
+// --- WebGL vendor / renderer -----------------------------------------------
+(function() {
+    const getParam = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(param) {
+        if (param === 37445) return 'Google Inc. (NVIDIA)';
+        if (param === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 SUPER, OpenGL 4.5)';
+        return getParam.call(this, param);
+    };
+    if (typeof WebGL2RenderingContext !== 'undefined') {
+        const getParam2 = WebGL2RenderingContext.prototype.getParameter;
+        WebGL2RenderingContext.prototype.getParameter = function(param) {
+            if (param === 37445) return 'Google Inc. (NVIDIA)';
+            if (param === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 SUPER, OpenGL 4.5)';
+            return getParam2.call(this, param);
+        };
+    }
+})();
+
+// --- navigator.plugins (non-empty) -----------------------------------------
+Object.defineProperty(navigator, 'plugins', {
+    get: () => {
+        const arr = [{
+            name: 'Chrome PDF Plugin',
+            description: 'Portable Document Format',
+            filename: 'internal-pdf-viewer',
+            length: 1,
+            0: {type: 'application/x-google-chrome-pdf', suffixes: 'pdf',
+                description: 'Portable Document Format', enabledPlugin: null}
+        }];
+        arr.refresh = () => {};
+        Object.setPrototypeOf(arr, PluginArray.prototype);
+        return arr;
+    }
+});
+
+// --- navigator.permissions.query -------------------------------------------
+(function() {
+    const origQuery = navigator.permissions && navigator.permissions.query;
+    if (origQuery) {
+        navigator.permissions.query = function(desc) {
+            if (desc && desc.name === 'notifications') {
+                return Promise.resolve({state: Notification.permission || 'default'});
+            }
+            return origQuery.call(this, desc);
+        };
+    }
+})();
+"""
+
+
+def _inject_stealth_scripts(driver) -> None:
+    """Inject anti-fingerprint JS patches via CDP before any page loads."""
+    try:
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": _STEALTH_JS},
+        )
+        # Override screen metrics to hide headless 800x600 defaults
+        driver.execute_cdp_cmd(
+            "Emulation.setDeviceMetricsOverride",
+            {
+                "width": 1920,
+                "height": 1080,
+                "deviceScaleFactor": 1,
+                "mobile": False,
+                "screenWidth": 1920,
+                "screenHeight": 1080,
+            }
+        )
+        logger.info("hirecafe stealth scripts injected")
+    except Exception as exc:
+        logger.warning(
+            "hirecafe stealth script injection failed: %s",
+            type(exc).__name__,
+        )
+
+    # Align HTTP headers with the UA string.
+    try:
+        driver.execute_cdp_cmd(
+            "Network.setExtraHTTPHeaders",
+            {
+                "headers": {
+                    "sec-ch-ua": _CHROME_SEC_CH_UA,
+                    "sec-ch-ua-platform": _CHROME_SEC_CH_UA_PLATFORM,
+                }
+            },
+        )
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+#  Bézier-curve human-like mouse movement helpers
+# ---------------------------------------------------------------------------
+
+def _bezier_point(
+    t: float,
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    p3: tuple[float, float],
+) -> tuple[float, float]:
+    """Evaluate a cubic Bézier curve at parameter *t* ∈ [0, 1]."""
+    u = 1.0 - t
+    tt = t * t
+    uu = u * u
+    uuu = uu * u
+    ttt = tt * t
+    x = uuu * p0[0] + 3 * uu * t * p1[0] + 3 * u * tt * p2[0] + ttt * p3[0]
+    y = uuu * p0[1] + 3 * uu * t * p1[1] + 3 * u * tt * p2[1] + ttt * p3[1]
+    return (x, y)
+
+
+def _human_mouse_path(
+    x0: int, y0: int, x1: int, y1: int,
+    steps: int | None = None,
+) -> list[tuple[int, int]]:
+    """Generate a list of *(x, y)* waypoints along a jittered cubic Bézier
+    curve from *(x0, y0)* to *(x1, y1)*."""
+    if steps is None:
+        steps = random.randint(20, 40)
+
+    dx = x1 - x0
+    dy = y1 - y0
+    dist = math.hypot(dx, dy) or 1.0
+
+    # Two random control-points that bow the curve naturally.
+    spread = max(40, dist * 0.35)
+    cp1 = (
+        x0 + dx * random.uniform(0.15, 0.45) + random.gauss(0, spread * 0.3),
+        y0 + dy * random.uniform(0.0, 0.35) + random.gauss(0, spread * 0.3),
+    )
+    cp2 = (
+        x0 + dx * random.uniform(0.55, 0.85) + random.gauss(0, spread * 0.25),
+        y0 + dy * random.uniform(0.65, 1.0) + random.gauss(0, spread * 0.25),
+    )
+
+    p0 = (float(x0), float(y0))
+    p3 = (float(x1), float(y1))
+    path: list[tuple[int, int]] = []
+    for i in range(steps + 1):
+        t = i / steps
+        bx, by = _bezier_point(t, p0, cp1, cp2, p3)
+        # Gaussian jitter (±1-3 px) except at endpoints.
+        if 0 < i < steps:
+            bx += random.gauss(0, 1.5)
+            by += random.gauss(0, 1.5)
+        path.append((int(round(bx)), int(round(by))))
+
+    # Always end exactly on target.
+    path[-1] = (x1, y1)
+    return path
+
 
 
 def _probe_cloudflare_challenge(driver) -> dict[str, Any]:
@@ -158,7 +372,16 @@ def _probe_cloudflare_challenge(driver) -> dict[str, Any]:
             "cf_meta_refresh: !!document.querySelector(\"meta[http-equiv='refresh'][content]\"),"
             "cf_ray_id_text: /ray id:/.test(bodyText),"
             "cf_verify_copy: /performing security verification|this website uses a security service|just a moment|security check|verify you are human|checking your browser/.test(bodyText),"
-            "cf_challenge_text: /just a moment|security check|verify you are human|performing security verification|checking your browser/.test(bodyText)"
+            "cf_challenge_text: /just a moment|security check|verify you are human|performing security verification|checking your browser/.test(bodyText),"
+            "cf_turnstile_success: (function(){"
+            "  var inp=document.querySelector(\"input[name='cf-turnstile-response']\");"
+            "  if(inp && inp.value && inp.value.length>30) return 'token_present';"
+            "  var st=document.querySelector('#challenge-success-text');"
+            "  if(st && (st.offsetWidth > 0 || st.offsetHeight > 0)) return 'success_text_visible';"
+            "  var iframes=document.querySelectorAll(\"iframe[src*='challenges.cloudflare.com']\");"
+            "  for(var fr of iframes){try{if(fr.getAttribute('data-cdata')&&fr.style.display!=='none') return 'iframe_active';}catch(e){}}"
+            "  return false;"
+            "})()"
             "};"
         ) or {}
     except Exception:
@@ -189,6 +412,7 @@ def _probe_cloudflare_challenge(driver) -> dict[str, Any]:
     state["strong_signal"] = strong_signal
     state["signal_score"] = (3 if strong_signal else 0) + weak_score
     state["active"] = bool(strong_signal or weak_score >= 2)
+    state["turnstile_success"] = selector_hits.get("cf_turnstile_success") or False
     return state
 
 
@@ -206,6 +430,16 @@ def _wait_for_cloudflare_clearance(
     while time.time() < deadline:
         last_state = _probe_cloudflare_challenge(driver)
         if not last_state.get("active"):
+            # Also verify the Turnstile token appeared (poll up to 5 s).
+            if last_state.get("turnstile_success"):
+                return True, last_state
+            ts_deadline = time.time() + 5.0
+            while time.time() < ts_deadline:
+                last_state = _probe_cloudflare_challenge(driver)
+                if last_state.get("turnstile_success"):
+                    return True, last_state
+                time.sleep(0.5)
+            # Even without a token, if the challenge is gone we accept it.
             return True, last_state
         time.sleep(max(0.1, poll_interval_seconds))
     last_state = _probe_cloudflare_challenge(driver)
@@ -296,9 +530,12 @@ def _capture_observation_artifacts(
             output_dir = Path.cwd() / output_dir
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        global _HIRECAFE_OBSERVE_STEP_COUNTER
+        _HIRECAFE_OBSERVE_STEP_COUNTER += 1
+
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
         safe_stage = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in stage)
-        base = output_dir / f"{stamp}_{safe_stage}"
+        base = output_dir / f"{stamp}_{_HIRECAFE_OBSERVE_STEP_COUNTER:05d}_{safe_stage}"
 
         screenshot_path = base.with_suffix(".png")
         html_path = base.with_suffix(".html")
@@ -317,6 +554,7 @@ def _capture_observation_artifacts(
 
         metadata = {
             "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+            "observe_step_index": _HIRECAFE_OBSERVE_STEP_COUNTER,
             "stage": stage,
             "screenshot_ok": screenshot_ok,
             "screenshot_path": str(screenshot_path),
@@ -332,6 +570,61 @@ def _capture_observation_artifacts(
         logger.info("hirecafe observe stage=%s wrote %s", stage, meta_path)
     except Exception as exc:
         logger.info("hirecafe observe capture failed stage=%s: %s", stage, type(exc).__name__)
+
+
+def _observe_step(
+    driver,
+    stage: str,
+    extra: Optional[dict[str, Any]] = None,
+) -> None:
+    """Capture a step-level snapshot when observation mode is enabled."""
+    if not HIRECAFE_OBSERVE_PAGES:
+        return
+    _capture_observation_artifacts(driver, stage, extra)
+
+
+def _is_production_runtime() -> bool:
+    return any(os.getenv(key) for key in _PRODUCTION_ENV_KEYS)
+
+
+def _is_docker_runtime() -> bool:
+    if Path("/.dockerenv").is_file():
+        return True
+
+    cgroup_path = Path("/proc/1/cgroup")
+    if not cgroup_path.is_file():
+        return False
+
+    try:
+        cgroup_text = cgroup_path.read_text(encoding="utf-8", errors="ignore").lower()
+    except Exception:
+        return False
+
+    return any(marker in cgroup_text for marker in ("docker", "containerd", "podman", "kubepods"))
+
+
+def _detectable_mode_block_runtime() -> str | None:
+    if _is_production_runtime():
+        return "production"
+    if _is_docker_runtime():
+        return "docker"
+    return None
+
+
+def _resolve_hirecafe_browser_mode() -> tuple[str, str, str | None]:
+    requested_mode = (HIRECAFE_BROWSER_MODE or "").strip().lower()
+    if requested_mode not in ("stealth", "detectable"):
+        logger.warning(
+            "hirecafe unknown browser mode=%s, forcing stealth",
+            requested_mode or "<empty>",
+        )
+        return requested_mode or "stealth", "stealth", "invalid_mode"
+
+    blocked_runtime = _detectable_mode_block_runtime()
+    if requested_mode == "detectable" and blocked_runtime:
+        return requested_mode, "stealth", blocked_runtime
+
+    return requested_mode, requested_mode, None
 
 
 def _launch_detectable_driver():
@@ -354,13 +647,13 @@ def _launch_detectable_driver():
     options.add_argument("--window-size=1366,768")
     options.add_argument("--no-sandbox")
 
-    if HIRECAFE_DETECTABLE_HEADLESS:
+    if HIRECAFE_DETECTABLE_HEADLESS and HIRECAFE_HEADLESS:
         options.add_argument("--headless=new")
-        options.add_argument(
-            "--user-agent=Mozilla/5.0 (X11; Linux x86_64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "HeadlessChrome/124.0.0.0 Safari/537.36"
-        )
+        options.add_argument(f"--user-agent={_CHROME_UA}")
+    if HIRECAFE_CHROME_USER_DATA_DIR:
+        options.add_argument(f"--user-data-dir={HIRECAFE_CHROME_USER_DATA_DIR}")
+    if HIRECAFE_CHROME_PROFILE_DIR:
+        options.add_argument(f"--profile-directory={HIRECAFE_CHROME_PROFILE_DIR}")
 
     if HIRECAFE_CHROME_BINARY:
         options.binary_location = HIRECAFE_CHROME_BINARY
@@ -377,24 +670,70 @@ def _launch_detectable_driver():
     return webdriver.Chrome(service=service, options=options)
 
 
-def _launch_hirecafe_driver():
+def _launch_hirecafe_driver(browser_mode: str = "stealth"):
     options = uc.ChromeOptions()
     options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
+    options.add_argument("--disable-dev-shm-usage")
+    # Removing --disable-gpu to allow WebGL context to actually initialize
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--no-sandbox")
+    options.add_argument(f"--user-agent={_CHROME_UA}")
+    if HIRECAFE_HEADLESS:
+        options.add_argument("--headless=new")
+    if HIRECAFE_CHROME_USER_DATA_DIR:
+        options.add_argument(f"--user-data-dir={HIRECAFE_CHROME_USER_DATA_DIR}")
+    if HIRECAFE_CHROME_PROFILE_DIR:
+        options.add_argument(f"--profile-directory={HIRECAFE_CHROME_PROFILE_DIR}")
 
-    if HIRECAFE_BROWSER_MODE == "detectable":
+    if browser_mode == "detectable":
         detectable_driver = _launch_detectable_driver()
         if detectable_driver is not None:
             return detectable_driver
 
-    is_server = os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("PORT")
-    if is_server:
-        logger.info("hirecafe detected server environment, using system chromium binaries")
-        return uc.Chrome(
-            options=options,
-            browser_executable_path="/usr/bin/chromium",
-            driver_executable_path="/usr/bin/chromedriver",
+    system_browser = Path("/usr/bin/chromium").is_file()
+    system_driver = Path("/usr/bin/chromedriver").is_file()
+    if HIRECAFE_USE_SYSTEM_BINARIES in ("1", "true", "yes"):
+        use_system_binaries = True
+        use_system_reason = "env_forced_true"
+    elif HIRECAFE_USE_SYSTEM_BINARIES in ("0", "false", "no"):
+        use_system_binaries = False
+        use_system_reason = "env_forced_false"
+    else:
+        # Auto mode: only force system binaries in known production runtimes.
+        use_system_binaries = _is_production_runtime() and system_browser and system_driver
+        use_system_reason = "auto_production_only"
+
+    driver = None
+    if use_system_binaries:
+        logger.info(
+            "hirecafe using system chromium binaries (reason=%s browser=%s driver=%s)",
+            use_system_reason,
+            system_browser,
+            system_driver,
         )
-    return uc.Chrome(options=options, version_main=145)
+        kwargs = {
+            "options": options,
+            "browser_executable_path": "/usr/bin/chromium",
+            "driver_executable_path": "/usr/bin/chromedriver",
+        }
+        if HIRECAFE_UC_VERSION_MAIN is not None:
+             kwargs["version_main"] = HIRECAFE_UC_VERSION_MAIN
+        driver = uc.Chrome(**kwargs)
+    else:
+        logger.info(
+            "hirecafe using bundled undetected-chromedriver binaries (reason=%s browser=%s driver=%s)",
+            use_system_reason,
+            system_browser,
+            system_driver,
+        )
+        if HIRECAFE_UC_VERSION_MAIN is None:
+            driver = uc.Chrome(options=options)
+        else:
+            driver = uc.Chrome(options=options, version_main=HIRECAFE_UC_VERSION_MAIN)
+
+    # Inject stealth patches before any page loads.
+    _inject_stealth_scripts(driver)
+    return driver
 
 
 def _press_escape_before_scroll(driver) -> None:
@@ -414,23 +753,622 @@ def _press_escape_before_scroll(driver) -> None:
 
 
 def _click_viewport_coordinate(driver, x: int, y: int) -> bool:
+    """Move the pointer to *(x, y)* along a human-like Bézier curve, then click."""
     try:
-        driver.execute_cdp_cmd(
-            "Input.dispatchMouseEvent",
-            {"type": "mouseMoved", "x": x, "y": y, "button": "left", "clickCount": 1},
+        # Pick a random starting position offset from the target.
+        start_x = _clamp_int(
+            x + random.randint(-180, -40),
+            0,
+            1919,
         )
+        start_y = _clamp_int(
+            y + random.randint(-120, -25),
+            0,
+            1079,
+        )
+
+        # Generate a curved, jittered path (20–40 waypoints).
+        path = _human_mouse_path(start_x, start_y, x, y)
+
+        for wx, wy in path:
+            driver.execute_cdp_cmd(
+                "Input.dispatchMouseEvent",
+                {
+                    "type": "mouseMoved",
+                    "x": _clamp_int(wx, 0, 1919),
+                    "y": _clamp_int(wy, 0, 1079),
+                },
+            )
+            # Variable micro-delay between waypoints (8–25 ms).
+            time.sleep(random.uniform(0.008, 0.025))
+
+        # Pre-click hover pause — humans don’t click the instant the cursor arrives.
+        time.sleep(random.uniform(0.08, 0.20))
+
         driver.execute_cdp_cmd(
             "Input.dispatchMouseEvent",
             {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1},
         )
+        # Hold duration — simulate physical button depression.
+        time.sleep(random.uniform(0.05, 0.12))
         driver.execute_cdp_cmd(
             "Input.dispatchMouseEvent",
             {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1},
         )
         return True
     except Exception as exc:
-        logger.info("hirecafe hardcoded click failed at (%s,%s): %s", x, y, type(exc).__name__)
+        logger.info("hirecafe Bézier click failed at (%s,%s): %s", x, y, type(exc).__name__)
         return False
+
+
+def _clamp_int(value: int, lower: int, upper: int) -> int:
+    if lower > upper:
+        return value
+    return max(lower, min(upper, value))
+
+
+def _normalize_viewport(raw_viewport: Any) -> dict[str, int]:
+    width = 1920
+    height = 1080
+    if isinstance(raw_viewport, dict):
+        try:
+            width = int(raw_viewport.get("width") or width)
+        except Exception:
+            pass
+        try:
+            height = int(raw_viewport.get("height") or height)
+        except Exception:
+            pass
+
+    return {
+        "width": max(1, width),
+        "height": max(1, height),
+    }
+
+
+def _normalize_box(raw_box: Any, viewport: dict[str, int]) -> dict[str, int] | None:
+    if not isinstance(raw_box, dict):
+        return None
+
+    try:
+        x1 = int(float(raw_box.get("x1")))
+        y1 = int(float(raw_box.get("y1")))
+        x2 = int(float(raw_box.get("x2")))
+        y2 = int(float(raw_box.get("y2")))
+    except Exception:
+        return None
+
+    max_x = max(0, viewport["width"] - 1)
+    max_y = max(0, viewport["height"] - 1)
+    x1 = _clamp_int(x1, 0, max_x)
+    x2 = _clamp_int(x2, 0, max_x)
+    y1 = _clamp_int(y1, 0, max_y)
+    y2 = _clamp_int(y2, 0, max_y)
+
+    if x2 <= x1 or y2 <= y1:
+        return None
+
+    return {
+        "x1": x1,
+        "y1": y1,
+        "x2": x2,
+        "y2": y2,
+        "width": x2 - x1,
+        "height": y2 - y1,
+    }
+
+
+def _build_checkbox_anchor_candidates(
+    checkbox_box: dict[str, int],
+    viewport: dict[str, int],
+) -> list[dict[str, Any]]:
+    x1 = checkbox_box["x1"]
+    y1 = checkbox_box["y1"]
+    x2 = checkbox_box["x2"]
+    y2 = checkbox_box["y2"]
+
+    cx = int((x1 + x2) / 2)
+    cy = int((y1 + y2) / 2)
+    w = max(1, x2 - x1)
+    h = max(1, y2 - y1)
+
+    inset_x = max(2, int(w * 0.22))
+    inset_y = max(2, int(h * 0.22))
+
+    raw_points = [
+        (cx, cy, "P1"),
+        (int(x1 + inset_x), cy, "P2"),
+        (int(x2 - inset_x), cy, "P3"),
+        (cx, int(y1 + inset_y), "P4"),
+    ]
+
+    max_x = max(0, viewport["width"] - 1)
+    max_y = max(0, viewport["height"] - 1)
+    seen: set[tuple[int, int]] = set()
+    candidates: list[dict[str, Any]] = []
+
+    for x, y, label in raw_points:
+        px = _clamp_int(int(x), 0, max_x)
+        py = _clamp_int(int(y), 0, max_y)
+        key = (px, py)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append({
+            "x": px,
+            "y": py,
+            "label": label,
+            "source": "checkbox_anchor",
+        })
+
+    return candidates
+
+
+def _build_widget_fallback_candidates(
+    widget_box: dict[str, int],
+    viewport: dict[str, int],
+) -> list[dict[str, Any]]:
+    x1 = widget_box["x1"]
+    y1 = widget_box["y1"]
+    x2 = widget_box["x2"]
+    y2 = widget_box["y2"]
+
+    w = max(1, x2 - x1)
+    h = max(1, y2 - y1)
+    raw_points = [
+        (int(x1 + 0.20 * w), int(y1 + 0.50 * h), "P1"),
+        (int(x1 + 0.32 * w), int(y1 + 0.50 * h), "P2"),
+        (int(x1 + 0.50 * w), int(y1 + 0.50 * h), "P3"),
+        (int(x1 + 0.20 * w), int(y1 + 0.68 * h), "P4"),
+    ]
+
+    max_x = max(0, viewport["width"] - 1)
+    max_y = max(0, viewport["height"] - 1)
+    seen: set[tuple[int, int]] = set()
+    candidates: list[dict[str, Any]] = []
+
+    for x, y, label in raw_points:
+        px = _clamp_int(int(x), 0, max_x)
+        py = _clamp_int(int(y), 0, max_y)
+        key = (px, py)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append({
+            "x": px,
+            "y": py,
+            "label": label,
+            "source": "widget_fallback",
+        })
+
+    return candidates
+
+
+def _build_text_visual_fallback_candidates(
+    widget_box: dict[str, int],
+    viewport: dict[str, int],
+) -> list[dict[str, Any]]:
+    """Generate clicks close to the expected Turnstile checkbox hotspot near the widget's left edge."""
+    x1 = widget_box["x1"]
+    y1 = widget_box["y1"]
+    x2 = widget_box["x2"]
+    y2 = widget_box["y2"]
+
+    w = max(1, x2 - x1)
+    h = max(1, y2 - y1)
+    raw_points = [
+        (int(x1 + 0.07 * w), int(y1 + 0.50 * h), "T1"),
+        (int(x1 + 0.10 * w), int(y1 + 0.50 * h), "T2"),
+        (int(x1 + 0.13 * w), int(y1 + 0.50 * h), "T3"),
+        (int(x1 + 0.07 * w), int(y1 + 0.64 * h), "T4"),
+    ]
+
+    max_x = max(0, viewport["width"] - 1)
+    max_y = max(0, viewport["height"] - 1)
+    seen: set[tuple[int, int]] = set()
+    candidates: list[dict[str, Any]] = []
+
+    for x, y, label in raw_points:
+        px = _clamp_int(int(x), 0, max_x)
+        py = _clamp_int(int(y), 0, max_y)
+        key = (px, py)
+        if key in seen:
+            continue
+        seen.add(key)
+        candidates.append({
+            "x": px,
+            "y": py,
+            "label": label,
+            "source": "text_visual_fallback",
+        })
+
+    return candidates
+
+
+def _resolve_cloudflare_click_plan(driver) -> dict[str, Any]:
+    raw: dict[str, Any] = {}
+    js_error: str | None = None
+
+    try:
+        raw = driver.execute_script(
+            "const clamp=(v,a,b)=>Math.max(a,Math.min(b,v));"
+            "const vw=Math.round(window.innerWidth||document.documentElement.clientWidth||1920);"
+            "const vh=Math.round(window.innerHeight||document.documentElement.clientHeight||1080);"
+            "const toBox=(el)=>{"
+            "if(!el)return null;"
+            "const r=el.getBoundingClientRect();"
+            "if(!r||r.width<=0||r.height<=0)return null;"
+            "return {x1:Math.round(r.left),y1:Math.round(r.top),x2:Math.round(r.right),y2:Math.round(r.bottom)};"
+            "};"
+            "const checkboxSelectors=[\"input[type='checkbox']\",\"[role='checkbox']\",\".ctp-checkbox-container\",\".mark\",\"label.ctp-checkbox-label\",\"label[for*='cf-chl']\"];"
+            "const checkboxCandidates=[];"
+            "for(const sel of checkboxSelectors){"
+            "for(const el of document.querySelectorAll(sel)){"
+            "const box=toBox(el);"
+            "if(!box)continue;"
+            "const w=Math.max(1,box.x2-box.x1);"
+            "const h=Math.max(1,box.y2-box.y1);"
+            "const minSide=Math.min(w,h);"
+            "const maxSide=Math.max(w,h);"
+            "if(minSide<10||maxSide>70)continue;"
+            "if((maxSide/minSide)>1.6)continue;"
+            "const leftBias=1-Math.min(1,Math.max(0,box.x1/Math.max(1,vw)));"
+            "const sizeBias=1-Math.min(1,Math.abs(minSide-24)/24);"
+            "const score=(leftBias*0.65)+(sizeBias*0.35);"
+            "checkboxCandidates.push({selector:sel,score:score,box:box});"
+            "}"
+            "}"
+            "checkboxCandidates.sort((a,b)=>b.score-a.score);"
+            "const checkbox=checkboxCandidates.length?checkboxCandidates[0]:null;"
+            "const iframeSelectors=[\"iframe[src*='challenges.cloudflare.com']\",\"iframe[src*='turnstile']\",\"iframe[src*='cloudflare']\"];"
+            "const iframeCandidates=[];"
+            "for(const sel of iframeSelectors){"
+            "for(const el of document.querySelectorAll(sel)){"
+            "const box=toBox(el);"
+            "if(!box)continue;"
+            "const w=Math.max(1,box.x2-box.x1);"
+            "const h=Math.max(1,box.y2-box.y1);"
+            "if(w<120||h<30)continue;"
+            "const leftBias=1-Math.min(1,Math.max(0,box.x1/Math.max(1,vw)));"
+            "const score=(leftBias*0.6)+(Math.min(1,w/420)*0.25)+(Math.min(1,h/140)*0.15);"
+            "iframeCandidates.push({selector:sel,score:score,box:box});"
+            "}"
+            "}"
+            "iframeCandidates.sort((a,b)=>b.score-a.score);"
+            "const iframe=iframeCandidates.length?iframeCandidates[0]:null;"
+            "const hiddenInputCandidates=[];"
+            "const hiddenInputs=[...document.querySelectorAll(\"input[name='cf-turnstile-response'], input[id^='cf-chl-widget'][id$='_response']\")];"
+            "for(const inputEl of hiddenInputs){"
+            "let node=inputEl;"
+            "for(let depth=0;depth<8 && node;depth++){"
+            "const box=toBox(node);"
+            "if(box){"
+            "const w=Math.max(1,box.x2-box.x1);"
+            "const h=Math.max(1,box.y2-box.y1);"
+            "if(w>=140 && w<=520 && h>=32 && h<=220){"
+            "const leftBias=1-Math.min(1,Math.max(0,box.x1/Math.max(1,vw)));"
+            "const widthBias=1-Math.min(1,Math.abs(w-320)/320);"
+            "const heightBias=1-Math.min(1,Math.abs(h-78)/78);"
+            "const depthPenalty=Math.min(0.2,depth*0.02);"
+            "const score=(leftBias*0.45)+(widthBias*0.33)+(heightBias*0.22)-depthPenalty;"
+            "hiddenInputCandidates.push({score:score,box:box,depth:depth});"
+            "}"
+            "}"
+            "node=node.parentElement;"
+            "}"
+            "}"
+            "hiddenInputCandidates.sort((a,b)=>b.score-a.score);"
+            "const hiddenInputAnchor=hiddenInputCandidates.length?hiddenInputCandidates[0]:null;"
+            "const textVisualCandidates=[];"
+            "const pushTextVisual=(box,source)=>{"
+            "if(!box)return;"
+            "const w=Math.max(1,box.x2-box.x1);"
+            "const h=Math.max(1,box.y2-box.y1);"
+            "if(w<140||w>960||h<24||h>280)return;"
+            "const leftBias=1-Math.min(1,Math.max(0,box.x1/Math.max(1,vw)));"
+            "const widthBias=1-Math.min(1,Math.abs(w-300)/420);"
+            "const heightBias=1-Math.min(1,Math.abs(h-56)/130);"
+            "const score=(leftBias*0.44)+(widthBias*0.34)+(heightBias*0.22);"
+            "textVisualCandidates.push({score:score,source:source,box:box});"
+            "};"
+            "const textVisualSelectors=[\"#hQLfM7\",\".main-content #hQLfM7\",\"[id*='cf-chl-widget'][id$='_container']\"];"
+            "for(const sel of textVisualSelectors){"
+            "for(const el of document.querySelectorAll(sel)){"
+            "pushTextVisual(toBox(el),sel);"
+            "}"
+            "}"
+            "const mainContentBox=toBox(document.querySelector('.main-content'));"
+            "let challengeHeadingBox=null;"
+            "for(const el of document.querySelectorAll('h2,p,div,span')){"
+            "const txt=(el.innerText||'').toLowerCase();"
+            "if(!txt)continue;"
+            "if(!(txt.includes('performing security verification')||txt.includes('verify you are human')||txt.includes('this website uses a security service')))continue;"
+            "const box=toBox(el);"
+            "if(!box)continue;"
+            "challengeHeadingBox=box;"
+            "break;"
+            "}"
+            "if(mainContentBox&&challengeHeadingBox){"
+            "const estY1=clamp(Math.round(challengeHeadingBox.y2+12),mainContentBox.y1+42,Math.max(mainContentBox.y1+42,mainContentBox.y2-76));"
+            "const estBox={"
+            "x1:clamp(Math.round(mainContentBox.x1+24),0,vw-1),"
+            "y1:clamp(estY1,0,vh-1),"
+            "x2:clamp(Math.round(mainContentBox.x1+340),0,vw-1),"
+            "y2:clamp(Math.round(estY1+56),0,vh-1)"
+            "};"
+            "if(estBox.x2>estBox.x1&&estBox.y2>estBox.y1)pushTextVisual(estBox,'main_content_text_estimate');"
+            "}"
+            "textVisualCandidates.sort((a,b)=>b.score-a.score);"
+            "const textVisualAnchor=textVisualCandidates.length?textVisualCandidates[0]:null;"
+            "const findVerifyPromptAndSquare=()=>{"
+            "const promptNeedles=['verify you are human','verify you are a human'];"
+            "const nodes=[...document.querySelectorAll('label,span,p,div')];"
+            "let promptEl=null;"
+            "let promptBox=null;"
+            "for(const node of nodes){"
+            "const txt=((node.innerText||'')+'').toLowerCase().replace(/\\s+/g,' ').trim();"
+            "if(!txt)continue;"
+            "if(!promptNeedles.some((needle)=>txt.includes(needle)))continue;"
+            "const b=toBox(node);"
+            "if(!b)continue;"
+            "const bw=Math.max(1,b.x2-b.x1);"
+            "const bh=Math.max(1,b.y2-b.y1);"
+            "if(bw<70||bw>520||bh>48)continue;"
+            "promptEl=node;"
+            "promptBox=b;"
+            "break;"
+            "}"
+            "if(!promptEl||!promptBox)return {promptBox:null,checkboxBox:null};"
+            "const containerCandidates=[];"
+            "let ptr=promptEl;"
+            "for(let depth=0;depth<6&&ptr;depth++){"
+            "const box=toBox(ptr);"
+            "if(box){"
+            "const w=Math.max(1,box.x2-box.x1);"
+            "const h=Math.max(1,box.y2-box.y1);"
+            "if(w>=120&&w<=780&&h>=24&&h<=240){"
+            "const leftBias=1-Math.min(1,Math.max(0,box.x1/Math.max(1,vw)));"
+            "const score=(leftBias*0.6)+(Math.min(1,w/420)*0.25)+(Math.min(1,h/120)*0.15);"
+            "containerCandidates.push({score:score,box:box,el:ptr});"
+            "}"
+            "}"
+            "ptr=ptr.parentElement;"
+            "}"
+            "containerCandidates.sort((a,b)=>b.score-a.score);"
+            "const container=containerCandidates.length?containerCandidates[0]:null;"
+            "const scope=(container&&container.el)?container.el:promptEl.parentElement||document.body;"
+            "const squareCandidates=[];"
+            "const all=[...scope.querySelectorAll('*')];"
+            "for(const el of all){"
+            "if(el===promptEl)continue;"
+            "const b=toBox(el);"
+            "if(!b)continue;"
+            "const w=Math.max(1,b.x2-b.x1);"
+            "const h=Math.max(1,b.y2-b.y1);"
+            "const minSide=Math.min(w,h);"
+            "const maxSide=Math.max(w,h);"
+            "if(minSide<10||maxSide>34)continue;"
+            "if((maxSide/minSide)>1.28)continue;"
+            "const isLeft=(b.x2<=promptBox.x1+8);"
+            "const verticalOverlap=Math.min(b.y2,promptBox.y2)-Math.max(b.y1,promptBox.y1);"
+            "if(!isLeft||verticalOverlap<4)continue;"
+            "const centerY=Math.round((b.y1+b.y2)/2);"
+            "const promptCenterY=Math.round((promptBox.y1+promptBox.y2)/2);"
+            "const yDelta=Math.abs(centerY-promptCenterY);"
+            "const xGap=Math.max(0,promptBox.x1-b.x2);"
+            "if(xGap>42)continue;"
+            "const squareBias=1-Math.min(1,Math.abs(minSide-14)/14);"
+            "const yBias=1-Math.min(1,yDelta/16);"
+            "const gapBias=1-Math.min(1,xGap/26);"
+            "const score=(squareBias*0.45)+(yBias*0.35)+(gapBias*0.20);"
+            "squareCandidates.push({score:score,box:b});"
+            "}"
+            "squareCandidates.sort((a,b)=>b.score-a.score);"
+            "return {"
+            "promptBox:promptBox,"
+            "checkboxBox:squareCandidates.length?squareCandidates[0].box:null,"
+            "containerBox:container?container.box:null"
+            "};"
+            "};"
+            "const verifyPromptProbe=findVerifyPromptAndSquare();"
+            "let method='none';"
+            "let checkboxBox=null;"
+            "let widgetBox=null;"
+            "let hiddenInputBox=null;"
+            "let textVisualBox=null;"
+            "let textVisualSource=null;"
+            "if(checkbox){"
+            "checkboxBox=checkbox.box;"
+            "method='checkbox_dom';"
+            "widgetBox={x1:checkboxBox.x1-10,y1:checkboxBox.y1-14,x2:checkboxBox.x2+260,y2:checkboxBox.y2+14};"
+            "}else if(iframe){"
+            "const ib=iframe.box;"
+            "const iw=Math.max(1,ib.x2-ib.x1);"
+            "const ih=Math.max(1,ib.y2-ib.y1);"
+            "const side=clamp(Math.round(Math.min(Math.max(ih*0.42,18),Math.min(iw*0.20,30))),16,34);"
+            "const cx=clamp(Math.round(ib.x1+Math.max(14,iw*0.12)),ib.x1+2,ib.x2-2);"
+            "const cy=clamp(Math.round(ib.y1+(ih/2)),ib.y1+2,ib.y2-2);"
+            "checkboxBox={x1:cx-Math.round(side/2),y1:cy-Math.round(side/2),x2:cx+Math.round(side/2),y2:cy+Math.round(side/2)};"
+            "method='iframe_anchor';"
+            "widgetBox={x1:checkboxBox.x1-10,y1:checkboxBox.y1-14,x2:checkboxBox.x2+260,y2:checkboxBox.y2+14};"
+            "}else if(hiddenInputAnchor){"
+            "hiddenInputBox=hiddenInputAnchor.box;"
+            "const hb=hiddenInputBox;"
+            "const hw=Math.max(1,hb.x2-hb.x1);"
+            "const hh=Math.max(1,hb.y2-hb.y1);"
+            "const side=clamp(Math.round(Math.min(Math.max(hh*0.45,18),30)),16,34);"
+            "const cx=clamp(Math.round(hb.x1+Math.min(78,Math.max(24,hw*0.20))),hb.x1+2,hb.x2-2);"
+            "const cy=clamp(Math.round(hb.y1+(hh*0.50)),hb.y1+2,hb.y2-2);"
+            "checkboxBox={x1:cx-Math.round(side/2),y1:cy-Math.round(side/2),x2:cx+Math.round(side/2),y2:cy+Math.round(side/2)};"
+            "widgetBox=hb;"
+            "method='hidden_input_anchor';"
+            "}else if(textVisualAnchor){"
+            "textVisualBox=textVisualAnchor.box;"
+            "textVisualSource=textVisualAnchor.source;"
+            "const tb=textVisualBox;"
+            "const tw=Math.max(1,tb.x2-tb.x1);"
+            "const th=Math.max(1,tb.y2-tb.y1);"
+            "const side=clamp(Math.round(Math.min(Math.max(th*0.45,18),30)),16,34);"
+            "const cx=clamp(Math.round(tb.x1+Math.max(16,Math.min(42,tw*0.09))),tb.x1+2,tb.x2-2);"
+            "const cy=clamp(Math.round(tb.y1+(th*0.50)),tb.y1+2,tb.y2-2);"
+            "checkboxBox={x1:cx-Math.round(side/2),y1:cy-Math.round(side/2),x2:cx+Math.round(side/2),y2:cy+Math.round(side/2)};"
+            "widgetBox=tb;"
+            "method='text_visual_anchor';"
+            "}else if(verifyPromptProbe&&verifyPromptProbe.checkboxBox){"
+            "checkboxBox=verifyPromptProbe.checkboxBox;"
+            "widgetBox=verifyPromptProbe.containerBox||{"
+            "x1:clamp(Math.round(checkboxBox.x1-8),0,vw-1),"
+            "y1:clamp(Math.round(checkboxBox.y1-12),0,vh-1),"
+            "x2:clamp(Math.round(checkboxBox.x2+260),0,vw-1),"
+            "y2:clamp(Math.round(checkboxBox.y2+12),0,vh-1)"
+            "};"
+            "method='verify_text_square_probe';"
+            "}"
+            "return {"
+            "viewport:{width:vw,height:vh},"
+            "method:method,"
+            "checkbox_box:checkboxBox,"
+            "iframe_box:iframe?iframe.box:null,"
+            "hidden_input_box:hiddenInputBox,"
+            "text_visual_box:textVisualBox,"
+            "text_visual_source:textVisualSource,"
+            "verify_prompt_box:verifyPromptProbe?verifyPromptProbe.promptBox:null,"
+            "widget_box:widgetBox,"
+            "checkbox_selector:checkbox?checkbox.selector:null,"
+            "iframe_selector:iframe?iframe.selector:null"
+            "};"
+        ) or {}
+    except Exception as exc:
+        js_error = type(exc).__name__
+        raw = {}
+
+    viewport = _normalize_viewport(raw.get("viewport"))
+    checkbox_box = _normalize_box(raw.get("checkbox_box"), viewport)
+    iframe_box = _normalize_box(raw.get("iframe_box"), viewport)
+    hidden_input_box = _normalize_box(raw.get("hidden_input_box"), viewport)
+    text_visual_box = _normalize_box(raw.get("text_visual_box"), viewport)
+    text_visual_source = raw.get("text_visual_source")
+    verify_prompt_box = _normalize_box(raw.get("verify_prompt_box"), viewport)
+    widget_box = _normalize_box(raw.get("widget_box"), viewport)
+
+    method = str(raw.get("method") or "none")
+    if js_error:
+        method = "js_error"
+
+    candidates: list[dict[str, Any]] = []
+    if checkbox_box:
+        candidates.extend(_build_checkbox_anchor_candidates(checkbox_box, viewport))
+    elif method == "text_visual_anchor" and widget_box:
+        candidates.extend(_build_text_visual_fallback_candidates(widget_box, viewport))
+    elif widget_box:
+        candidates.extend(_build_widget_fallback_candidates(widget_box, viewport))
+
+    legacy_x = _clamp_int(HARDCODED_CF_CLICK_X, 0, max(0, viewport["width"] - 1))
+    legacy_y = _clamp_int(HARDCODED_CF_CLICK_Y, 0, max(0, viewport["height"] - 1))
+    candidates.append({
+        "x": legacy_x,
+        "y": legacy_y,
+        "label": "LEGACY",
+        "source": "legacy_hardcoded",
+    })
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[int, int]] = set()
+    for candidate in candidates:
+        key = (int(candidate["x"]), int(candidate["y"]))
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(candidate)
+
+    for idx, candidate in enumerate(deduped, start=1):
+        candidate["rank"] = idx
+        candidate["recommended"] = idx == 1
+
+    return {
+        "method": method,
+        "viewport": viewport,
+        "checkbox_box": checkbox_box,
+        "iframe_box": iframe_box,
+        "hidden_input_box": hidden_input_box,
+        "text_visual_box": text_visual_box,
+        "text_visual_source": text_visual_source,
+        "verify_prompt_box": verify_prompt_box,
+        "widget_box": widget_box,
+        "checkbox_selector": raw.get("checkbox_selector"),
+        "iframe_selector": raw.get("iframe_selector"),
+        "click_candidates": deduped,
+        "js_error": js_error,
+    }
+
+
+def _execute_cloudflare_single_click(
+    driver,
+    click_candidates: list[dict[str, Any]],
+) -> dict[str, Any]:
+    attempts: list[dict[str, Any]] = []
+    clicked = False
+    cleared = False
+    last_state = _probe_cloudflare_challenge(driver)
+
+    if not click_candidates:
+        return {
+            "clicked": False,
+            "cleared": False,
+            "attempt_count": 0,
+            "attempt_limit": 0,
+            "attempts": attempts,
+            "last_state": last_state,
+        }
+
+    candidate = click_candidates[0]
+    x = int(candidate.get("x", HARDCODED_CF_CLICK_X))
+    y = int(candidate.get("y", HARDCODED_CF_CLICK_Y))
+    rank = int(candidate.get("rank", 1))
+    label = str(candidate.get("label") or "P1")
+    source = str(candidate.get("source") or "unknown")
+    sent = _click_viewport_coordinate(driver, x, y)
+    clicked = clicked or sent
+
+    post_click_wait = max(
+        0.15,
+        HIRECAFE_CF_MULTI_CLICK_DELAY_SECONDS,
+        HIRECAFE_CF_POST_CLICK_SETTLE_SECONDS,
+    )
+    time.sleep(post_click_wait)
+    last_state = _probe_cloudflare_challenge(driver)
+    challenge_active = bool(last_state.get("active"))
+    logger.info(
+        "hirecafe challenge single-click rank=%s label=%s source=%s x=%s y=%s sent=%s challenge_active=%s",
+        rank,
+        label,
+        source,
+        x,
+        y,
+        sent,
+        challenge_active,
+    )
+
+    attempts.append({
+        "rank": rank,
+        "label": label,
+        "source": source,
+        "x": x,
+        "y": y,
+        "sent": sent,
+        "challenge_active": challenge_active,
+    })
+    if not challenge_active:
+        cleared = True
+
+    return {
+        "clicked": clicked,
+        "cleared": cleared,
+        "attempt_count": len(attempts),
+        "attempt_limit": 1,
+        "attempts": attempts,
+        "last_state": last_state,
+    }
 
 
 def _extract_viewjob_id(url_or_href: str) -> str | None:
@@ -1009,6 +1947,7 @@ def _process_cards_on_page(
     seen_ids: set[str],
     *,
     max_samples: int,
+    page_no: int,
 ) -> dict[str, int]:
     processed = 0
     page_new_jobs = 0
@@ -1024,6 +1963,16 @@ def _process_cards_on_page(
             continue
 
         processed += 1
+        card_no = processed
+
+        _observe_step(
+            driver,
+            f"page_{page_no:03d}_card_{card_no:03d}_before_click",
+            {
+                "cards_seen": len(cards),
+                "jobs_total_before_card": len(job_samples),
+            },
+        )
 
         try:
             driver.execute_script(
@@ -1034,8 +1983,17 @@ def _process_cards_on_page(
         except Exception:
             pass
 
-        _click_card_surface(driver, card)
+        card_clicked = _click_card_surface(driver, card)
         time.sleep(max(0.0, HIRECAFE_CARD_CLICK_PAUSE_SECONDS))
+
+        _observe_step(
+            driver,
+            f"page_{page_no:03d}_card_{card_no:03d}_after_click",
+            {
+                "clicked": card_clicked,
+                "jobs_total_after_click": len(job_samples),
+            },
+        )
 
         card_result = _collect_jobs_for_card_until_no_new(
             driver,
@@ -1048,6 +2006,15 @@ def _process_cards_on_page(
             max_carousel_clicks=PHASE2_MAX_CAROUSEL_CLICKS,
         )
         page_new_jobs += int(card_result.get("new_jobs", 0))
+
+        _observe_step(
+            driver,
+            f"page_{page_no:03d}_card_{card_no:03d}_after_collect",
+            {
+                "card_result": card_result,
+                "jobs_total_after_collect": len(job_samples),
+            },
+        )
 
     return {
         "cards_seen": len(cards),
@@ -1069,8 +2036,24 @@ def _scrape_paginated_card_pages(
     visited_signatures: set[str] = set()
 
     for loop_idx in range(1, max_pages + 1):
+        _observe_step(
+            driver,
+            f"pagination_loop_{loop_idx:03d}_start",
+            {
+                "loop_idx": loop_idx,
+                "max_pages": max_pages,
+                "max_samples": max_samples,
+                "current_total_jobs": len(job_samples),
+            },
+        )
+
         if len(job_samples) >= max_samples:
             logger.info("hirecafe stop: max_samples reached")
+            _observe_step(
+                driver,
+                f"pagination_loop_{loop_idx:03d}_stop_max_samples",
+                {"current_total_jobs": len(job_samples)},
+            )
             break
 
         root, cards, grid_meta = _find_card_grid_root(driver)
@@ -1083,17 +2066,42 @@ def _scrape_paginated_card_pages(
                 grid_meta.get("candidate_count"),
                 pagination_meta.get("found"),
             )
+            _observe_step(
+                driver,
+                f"pagination_loop_{loop_idx:03d}_grid_not_found",
+                {
+                    "grid_meta": grid_meta,
+                    "pagination_meta": pagination_meta,
+                },
+            )
             break
 
         signature = _page_signature(driver, cards)
         if signature and signature in visited_signatures:
             logger.info("hirecafe stop: repeated page signature")
+            _observe_step(
+                driver,
+                f"pagination_loop_{loop_idx:03d}_stop_repeated_signature",
+                {"signature": signature},
+            )
             break
         if signature:
             visited_signatures.add(signature)
 
         page_no = int(pagination_meta.get("currentPage") or loop_idx)
         total_pages = pagination_meta.get("totalPages")
+
+        _observe_step(
+            driver,
+            f"pagination_loop_{loop_idx:03d}_before_page_cards",
+            {
+                "page_no": page_no,
+                "total_pages": total_pages,
+                "grid_meta": grid_meta,
+                "pagination_meta": pagination_meta,
+                "signature": signature,
+            },
+        )
 
         before_page = len(job_samples)
         card_metrics = _process_cards_on_page(
@@ -1103,8 +2111,21 @@ def _scrape_paginated_card_pages(
             seen_urls,
             seen_ids,
             max_samples=max_samples,
+            page_no=page_no,
         )
         after_page = len(job_samples)
+
+        _observe_step(
+            driver,
+            f"pagination_loop_{loop_idx:03d}_after_page_cards",
+            {
+                "page_no": page_no,
+                "total_pages": total_pages,
+                "card_metrics": card_metrics,
+                "new_jobs": after_page - before_page,
+                "total_jobs": after_page,
+            },
+        )
 
         pages_visited += 1
         logger.info(
@@ -1117,15 +2138,49 @@ def _scrape_paginated_card_pages(
         )
 
         if len(job_samples) >= max_samples:
+            _observe_step(
+                driver,
+                f"pagination_loop_{loop_idx:03d}_stop_after_cards_max_samples",
+                {"total_jobs": len(job_samples)},
+            )
             break
 
         if total_pages is not None and page_no >= int(total_pages):
             logger.info("hirecafe stop: last page reached")
+            _observe_step(
+                driver,
+                f"pagination_loop_{loop_idx:03d}_stop_last_page",
+                {
+                    "page_no": page_no,
+                    "total_pages": total_pages,
+                    "total_jobs": len(job_samples),
+                },
+            )
             break
 
         old_signature = signature
+
+        _observe_step(
+            driver,
+            f"pagination_loop_{loop_idx:03d}_before_scroll_bottom",
+            {"page_signature": old_signature},
+        )
         _scroll_to_bottom(driver)
+
+        _observe_step(
+            driver,
+            f"pagination_loop_{loop_idx:03d}_after_scroll_bottom",
+            {"page_signature": old_signature},
+        )
+
         click_next = _click_next_pagination(driver)
+
+        _observe_step(
+            driver,
+            f"pagination_loop_{loop_idx:03d}_after_next_click_attempt",
+            {"click_next": click_next},
+        )
+
         if not click_next.get("clicked"):
             logger.info(
                 "hirecafe stop: next-page click failed reason=%s",
@@ -1143,7 +2198,24 @@ def _scrape_paginated_card_pages(
                 "hirecafe stop: page did not change after next click signature=%s",
                 new_signature,
             )
+            _observe_step(
+                driver,
+                f"pagination_loop_{loop_idx:03d}_stop_page_unchanged",
+                {
+                    "old_signature": old_signature,
+                    "new_signature": new_signature,
+                },
+            )
             break
+
+        _observe_step(
+            driver,
+            f"pagination_loop_{loop_idx:03d}_page_changed",
+            {
+                "old_signature": old_signature,
+                "new_signature": new_signature,
+            },
+        )
 
         time.sleep(0.8)
 
@@ -1153,9 +2225,27 @@ def _scrape_paginated_card_pages(
 def _navigate_to_hirecafe_ready_page(driver: Any, target_url: str) -> None:
     logger.info("hirecafe navigating to url=%s", target_url)
     driver.get(target_url)
+    _observe_step(driver, "navigate_after_get", {"target_url": target_url})
 
-    logger.info("hirecafe waiting %ss for initial load and Cloudflare check", CLOUDFLARE_WAIT_SECONDS)
-    time.sleep(max(0, CLOUDFLARE_WAIT_SECONDS))
+    base_wait_seconds = max(0.0, float(CLOUDFLARE_WAIT_SECONDS))
+    extra_initial_wait_seconds = max(0.0, HIRECAFE_INITIAL_PAGE_EXTRA_WAIT_SECONDS)
+    initial_wait_seconds = base_wait_seconds + extra_initial_wait_seconds
+    logger.info(
+        "hirecafe waiting %ss for initial load and Cloudflare check (base=%ss extra=%ss)",
+        initial_wait_seconds,
+        base_wait_seconds,
+        extra_initial_wait_seconds,
+    )
+    time.sleep(initial_wait_seconds)
+    _observe_step(
+        driver,
+        "navigate_after_initial_wait",
+        {
+            "cloudflare_wait_seconds": CLOUDFLARE_WAIT_SECONDS,
+            "extra_initial_wait_seconds": extra_initial_wait_seconds,
+            "initial_wait_seconds": initial_wait_seconds,
+        },
+    )
 
     initial_challenge = _probe_cloudflare_challenge(driver)
     logger.info(
@@ -1178,43 +2268,129 @@ def _navigate_to_hirecafe_ready_page(driver: Any, target_url: str) -> None:
             "challenge_detected",
             {"challenge": initial_challenge},
         )
-        clicked = False
+        _observe_step(driver, "challenge_before_click_attempt", {"challenge": initial_challenge})
+        _capture_observation_artifacts(
+            driver,
+            "challenge_before_click",
+            {"challenge": initial_challenge},
+        )
 
-        try:
-            iframes = driver.find_elements(By.TAG_NAME, "iframe")
-            for iframe in iframes:
-                src = iframe.get_attribute("src")
-                if src and "cloudflare" in src.lower():
-                    logger.info("Found Cloudflare iframe, attempting checkbox click")
-                    driver.switch_to.frame(iframe)
-                    checkbox = WebDriverWait(driver, 5).until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='checkbox'], .ctp-checkbox-container, .mark"))
-                    )
-                    checkbox.click()
-                    clicked = True
-                    logger.info("Cloudflare checkbox click sent")
-                    break
-        except Exception as exc:
-            logger.info("Cloudflare iframe click unavailable: %s", type(exc).__name__)
-        finally:
-            try:
-                driver.switch_to.default_content()
-            except Exception:
-                pass
+        challenge_stabilize_seconds = max(0.0, HIRECAFE_CHALLENGE_STABILIZE_SECONDS)
+        if challenge_stabilize_seconds > 0:
+            logger.info(
+                "hirecafe waiting %ss for challenge UI stabilization before click planning",
+                challenge_stabilize_seconds,
+            )
+            time.sleep(challenge_stabilize_seconds)
+            _observe_step(
+                driver,
+                "challenge_after_stabilize_wait",
+                {
+                    "wait_seconds": challenge_stabilize_seconds,
+                    "challenge": _probe_cloudflare_challenge(driver),
+                },
+            )
 
-        if not clicked:
-            clicked = _click_viewport_coordinate(driver, HARDCODED_CF_CLICK_X, HARDCODED_CF_CLICK_Y)
-            if clicked:
-                logger.info(
-                    "hirecafe sent fallback coordinate click x=%s y=%s",
-                    HARDCODED_CF_CLICK_X,
-                    HARDCODED_CF_CLICK_Y,
-                )
+        click_plan = _resolve_cloudflare_click_plan(driver)
+        logger.info(
+            "hirecafe challenge click-plan strategy=%s method=%s candidates=%s checkbox_box=%s iframe_box=%s hidden_input_box=%s text_visual_box=%s text_visual_source=%s",
+            HIRECAFE_CF_CLICK_STRATEGY_VERSION,
+            click_plan.get("method"),
+            len(click_plan.get("click_candidates") or []),
+            click_plan.get("checkbox_box"),
+            click_plan.get("iframe_box"),
+            click_plan.get("hidden_input_box"),
+            click_plan.get("text_visual_box"),
+            click_plan.get("text_visual_source"),
+        )
+        single_click_result: dict[str, Any] = {
+            "clicked": False,
+            "cleared": False,
+            "attempt_count": 0,
+            "attempt_limit": 1,
+            "attempts": [],
+            "last_state": initial_challenge,
+        }
+        click_candidates = click_plan.get("click_candidates") or [
+            {
+                "rank": 1,
+                "recommended": True,
+                "label": "LEGACY",
+                "source": "fallback_hardcoded",
+                "x": HARDCODED_CF_CLICK_X,
+                "y": HARDCODED_CF_CLICK_Y,
+            }
+        ]
+        
+        target = click_candidates[0]
+        logger.info(
+            "hirecafe challenge single-click strategy=%s method=%s selection_source=%s x=%s y=%s",
+            HIRECAFE_CF_CLICK_STRATEGY_VERSION,
+            click_plan.get("method"),
+            target.get("source"),
+            target.get("x"),
+            target.get("y"),
+        )
+        single_click_result = _execute_cloudflare_single_click(driver, click_candidates)
+        clicked = bool(single_click_result.get("clicked"))
+        
+        logger.info("hirecafe challenge single-click completed, sleeping 10s as requested")
+        time.sleep(10.0)
+
+        _capture_observation_artifacts(
+            driver,
+            "challenge_immediate_after_click",
+            {
+                "clicked": clicked,
+                "x": HARDCODED_CF_CLICK_X,
+                "y": HARDCODED_CF_CLICK_Y,
+                "single_click_result": single_click_result,
+            },
+        )
+        # Poll for Turnstile success instead of a fixed sleep.
+        _ts_deadline = time.time() + 5.0
+        while time.time() < _ts_deadline:
+            _ts_state = _probe_cloudflare_challenge(driver)
+            if _ts_state.get("turnstile_success") or not _ts_state.get("active"):
+                break
+            time.sleep(0.5)
+        _capture_observation_artifacts(
+            driver,
+            "challenge_turnstile_poll_after_click",
+            {
+                "clicked": clicked,
+                "x": HARDCODED_CF_CLICK_X,
+                "y": HARDCODED_CF_CLICK_Y,
+                "single_click_result": single_click_result,
+            },
+        )
+
+        _observe_step(
+            driver,
+            "challenge_after_fallback_click",
+            {
+                "clicked": clicked,
+                "legacy_x": HARDCODED_CF_CLICK_X,
+                "legacy_y": HARDCODED_CF_CLICK_Y,
+                "click_plan": click_plan,
+                "single_click_result": single_click_result,
+            },
+        )
 
         _capture_observation_artifacts(
             driver,
             "challenge_after_click_attempt",
-            {"clicked": clicked},
+            {
+                "clicked": clicked,
+                "click_plan": click_plan,
+                "single_click_result": single_click_result,
+            },
+        )
+
+        _observe_step(
+            driver,
+            "challenge_before_clearance_wait",
+            {"clear_timeout_seconds": CLOUDFLARE_CLEAR_TIMEOUT_SECONDS},
         )
 
         cleared, clear_state = _wait_for_cloudflare_clearance(
@@ -1234,18 +2410,29 @@ def _navigate_to_hirecafe_ready_page(driver: Any, target_url: str) -> None:
             )
         else:
             logger.warning(
-                "hirecafe cloudflare still active after %ss markers=%s selectors=%s",
-                CLOUDFLARE_CLEAR_TIMEOUT_SECONDS,
+                "hirecafe cloudflare still active after click markers=%s selectors=%s",
                 clear_state.get("marker_hits"),
                 clear_state.get("selector_hits"),
             )
             _capture_observation_artifacts(
                 driver,
                 "challenge_uncleared",
-                {"challenge": clear_state},
+                {
+                    "challenge": clear_state,
+                },
             )
     else:
         logger.info("hirecafe cloudflare challenge not detected")
+        _observe_step(driver, "challenge_not_detected", {"challenge": initial_challenge})
+
+    _observe_step(
+        driver,
+        "page_ready_wait_start",
+        {
+            "timeout_seconds": HIRECAFE_PAGE_READY_TIMEOUT_SECONDS,
+            "poll_seconds": HIRECAFE_PAGE_READY_POLL_SECONDS,
+        },
+    )
 
     page_ready, page_state = _wait_for_hiring_cafe_page_ready(
         driver,
@@ -1273,6 +2460,11 @@ def _navigate_to_hirecafe_ready_page(driver: Any, target_url: str) -> None:
                 POST_VERIFY_WAIT_SECONDS,
             )
             time.sleep(max(0, POST_VERIFY_WAIT_SECONDS))
+            _observe_step(
+                driver,
+                "post_ready_wait_complete",
+                {"post_verify_wait_seconds": POST_VERIFY_WAIT_SECONDS},
+            )
     else:
         logger.warning(
             "hirecafe page readiness not verified within %ss reason=%s",
@@ -1300,22 +2492,55 @@ def scrape_hirecafe_jobs(
     target_url = (search_url or "").strip() or HIRECAFE_SEARCH_URL
     page_limit = max_pages if max_pages is not None else HIRECAFE_MAX_PAGES
     page_limit = max(1, int(page_limit))
+    requested_mode, effective_mode, blocked_runtime = _resolve_hirecafe_browser_mode()
+
+    if requested_mode != effective_mode and blocked_runtime in ("production", "docker"):
+        logger.warning(
+            "hirecafe requested browser mode=%s blocked in %s runtime, forcing mode=%s",
+            requested_mode,
+            blocked_runtime,
+            effective_mode,
+        )
 
     logger.info(
-        "hirecafe launching browser mode=%s max_samples=%s max_pages=%s url=%s",
-        HIRECAFE_BROWSER_MODE,
+        "hirecafe launching browser requested_mode=%s effective_mode=%s "
+        "max_samples=%s max_pages=%s url=%s",
+        requested_mode,
+        effective_mode,
         max_samples,
         page_limit,
         target_url,
     )
-    driver = _launch_hirecafe_driver()
+    driver = _launch_hirecafe_driver(browser_mode=effective_mode)
+    _observe_step(
+        driver,
+        "driver_launched",
+        {
+            "requested_browser_mode": requested_mode,
+            "effective_browser_mode": effective_mode,
+            "mode_blocked_runtime": blocked_runtime,
+            "max_samples": max_samples,
+            "max_pages": page_limit,
+            "target_url": target_url,
+        },
+    )
 
     try:
         _navigate_to_hirecafe_ready_page(driver, target_url)
+        _observe_step(driver, "navigate_complete", {"target_url": target_url})
 
         job_samples: list[dict[str, Any]] = []
         seen_urls: set[str] = set()
         seen_ids: set[str] = set()
+
+        _observe_step(
+            driver,
+            "pagination_scrape_start",
+            {
+                "max_samples": max_samples,
+                "max_pages": page_limit,
+            },
+        )
 
         pages_visited = _scrape_paginated_card_pages(
             driver,
@@ -1326,13 +2551,41 @@ def scrape_hirecafe_jobs(
             max_pages=page_limit,
         )
 
+        _observe_step(
+            driver,
+            "pagination_scrape_complete",
+            {
+                "pages_visited": pages_visited,
+                "total_jobs": len(job_samples),
+            },
+        )
+
         logger.info(
             "hirecafe scrape complete: pages_visited=%s total=%s jobs",
             pages_visited,
             len(job_samples),
         )
+        _observe_step(
+            driver,
+            "scrape_complete",
+            {
+                "pages_visited": pages_visited,
+                "total_jobs": len(job_samples),
+            },
+        )
         return job_samples
+    except Exception as exc:
+        _observe_step(
+            driver,
+            "scrape_exception",
+            {
+                "error_type": type(exc).__name__,
+                "error": str(exc),
+            },
+        )
+        raise
     finally:
+        _observe_step(driver, "driver_before_quit")
         try:
             driver.quit()
         except Exception:

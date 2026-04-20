@@ -21,6 +21,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium-driver \
     xauth \
     xvfb \
+    fontconfig \
+    fonts-liberation \
+    fonts-dejavu-core \
+    fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
 
 RUN pip install --no-cache-dir --upgrade pip
@@ -33,4 +37,12 @@ RUN playwright install --with-deps chromium
 
 COPY . /app
 
-CMD sh -c "xvfb-run -a uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"
+# Non-root user — reduces detection of headless bots running as uid 0
+# Give the user ownership of chromedriver so undetected_chromedriver can patch it
+RUN groupadd -g 1000 appuser && useradd -u 1000 -g appuser -m -d /home/appuser appuser \
+    && chown -R appuser:appuser /app \
+    && chown appuser:appuser /usr/bin/chromedriver
+USER appuser
+
+# Realistic screen resolution (1920x1080x24) for Xvfb
+CMD sh -c "xvfb-run -a --server-args='-screen 0 1920x1080x24' uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"

@@ -599,6 +599,7 @@ def _classify_relevant_jobs(jobs: list[dict[str, Any]]) -> tuple[list[dict[str, 
                     enriched["role_category"] = decision.get("role_category", "")
                     enriched["priority"] = decision.get("priority", "")
                     enriched["reason"] = decision.get("reason", "")
+                    enriched["company_size"] = decision.get("company_size", "")
                     enriched["confidence"] = decision.get("confidence", "")
                     relevant_jobs.append(enriched)
             logger.info(
@@ -630,6 +631,7 @@ def _classify_relevant_jobs(jobs: list[dict[str, Any]]) -> tuple[list[dict[str, 
                 enriched["role_category"] = decision.get("role_category", "")
                 enriched["priority"] = decision.get("priority", "")
                 enriched["reason"] = decision.get("reason", "")
+                enriched["company_size"] = decision.get("company_size", "")
                 enriched["confidence"] = decision.get("confidence", "")
                 relevant_jobs.append(enriched)
         logger.info(
@@ -726,7 +728,8 @@ def _classify_with_gemini(
     model = genai.GenerativeModel(model_name, system_instruction=prompt)
     description = _job_description_for_relevance(job, batch=False)
     content = (
-        "Return ONLY JSON with keys: relevant, reason, role_category, priority.\n"
+        "Return ONLY JSON with keys: relevant, reason, role_category, priority, company_size.\n"
+        "company_size must be one of: startup, mnc, mid_level, unknown.\n"
         "Job payload:\n"
         f"{json.dumps({'title': job.get('title'), 'company': job.get('company'), 'location': job.get('location'), 'description': description, 'experience': job.get('experience'), 'salary': job.get('salary'), 'job_type': job.get('job_type'), 'site': job.get('site'), 'job_url': job.get('job_url')}, ensure_ascii=True)}"
     )
@@ -746,6 +749,7 @@ def _classify_with_gemini(
         "role_category": str(normalized.get("role_category", "")),
         "priority": str(normalized.get("priority", "")),
         "reason": str(normalized.get("reason", "")),
+        "company_size": str(normalized.get("company_size", "")),
         "confidence": normalized.get("confidence", 0),
     }
 
@@ -779,7 +783,8 @@ def _classify_batch_with_gemini(
     content = (
         "Classify all rows below in one response.\n"
         "Return ONLY a JSON array.\n"
-        "Each returned item must include: row, relevant, reason, role_category, priority.\n"
+        "Each returned item must include: row, relevant, reason, role_category, priority, company_size.\n"
+        "company_size must be one of: startup, mnc, mid_level, unknown.\n"
         "Only include items where relevant=true.\n"
         f"{json.dumps(payload, ensure_ascii=True)}"
     )
@@ -814,6 +819,7 @@ def _classify_batch_with_gemini(
                 "role_category": "",
                 "priority": "",
                 "reason": "Missing row decision from batch classifier.",
+                "company_size": "",
                 "confidence": 0,
             },
         )
@@ -867,6 +873,7 @@ def _normalize_classifier_decision(parsed: dict[str, Any]) -> dict[str, Any]:
             "role_category": parsed.get("role_category", ""),
             "priority": parsed.get("priority", ""),
             "reason": parsed.get("reason", ""),
+            "company_size": parsed.get("company_size", ""),
             "confidence": parsed.get("confidence", 0),
         }
 

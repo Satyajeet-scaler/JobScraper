@@ -625,6 +625,12 @@ def _classify_relevant_jobs_for_role_pipeline(
                 candidate = candidate.get("prompt") or candidate.get("value")
             if isinstance(candidate, str) and candidate.strip():
                 role_prompt = candidate
+            size_rules = (role_cfg or {}).get("ai_company_size_rules")
+            if isinstance(size_rules, str) and size_rules.strip():
+                if role_prompt and role_prompt.strip():
+                    role_prompt = f"{role_prompt.rstrip()}\n\n{size_rules.strip()}"
+                else:
+                    role_prompt = size_rules.strip()
 
     if not role_prompt:
         role_prompt = os.getenv("ROLE_PIPELINE_AI_RELEVANCE_PROMPT")
@@ -645,7 +651,7 @@ def _classify_relevant_jobs_for_role_pipeline(
 
 def _normalize_role_pipeline_parsed(parsed: dict[str, Any]) -> dict[str, dict[str, Any]]:
     """Normalise a top-level role map from JSON (env string or file)."""
-    reserved_role_keys = {"ai_relevance_prompt", "handover"}
+    reserved_role_keys = {"ai_relevance_prompt", "ai_company_size_rules", "handover"}
     out: dict[str, dict[str, Any]] = {}
     for role_key, source_map in parsed.items():
         if not isinstance(role_key, str) or not isinstance(source_map, dict):

@@ -504,6 +504,7 @@ Endpoints:
 | POST   | `/internal/run-scrape-jobs`                       | Legacy scrape-only.                   |
 | POST   | `/internal/run-classify-relevant`                 | Legacy classify-only.                 |
 | POST   | `/internal/run-recruiter-info`                    | Legacy recruiter info extraction.     |
+| POST   | `/internal/run-recruiter-profile-backfill`        | Backfill recruiter profile URLs from Lusha into recruiter-info tabs. |
 | POST   | `/internal/run-candidate-jd-evaluator`            | Legacy candidate-JD evaluator.        |
 | POST   | `/internal/run-candidate-match-slack`             | Legacy candidate match Slack post.    |
 | POST   | `/internal/fix-relevant-jobs-tab`                 | Repair tool for `relevant_jobs_*`.    |
@@ -702,6 +703,15 @@ for the long tail.
   `LINKEDIN_RECRUITER_LAUNCH_RETRY_COUNT` / `_DELAY_S`,
   `LINKEDIN_RECRUITER_RECYCLE_EVERY`,
   `LINKEDIN_RECRUITER_FORCE_FAIL_TIMEOUT_S`.
+
+**Lusha recruiter backfill**
+
+- `LUSHA_API_KEY` — required for recruiter-profile backfill.
+- `LUSHA_BASE_URL` — default `https://api.lusha.com`.
+- `LUSHA_TIMEOUT_SECONDS` — request timeout for Lusha calls (default `20`).
+- `LUSHA_RETRY_COUNT` — retry attempts for failed Lusha calls (default `2`).
+- `LUSHA_TOP_CONTACTS_PER_JOB` — max contacts to enrich per job row (default `3`).
+- `LUSHA_RECRUITER_TITLES` — optional comma-separated title override for contact search.
 
 **Slack / handover**
 

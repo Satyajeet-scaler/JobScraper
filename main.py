@@ -58,6 +58,10 @@ from services.role_recruiter_info_service import (
     run_role_recruiter_info_extraction,
 )
 from services.recruiter_info_service import get_recruiter_info_run_metrics, run_recruiter_info_extraction
+from services.recruiter_profile_backfill_service import (
+    get_recruiter_profile_backfill_run_metrics,
+    run_recruiter_profile_backfill,
+)
 from services.candidate_jd_evaluator_service import (
     get_candidate_jd_evaluator_run_metrics,
     run_candidate_jd_evaluator,
@@ -1401,6 +1405,51 @@ def get_recruiter_info_run_status(
 ) -> JSONResponse:
     validate_internal_trigger_token(x_internal_token)
     metrics = get_recruiter_info_run_metrics(run_id)
+    if not metrics:
+        raise HTTPException(status_code=404, detail="Run ID not found.")
+    return JSONResponse(content=metrics)
+
+
+@app.post("/internal/run-recruiter-profile-backfill")
+def run_recruiter_profile_backfill_endpoint(
+    background_tasks: BackgroundTasks,
+    run_date: Optional[str] = Query(default=None, description="Optional date YYYY-MM-DD"),
+    role: Optional[str] = Query(default=None, description="Optional role for role-based relevant/recruiter tabs."),
+    relevant_tab: Optional[str] = Query(default=None, description="Optional explicit relevant jobs tab name."),
+    recruiters_tab: Optional[str] = Query(default=None, description="Optional explicit recruiters info tab name."),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    resolved_date = run_date or _cron_today()
+    run_id = str(uuid.uuid4())
+    background_tasks.add_task(
+        run_recruiter_profile_backfill,
+        run_id,
+        resolved_date,
+        role,
+        relevant_tab,
+        recruiters_tab,
+    )
+    return JSONResponse(
+        status_code=status.HTTP_202_ACCEPTED,
+        content={
+            "run_id": run_id,
+            "status": "accepted",
+            "run_date": resolved_date,
+            "role": (role or "").strip(),
+            "relevant_tab": (relevant_tab or "").strip(),
+            "recruiters_tab": (recruiters_tab or "").strip(),
+        },
+    )
+
+
+@app.get("/internal/run-recruiter-profile-backfill/{run_id}")
+def get_recruiter_profile_backfill_run_status(
+    run_id: str,
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    validate_internal_trigger_token(x_internal_token)
+    metrics = get_recruiter_profile_backfill_run_metrics(run_id)
     if not metrics:
         raise HTTPException(status_code=404, detail="Run ID not found.")
     return JSONResponse(content=metrics)

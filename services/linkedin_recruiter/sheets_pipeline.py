@@ -103,6 +103,7 @@ def write_linkedin_recruiters_for_relevant_jobs(
     append_mode: bool = False,
     dedupe_existing_on: tuple[str, ...] | None = None,
     extra_columns: dict[str, Any] | None = None,
+    include_company_contacts_fallback: bool = True,
 ) -> LinkedinRecruiterSheetResult:
     """
     Scrape LinkedIn recruiter cards for relevant LinkedIn job URLs and append rows to
@@ -210,7 +211,7 @@ def write_linkedin_recruiters_for_relevant_jobs(
                 }
             )
 
-    contacts_map = _load_company_contact_email_map()
+    contacts_map = _load_company_contact_email_map() if include_company_contacts_fallback else {}
     if contacts_map:
         for job in relevant_jobs:
             url = (job.get("job_url") or "").strip()

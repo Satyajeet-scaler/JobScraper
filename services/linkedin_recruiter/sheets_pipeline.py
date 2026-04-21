@@ -23,6 +23,7 @@ from services.google_sheets import GoogleSheetsWriter
 from services.handover_owners import worksheet_row_dicts
 from services.linkedin_recruiter.pipeline import is_linkedin_job_url, scrape_linkedin_job_recruiters_sync
 from services.linkedin_session import get_linkedin_storage_path
+from services.mysql_jobs_store import upsert_job_recruiter_contact
 
 logger = logging.getLogger(__name__)
 
@@ -257,13 +258,18 @@ def write_linkedin_recruiters_for_relevant_jobs(
     tab = recruiters_tab or os.getenv("RECRUITERS_INFO_WORKSHEET") or f"recruiters_info_{run_date}"
     chunk_size = max(1, int(os.getenv("GOOGLE_SHEETS_WRITE_CHUNK_SIZE", "200")))
 
-    writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
+    write_sheet = (os.getenv("ROLE_PIPELINE_SHEET_WRITE_ENABLED") or "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id) if write_sheet else None
     url_set = frozenset(job_urls_with_recruiter_profile)
     if not rows:
         logger.info("linkedin recruiter sheet: no recruiter/profile/contact rows; skipping sheet write tab=%s", tab)
         return 0, url_set
 
-    if append_mode:
+    if append_mode and write_sheet:
         rows_to_write = rows
         if dedupe_existing_on:
             existing_rows = _read_existing_rows(writer, tab)
@@ -301,15 +307,31 @@ def write_linkedin_recruiters_for_relevant_jobs(
             len(rows_to_write),
             len(url_set),
         )
+        _dual_write_recruiter_rows(rows_to_write)
         return len(rows_to_write), url_set
 
-    _retry_sheet_write(
-        action=lambda: writer.write_rows(tab, rows, chunk_size=chunk_size),
-        retries=3,
-        initial_delay_seconds=1.0,
-    )
-    logger.info("linkedin recruiter sheet wrote tab=%s rows=%s jobs_with_recruiters=%s", tab, len(rows), len(url_set))
+    if write_sheet:
+        _retry_sheet_write(
+            action=lambda: writer.write_rows(tab, rows, chunk_size=chunk_size),
+            retries=3,
+            initial_delay_seconds=1.0,
+        )
+        logger.info("linkedin recruiter sheet wrote tab=%s rows=%s jobs_with_recruiters=%s", tab, len(rows), len(url_set))
+    else:
+        logger.info("linkedin recruiter sheet write disabled tab=%s rows=%s", tab, len(rows))
+    _dual_write_recruiter_rows(rows)
     return len(rows), url_set
+
+
+def _dual_write_recruiter_rows(rows: list[dict[str, Any]]) -> None:
+    enabled = (os.getenv("ROLE_PIPELINE_MYSQL_DUAL_WRITE_ENABLED") or "true").strip().lower()
+    if enabled not in ("1", "true", "yes"):
+        return
+    try:
+        for row in rows:
+            upsert_job_recruiter_contact(row)
+    except Exception as exc:
+        logger.warning("linkedin recruiter mysql dual-write failed err=%s", exc)
 
 
 def _read_existing_rows(writer: GoogleSheetsWriter, tab: str) -> list[dict[str, str]]:

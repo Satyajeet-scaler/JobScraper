@@ -14,6 +14,7 @@ import gspread
 from services.description_text_parts import apply_three_part_text_columns
 from services.google_sheets import GoogleSheetsWriter
 from services.handover_owners import worksheet_row_dicts
+from services.mysql_jobs_store import upsert_job_relevance, upsert_job_scrape
 from services.pipeline import _classify_relevant_jobs, _dedupe_jobs, _parse_csv_env, _retry
 from services.role_scrapers import SCRAPER_REGISTRY
 
@@ -347,8 +348,6 @@ def _read_rows_from_tab(tab_name: str, allow_missing: bool = False) -> list[dict
 def _append_rows_to_tab(tab_name: str, rows: list[dict[str, Any]]) -> int:
     if not rows:
         return 0
-    writer = _get_writer()
-    chunk_size = max(1, int(os.getenv("GOOGLE_SHEETS_WRITE_CHUNK_SIZE", "200")))
     rows_for_sheet, overflow_rows, overflow_chars = apply_three_part_text_columns(rows, "description")
     if overflow_rows:
         logger.warning(
@@ -357,15 +356,43 @@ def _append_rows_to_tab(tab_name: str, rows: list[dict[str, Any]]) -> int:
             overflow_chars,
             tab_name,
         )
-    headers = _derive_headers(rows_for_sheet)
-    data_rows = [[_stringify_cell(row.get(col)) for col in headers] for row in rows_for_sheet]
-    writer.append_to_worksheet(
-        worksheet_title=tab_name,
-        data_rows=data_rows,
-        header_row=headers,
-        chunk_size=chunk_size,
+    write_sheet = (os.getenv("ROLE_PIPELINE_SHEET_WRITE_ENABLED") or "true").strip().lower() in (
+        "1",
+        "true",
+        "yes",
     )
+    if write_sheet:
+        writer = _get_writer()
+        chunk_size = max(1, int(os.getenv("GOOGLE_SHEETS_WRITE_CHUNK_SIZE", "200")))
+        headers = _derive_headers(rows_for_sheet)
+        data_rows = [[_stringify_cell(row.get(col)) for col in headers] for row in rows_for_sheet]
+        writer.append_to_worksheet(
+            worksheet_title=tab_name,
+            data_rows=data_rows,
+            header_row=headers,
+            chunk_size=chunk_size,
+        )
+    _dual_write_rows_to_mysql(tab_name=tab_name, rows=rows_for_sheet)
     return len(rows_for_sheet)
+
+
+def _dual_write_rows_to_mysql(*, tab_name: str, rows: list[dict[str, Any]]) -> None:
+    enabled = (os.getenv("ROLE_PIPELINE_MYSQL_DUAL_WRITE_ENABLED") or "true").strip().lower()
+    if enabled not in ("1", "true", "yes"):
+        return
+    if not rows:
+        return
+    try:
+        if "role_scraped_" in tab_name:
+            for row in rows:
+                upsert_job_scrape(row)
+            return
+        if "role_relevant_" in tab_name:
+            for row in rows:
+                upsert_job_relevance(row)
+            return
+    except Exception as exc:
+        logger.warning("role-pipeline mysql dual-write failed tab=%s err=%s", tab_name, exc)
 
 
 def _get_writer() -> GoogleSheetsWriter:

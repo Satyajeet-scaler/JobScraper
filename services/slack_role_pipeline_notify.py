@@ -8,6 +8,7 @@ from services.google_sheets import GoogleSheetsWriter
 from services.handover_owners import load_owner_rows_for_handover, worksheet_row_dicts
 from services.role_pipeline import _role_slug
 from services.role_recruiter_info_service import role_recruiters_tab_name_for_role
+from services.mysql_jobs_store import fetch_recruiter_rows_for_role, mark_recruiter_contacts_handover_sent
 from services.slack_relevant_jobs_handover import (
     _resolve_min_candidate_match,
     _role_includes_candidate_match_in_slack,
@@ -64,7 +65,12 @@ def send_role_handover_notifications(
         out["skipped_reason"] = "SLACK_WEBHOOK_URL not configured"
         return out
 
-    recruiter_rows = _read_role_recruiter_rows(recruiters_tab)
+    recruiter_rows = _read_role_recruiter_rows(
+        recruiters_tab,
+        role=resolved_role,
+        run_date=resolved_date,
+        upstream_run_id=upstream_run_id,
+    )
     if not recruiter_rows:
         out["skipped_reason"] = "no recruiter rows"
         return out
@@ -74,8 +80,8 @@ def send_role_handover_notifications(
         resolved_date,
         upstream_run_id=upstream_run_id,
     )
-    case3 = [row for row in case3 if _is_assigned_owner_empty(row)]
-    case2 = [row for row in case2 if _is_assigned_owner_empty(row)]
+    case3 = [row for row in case3 if not _is_handover_sent(row)]
+    case2 = [row for row in case2 if not _is_handover_sent(row)]
     candidate_match_count_map = load_candidate_match_count_map_for_role(
         role=resolved_role,
         run_date=resolved_date,
@@ -153,12 +159,35 @@ def send_role_handover_notifications(
             ),
         )
         out["assigned_owner_rows_updated"] += len(sent_case3_keys)
+    if sent_case3_keys:
+        out["handover_sent_rows_updated"] = mark_recruiter_contacts_handover_sent(
+            role=resolved_role,
+            run_date=resolved_date,
+            identities=sent_case3_keys,
+        )
+    else:
+        out["handover_sent_rows_updated"] = 0
 
     return out
 
 
-def _read_role_recruiter_rows(tab: str) -> list[dict[str, str]]:
+def _read_role_recruiter_rows(
+    tab: str,
+    *,
+    role: str,
+    run_date: str,
+    upstream_run_id: str | None = None,
+) -> list[dict[str, str]]:
     import os
+
+    use_mysql = (os.getenv("ROLE_PIPELINE_MYSQL_READ_ENABLED") or "false").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+    if use_mysql:
+        rows = fetch_recruiter_rows_for_role(role=role, run_date=run_date, upstream_run_id=upstream_run_id)
+        return [dict(r) for r in rows]
 
     spreadsheet_id = (os.getenv("GOOGLE_SPREADSHEET_ID") or "").strip()
     if not spreadsheet_id:
@@ -187,7 +216,7 @@ def _split_recruiter_cases(
             continue
         if upstream_run_id:
             row_upstream = (row.get("role_pipeline_upstream_run_id") or "").strip()
-            if row_upstream != upstream_run_id:
+            if row_upstream and row_upstream != upstream_run_id:
                 continue
         profile = (row.get("recruiter_profile_url") or "").strip()
         email = (row.get("recruiter_email") or "").strip()
@@ -217,8 +246,8 @@ def _row_meets_recruiter_handover_threshold(
     return count >= min_count
 
 
-def _is_assigned_owner_empty(row: dict[str, str]) -> bool:
-    return not str(row.get("assigned owner") or row.get("assigned_owner") or "").strip()
+def _is_handover_sent(row: dict[str, str]) -> bool:
+    return str(row.get("handover_sent") or "").strip().lower() in ("1", "true", "yes")
 
 
 def _google_spreadsheet_id() -> str:
@@ -249,8 +278,6 @@ def _is_recruiter_case3_selected(
         if (row.get("role_pipeline_upstream_run_id") or "").strip() != upstream_run_id:
             return False
     if not (row.get("recruiter_profile_url") or "").strip():
-        return False
-    if not _is_assigned_owner_empty(row):
         return False
     key = _recruiter_row_identity(row)
     return key in selected_keys

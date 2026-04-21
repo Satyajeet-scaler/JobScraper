@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 
 from services.google_sheets import GoogleSheetsWriter
 from services.handover_owners import worksheet_row_dicts
+from services.mysql_jobs_store import fetch_jd_rows_for_role
 
 try:
     import google.generativeai as genai
@@ -172,14 +173,22 @@ def run_candidate_jd_evaluator_for_role(
         candidates_writer = GoogleSheetsWriter(spreadsheet_id=_require_spreadsheet_id())
         candidates = _read_candidates(candidates_writer)
 
-        writer = GoogleSheetsWriter(spreadsheet_id=_require_spreadsheet_id())
-        jd_rows_all = _read_jd_rows_for_date(
-            writer,
-            resolved_run_date,
-            recruiters_tab,
-            allow_empty=True,
-            pipeline_role=resolved_role,
+        use_mysql = (os.getenv("ROLE_PIPELINE_MYSQL_READ_ENABLED") or "false").strip().lower() in (
+            "1",
+            "true",
+            "yes",
         )
+        if use_mysql:
+            jd_rows_all = fetch_jd_rows_for_role(role=resolved_role, run_date=resolved_run_date)
+        else:
+            writer = GoogleSheetsWriter(spreadsheet_id=_require_spreadsheet_id())
+            jd_rows_all = _read_jd_rows_for_date(
+                writer,
+                resolved_run_date,
+                recruiters_tab,
+                allow_empty=True,
+                pipeline_role=resolved_role,
+            )
 
         already_evaluated = _existing_candidate_match_job_urls(
             spreadsheet_id=_require_spreadsheet_id(),

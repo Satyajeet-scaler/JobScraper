@@ -87,20 +87,67 @@ def run_recruiter_profile_backfill(
         )
 
         existing_with_profile_urls = _job_urls_with_recruiter_profile(existing_recruiter_rows)
-        base_candidates = [
-            dict(row)
-            for row in relevant_rows
-            if _normalized_job_url(row) and _normalized_job_url(row) not in existing_with_profile_urls
-        ]
+        base_candidates: list[dict[str, Any]] = []
+        for row in relevant_rows:
+            row_copy = dict(row)
+            job_url = _normalized_job_url(row_copy)
+            company = str(row_copy.get("company") or "").strip() or "-"
+            title = str(row_copy.get("title") or "").strip() or "-"
+            company_size = _normalized_company_size(row_copy) or "unknown"
+
+            if not job_url:
+                logger.warning(
+                    "recruiter-profile-backfill row-skip reason=missing_job_url company=%s title=%s company_size=%s",
+                    company,
+                    title,
+                    company_size,
+                )
+                continue
+            if job_url in existing_with_profile_urls:
+                logger.info(
+                    "recruiter-profile-backfill row-skip reason=existing_recruiter_profile job_url=%s company=%s title=%s company_size=%s",
+                    job_url,
+                    company,
+                    title,
+                    company_size,
+                )
+                continue
+            base_candidates.append(row_copy)
+
         size_allowlist = _company_size_allowlist()
         if size_allowlist is None:
             candidates = base_candidates
             jobs_skipped_by_company_size = 0
         else:
-            candidates = [
-                row for row in base_candidates if _passes_company_size_filter(row, size_allowlist)
-            ]
-            jobs_skipped_by_company_size = len(base_candidates) - len(candidates)
+            candidates = []
+            jobs_skipped_by_company_size = 0
+            for row in base_candidates:
+                job_url = _normalized_job_url(row)
+                company = str(row.get("company") or "").strip() or "-"
+                title = str(row.get("title") or "").strip() or "-"
+                company_size = _normalized_company_size(row) or "unknown"
+                if _passes_company_size_filter(row, size_allowlist):
+                    candidates.append(row)
+                    continue
+                jobs_skipped_by_company_size += 1
+                logger.info(
+                    "recruiter-profile-backfill row-skip reason=company_size_filtered job_url=%s company=%s title=%s company_size=%s allowlist=%s",
+                    job_url or "-",
+                    company,
+                    title,
+                    company_size,
+                    ",".join(sorted(size_allowlist)),
+                )
+
+        for row in candidates:
+            logger.info(
+                "recruiter-profile-backfill row-selected-for-lusha job_url=%s company=%s title=%s company_size=%s",
+                _normalized_job_url(row) or "-",
+                str(row.get("company") or "").strip() or "-",
+                str(row.get("title") or "").strip() or "-",
+                _normalized_company_size(row) or "unknown",
+            )
+
         enriched_rows, lush_metrics = _build_rows_from_lusha(
             run_date=resolved_run_date,
             relevant_tab=resolved_tabs["relevant_tab"],
@@ -179,6 +226,22 @@ def _resolve_tabs(
         "relevant_tab": f"relevant_jobs_{run_date}",
         "recruiters_tab": recruiters_tab or f"recruiters_info_{run_date}",
     }
+
+
+def preview_recruiter_profile_backfill_tabs(
+    *,
+    run_date: str,
+    role: str | None = None,
+    relevant_tab: str | None = None,
+    recruiters_tab: str | None = None,
+) -> dict[str, str]:
+    """Resolve worksheet tab names the same way as :func:`run_recruiter_profile_backfill` (e.g. for 202 responses)."""
+    return _resolve_tabs(
+        run_date=run_date.strip(),
+        role=(role or "").strip(),
+        relevant_tab=(relevant_tab or "").strip(),
+        recruiters_tab=(recruiters_tab or "").strip(),
+    )
 
 
 def _derive_recruiters_tab_from_relevant_tab(relevant_tab: str) -> str:
@@ -261,6 +324,12 @@ def _build_rows_from_lusha(
         company = str(job.get("company") or "").strip()
         job_url = _normalized_job_url(job)
         if not company or not job_url:
+            logger.warning(
+                "recruiter-profile-backfill lusha-skip missing-company-or-job-url company=%s job_url=%s title=%s",
+                company or "-",
+                job_url or "-",
+                str(job.get("title") or "").strip() or "-",
+            )
             continue
         jobs_searched += 1
         try:
@@ -271,16 +340,59 @@ def _build_rows_from_lusha(
             )
             if contacts:
                 jobs_with_hits += 1
+            else:
+                reason = f"{job_url}: no contacts returned by Lusha search"
+                lush_errors.append(reason)
+                logger.warning(
+                    "recruiter-profile-backfill lusha-search-no-hits job_url=%s company=%s",
+                    job_url,
+                    company,
+                )
             request_id = str(search_response.get("requestId") or "").strip()
+            if not request_id:
+                reason = f"{job_url}: missing requestId in Lusha search response"
+                lush_errors.append(reason)
+                logger.warning(
+                    "recruiter-profile-backfill lusha-search-missing-request-id job_url=%s company=%s",
+                    job_url,
+                    company,
+                )
             for contact in contacts[: _lusha_top_contacts_per_job()]:
                 contact_id = _extract_contact_id(contact)
-                if not contact_id or not request_id:
+                if not contact_id:
+                    reason = f"{job_url}: missing contact id in Lusha search contact payload"
+                    lush_errors.append(reason)
+                    logger.warning(
+                        "recruiter-profile-backfill lusha-contact-missing-id job_url=%s company=%s",
+                        job_url,
+                        company,
+                    )
+                    continue
+                if not request_id:
+                    logger.warning(
+                        "recruiter-profile-backfill lusha-enrich-skip-missing-request-id job_url=%s company=%s contact_id=%s",
+                        job_url,
+                        company,
+                        contact_id,
+                    )
                     continue
                 enrich_calls += 1
-                enrich_response = _lusha_contact_enrich(
-                    request_id=request_id,
-                    contact_ids=[contact_id],
-                )
+                try:
+                    enrich_response = _lusha_contact_enrich(
+                        request_id=request_id,
+                        contact_ids=[contact_id],
+                    )
+                except Exception as exc:
+                    reason = f"{job_url}: enrich failed for contact_id={contact_id} reason={exc}"
+                    lush_errors.append(reason)
+                    logger.warning(
+                        "recruiter-profile-backfill lusha-enrich-failed job_url=%s company=%s contact_id=%s error=%s",
+                        job_url,
+                        company,
+                        contact_id,
+                        exc,
+                    )
+                    continue
                 charged = _extract_credits_charged(enrich_response)
                 credits_charged_total += charged
                 enriched_contact = _extract_enriched_contact(
@@ -289,8 +401,23 @@ def _build_rows_from_lusha(
                 )
                 profile_url = _extract_linkedin_url_from_enrich(enriched_contact)
                 if not profile_url:
+                    reason = f"{job_url}: enrich returned no linkedinUrl for contact_id={contact_id}"
+                    lush_errors.append(reason)
+                    logger.warning(
+                        "recruiter-profile-backfill lusha-linkedin-missing job_url=%s company=%s contact_id=%s",
+                        job_url,
+                        company,
+                        contact_id,
+                    )
                     continue
                 jobs_with_profile.add(job_url)
+                logger.info(
+                    "recruiter-profile-backfill lusha-linkedin-found job_url=%s company=%s contact_id=%s linkedin_url=%s",
+                    job_url,
+                    company,
+                    contact_id,
+                    profile_url,
+                )
                 rows.append(
                     {
                         "run_date": run_date,
@@ -318,6 +445,12 @@ def _build_rows_from_lusha(
                 )
         except Exception as exc:
             lush_errors.append(f"{job_url}: {exc}")
+            logger.warning(
+                "recruiter-profile-backfill lusha-search-failed job_url=%s company=%s error=%s",
+                job_url,
+                company,
+                exc,
+            )
 
     metrics = {
         "jobs_searched_on_lusha": jobs_searched,

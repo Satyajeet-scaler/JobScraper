@@ -60,6 +60,7 @@ from services.role_recruiter_info_service import (
 from services.recruiter_info_service import get_recruiter_info_run_metrics, run_recruiter_info_extraction
 from services.recruiter_profile_backfill_service import (
     get_recruiter_profile_backfill_run_metrics,
+    preview_recruiter_profile_backfill_tabs,
     run_recruiter_profile_backfill,
 )
 from services.candidate_jd_evaluator_service import (
@@ -1421,6 +1422,15 @@ def run_recruiter_profile_backfill_endpoint(
 ) -> JSONResponse:
     validate_internal_trigger_token(x_internal_token)
     resolved_date = run_date or _cron_today()
+    try:
+        resolved_tabs = preview_recruiter_profile_backfill_tabs(
+            run_date=resolved_date,
+            role=role,
+            relevant_tab=relevant_tab,
+            recruiters_tab=recruiters_tab,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
     run_id = str(uuid.uuid4())
     background_tasks.add_task(
         run_recruiter_profile_backfill,
@@ -1437,8 +1447,8 @@ def run_recruiter_profile_backfill_endpoint(
             "status": "accepted",
             "run_date": resolved_date,
             "role": (role or "").strip(),
-            "relevant_tab": (relevant_tab or "").strip(),
-            "recruiters_tab": (recruiters_tab or "").strip(),
+            "relevant_tab": resolved_tabs["relevant_tab"],
+            "recruiters_tab": resolved_tabs["recruiters_tab"],
         },
     )
 

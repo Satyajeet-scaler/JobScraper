@@ -710,7 +710,7 @@ for the long tail.
 - `LUSHA_BASE_URL` — default `https://api.lusha.com`.
 - `LUSHA_TIMEOUT_SECONDS` — request timeout for Lusha calls (default `20`).
 - `LUSHA_RETRY_COUNT` — retry attempts for failed Lusha calls (default `2`).
-- `LUSHA_TOP_CONTACTS_PER_JOB` — max contacts to enrich per job row (default `3`).
+- `LUSHA_TOP_CONTACTS_PER_JOB` — max contacts to enrich per job row (default `1`).
 - `LUSHA_RECRUITER_TITLES` — optional comma-separated title override for contact search.
 
 **Slack / handover**

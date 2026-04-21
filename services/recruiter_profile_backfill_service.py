@@ -92,7 +92,8 @@ def run_recruiter_profile_backfill(
             "candidate_jobs_for_backfill": len(candidates),
             "jobs_searched_on_lusha": lush_metrics["jobs_searched_on_lusha"],
             "jobs_with_lusha_search_hits": lush_metrics["jobs_with_lusha_search_hits"],
-            "person_enrich_calls": lush_metrics["person_enrich_calls"],
+            "enrich_calls": lush_metrics["enrich_calls"],
+            "lusha_credits_charged_total": lush_metrics["lusha_credits_charged_total"],
             "rows_with_lusha_linkedin_url": len(enriched_rows),
             "jobs_with_new_recruiter_profiles_found": lush_metrics["jobs_with_new_recruiter_profiles_found"],
             "recruiter_rows_appended": rows_written,
@@ -216,7 +217,8 @@ def _build_rows_from_lusha(
     jobs_with_profile: set[str] = set()
     jobs_searched = 0
     jobs_with_hits = 0
-    person_calls = 0
+    enrich_calls = 0
+    credits_charged_total = 0
     lush_errors: list[str] = []
     titles = _recruiter_titles()
 
@@ -227,20 +229,30 @@ def _build_rows_from_lusha(
             continue
         jobs_searched += 1
         try:
-            contacts = _lusha_contact_search(
+            search_response, contacts = _lusha_contact_search(
                 company=company,
                 location=str(job.get("location") or "").strip(),
                 recruiter_titles=titles,
             )
             if contacts:
                 jobs_with_hits += 1
+            request_id = str(search_response.get("requestId") or "").strip()
             for contact in contacts[: _lusha_top_contacts_per_job()]:
-                person_id = _extract_person_id(contact)
-                if not person_id:
+                contact_id = _extract_contact_id(contact)
+                if not contact_id or not request_id:
                     continue
-                person_calls += 1
-                person = _lusha_person_lookup(person_id=person_id)
-                profile_url = _extract_linkedin_url(person)
+                enrich_calls += 1
+                enrich_response = _lusha_contact_enrich(
+                    request_id=request_id,
+                    contact_ids=[contact_id],
+                )
+                charged = _extract_credits_charged(enrich_response)
+                credits_charged_total += charged
+                enriched_contact = _extract_enriched_contact(
+                    enrich_response,
+                    contact_id=contact_id,
+                )
+                profile_url = _extract_linkedin_url_from_enrich(enriched_contact)
                 if not profile_url:
                     continue
                 jobs_with_profile.add(job_url)
@@ -255,13 +267,18 @@ def _build_rows_from_lusha(
                         "matched_role": job.get("matched_role", ""),
                         "role_category": job.get("role_category", ""),
                         "priority": job.get("priority", ""),
-                        "recruiter_name": _extract_name(person, contact),
-                        "recruiter_headline": _extract_headline(person, contact),
+                        "recruiter_name": _extract_name_from_enrich(enriched_contact, contact),
+                        "recruiter_headline": _extract_headline_from_enrich(enriched_contact, contact),
                         "recruiter_profile_url": profile_url,
                         "recruiter_email": "",
                         "meet_the_team_section_found": False,
                         "recruiter_source": "lusha_search",
                         "scrape_error": "",
+                        "lusha_search_response_json": search_response,
+                        "lusha_enrich_response_json": enrich_response,
+                        "lusha_request_id": request_id,
+                        "lusha_contact_id": contact_id,
+                        "lusha_credits_charged": charged,
                     }
                 )
         except Exception as exc:
@@ -270,7 +287,8 @@ def _build_rows_from_lusha(
     metrics = {
         "jobs_searched_on_lusha": jobs_searched,
         "jobs_with_lusha_search_hits": jobs_with_hits,
-        "person_enrich_calls": person_calls,
+        "enrich_calls": enrich_calls,
+        "lusha_credits_charged_total": credits_charged_total,
         "jobs_with_new_recruiter_profiles_found": len(jobs_with_profile),
         "lusha_error_count": len(lush_errors),
         "lusha_errors": lush_errors,
@@ -287,7 +305,7 @@ def _recruiter_titles() -> list[str]:
 
 
 def _lusha_top_contacts_per_job() -> int:
-    return max(1, int((os.getenv("LUSHA_TOP_CONTACTS_PER_JOB") or "3").strip() or "3"))
+    return max(1, int((os.getenv("LUSHA_TOP_CONTACTS_PER_JOB") or "1").strip() or "1"))
 
 
 def _lusha_base_url() -> str:
@@ -320,7 +338,7 @@ def _lusha_contact_search(
     company: str,
     location: str,
     recruiter_titles: list[str],
-) -> list[dict[str, Any]]:
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     payload: dict[str, Any] = {
         "pages": {"page": 0, "size": 10},
         "filters": {
@@ -344,15 +362,15 @@ def _lusha_contact_search(
         path="/prospecting/contact/search",
         json_payload=payload,
     )
-    return _extract_contact_candidates(response)
+    return response, _extract_contact_candidates(response)
 
 
-def _lusha_person_lookup(*, person_id: str) -> dict[str, Any]:
-    query = {"personId": person_id}
+def _lusha_contact_enrich(*, request_id: str, contact_ids: list[str]) -> dict[str, Any]:
+    payload = {"requestId": request_id, "contactIds": contact_ids}
     return _lusha_request_json(
-        method="GET",
-        path="/v2/person",
-        query=query,
+        method="POST",
+        path="/prospecting/contact/enrich",
+        json_payload=payload,
     )
 
 
@@ -403,8 +421,8 @@ def _extract_contact_candidates(response: dict[str, Any]) -> list[dict[str, Any]
     seen: set[str] = set()
     deduped: list[dict[str, Any]] = []
     for item in candidates:
-        pid = _extract_person_id(item)
-        marker = pid or str(item.get("id") or "")
+        cid = _extract_contact_id(item)
+        marker = cid or str(item.get("id") or "")
         if not marker or marker in seen:
             continue
         seen.add(marker)
@@ -412,58 +430,78 @@ def _extract_contact_candidates(response: dict[str, Any]) -> list[dict[str, Any]
     return deduped
 
 
-def _extract_person_id(contact: dict[str, Any]) -> str:
-    for key in ("personId", "person_id", "id"):
+def _extract_contact_id(contact: dict[str, Any]) -> str:
+    for key in ("contactId", "contact_id", "id"):
         value = contact.get(key)
         if value:
             return str(value).strip()
-    person = contact.get("person")
-    if isinstance(person, dict):
-        for key in ("id", "personId", "person_id"):
-            value = person.get(key)
-            if value:
-                return str(value).strip()
     return ""
 
 
-def _extract_linkedin_url(person: dict[str, Any]) -> str:
-    for key in ("linkedinUrl", "linkedin_url", "linkedinProfileUrl", "linkedin_profile_url"):
-        value = person.get(key)
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    data = person.get("data")
+def _extract_linkedin_url_from_enrich(contact: dict[str, Any]) -> str:
+    data = contact.get("data")
     if isinstance(data, dict):
-        for key in ("linkedinUrl", "linkedin_url", "linkedinProfileUrl", "linkedin_profile_url"):
-            value = data.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
+        social_links = data.get("socialLinks")
+        if isinstance(social_links, dict):
+            linkedin = social_links.get("linkedin")
+            if isinstance(linkedin, str) and linkedin.strip():
+                return linkedin.strip()
+    linkedin_direct = contact.get("linkedinUrl")
+    if isinstance(linkedin_direct, str) and linkedin_direct.strip():
+        return linkedin_direct.strip()
     return ""
 
 
-def _extract_name(person: dict[str, Any], contact: dict[str, Any]) -> str:
-    for source in (person, person.get("data"), contact, contact.get("person")):
-        if not isinstance(source, dict):
-            continue
-        full_name = str(source.get("fullName") or source.get("name") or "").strip()
+def _extract_name_from_enrich(contact: dict[str, Any], search_contact: dict[str, Any]) -> str:
+    data = contact.get("data")
+    if isinstance(data, dict):
+        full_name = str(data.get("fullName") or "").strip()
         if full_name:
             return full_name
-        first = str(source.get("firstName") or "").strip()
-        last = str(source.get("lastName") or "").strip()
+        first = str(data.get("firstName") or "").strip()
+        last = str(data.get("lastName") or "").strip()
         combined = " ".join(part for part in (first, last) if part).strip()
         if combined:
             return combined
-    return ""
+    return str(search_contact.get("name") or "").strip()
 
 
-def _extract_headline(person: dict[str, Any], contact: dict[str, Any]) -> str:
-    for source in (person, person.get("data"), contact, contact.get("person")):
-        if not isinstance(source, dict):
+def _extract_headline_from_enrich(contact: dict[str, Any], search_contact: dict[str, Any]) -> str:
+    data = contact.get("data")
+    if isinstance(data, dict):
+        title = data.get("jobTitle")
+        if isinstance(title, str) and title.strip():
+            return title.strip()
+        if isinstance(title, dict):
+            title_text = str(title.get("title") or "").strip()
+            if title_text:
+                return title_text
+    return str(search_contact.get("jobTitle") or "").strip()
+
+
+def _extract_enriched_contact(response: dict[str, Any], *, contact_id: str) -> dict[str, Any]:
+    contacts = response.get("contacts")
+    if not isinstance(contacts, list):
+        return {}
+    for item in contacts:
+        if not isinstance(item, dict):
             continue
-        for key in ("headline", "jobTitle", "title", "position"):
-            value = source.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-    return ""
+        if str(item.get("id") or "").strip() == contact_id:
+            return item
+    for item in contacts:
+        if isinstance(item, dict):
+            return item
+    return {}
+
+
+def _extract_credits_charged(response: dict[str, Any]) -> int:
+    raw = response.get("creditsCharged")
+    if raw is None:
+        return 0
+    try:
+        return int(float(raw))
+    except (TypeError, ValueError):
+        return 0
 
 
 def _append_recruiter_rows(

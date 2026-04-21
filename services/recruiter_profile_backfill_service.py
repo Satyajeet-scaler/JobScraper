@@ -6,6 +6,7 @@ import uuid
 from datetime import date
 from time import perf_counter
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 import requests
 
@@ -154,10 +155,11 @@ def run_recruiter_profile_backfill(
             relevant_tab=resolved_tabs["relevant_tab"],
             candidate_jobs=candidates,
         )
+        deduped_enriched_rows = _dedupe_rows_by_profile_url(enriched_rows)
         rows_written = _append_recruiter_rows(
             tab_name=resolved_tabs["recruiters_tab"],
-            rows=enriched_rows,
-            dedupe_existing_on=("job_url", "recruiter_profile_url", "recruiter_source"),
+            rows=deduped_enriched_rows,
+            dedupe_existing_on=("normalized_recruiter_profile_url",),
         )
 
         metrics = {
@@ -178,6 +180,7 @@ def run_recruiter_profile_backfill(
             "enrich_calls": lush_metrics["enrich_calls"],
             "lusha_credits_charged_total": lush_metrics["lusha_credits_charged_total"],
             "rows_with_lusha_linkedin_url": len(enriched_rows),
+            "rows_deduped_by_profile_url": len(deduped_enriched_rows),
             "jobs_with_new_recruiter_profiles_found": lush_metrics["jobs_with_new_recruiter_profiles_found"],
             "recruiter_rows_appended": rows_written,
             "lusha_error_count": lush_metrics["lusha_error_count"],
@@ -297,6 +300,36 @@ def _job_urls_with_recruiter_profile(rows: list[dict[str, Any]]) -> set[str]:
 
 def _normalized_job_url(row: dict[str, Any]) -> str:
     return str(row.get("job_url") or "").strip()
+
+
+def _normalized_linkedin_profile_url(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    if not parsed.scheme or not parsed.netloc:
+        return raw.rstrip("/")
+    netloc = parsed.netloc.lower()
+    path = parsed.path.rstrip("/")
+    # Dedupe by stable LinkedIn profile identity; ignore query/fragment.
+    return urlunparse((parsed.scheme.lower(), netloc, path, "", "", ""))
+
+
+def _dedupe_rows_by_profile_url(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        profile_key = str(row.get("normalized_recruiter_profile_url") or "").strip()
+        if not profile_key:
+            profile_key = _normalized_linkedin_profile_url(row.get("recruiter_profile_url"))
+            row["normalized_recruiter_profile_url"] = profile_key
+        if not profile_key:
+            continue
+        if profile_key in seen:
+            continue
+        seen.add(profile_key)
+        out.append(row)
+    return out
 
 
 def _require_spreadsheet_id() -> str:
@@ -433,6 +466,7 @@ def _build_rows_from_lusha(
                         "recruiter_name": _extract_name_from_enrich(enriched_contact, contact),
                         "recruiter_headline": _extract_headline_from_enrich(enriched_contact, contact),
                         "recruiter_profile_url": profile_url,
+                        "normalized_recruiter_profile_url": _normalized_linkedin_profile_url(profile_url),
                         "recruiter_email": "",
                         "meet_the_team_section_found": False,
                         "recruiter_source": "lusha_search",

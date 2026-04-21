@@ -2,6 +2,7 @@ import json
 import os
 from contextlib import contextmanager
 from typing import Any, Iterator
+from urllib.parse import urlparse, urlunparse
 
 import pymysql
 
@@ -56,6 +57,16 @@ def _safe_int(value: Any) -> int | None:
         return None
 
 
+def _normalized_linkedin_profile_url(value: Any) -> str | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    parsed = urlparse(raw)
+    if not parsed.scheme or not parsed.netloc:
+        return raw.rstrip("/")
+    return urlunparse((parsed.scheme.lower(), parsed.netloc.lower(), parsed.path.rstrip("/"), "", "", ""))
+
+
 def upsert_lusha_recruiter(
     *,
     contact_id: str,
@@ -77,6 +88,10 @@ def upsert_lusha_recruiter(
     social_obj = social if isinstance(social, dict) else {}
     company = data_obj.get("company")
     company_obj = company if isinstance(company, dict) else {}
+
+    linkedin_url = _normalized_linkedin_profile_url(
+        social_obj.get("linkedin") or enriched_contact.get("linkedinUrl")
+    )
 
     sql = """
     INSERT INTO lusha_recruiters (
@@ -174,7 +189,7 @@ def upsert_lusha_recruiter(
         "company_id": _safe_int(data_obj.get("companyId") or search_contact.get("companyId")),
         "company_name": data_obj.get("companyName") or search_contact.get("companyName"),
         "company_fqdn": search_contact.get("fqdn"),
-        "linkedin_url": social_obj.get("linkedin") or enriched_contact.get("linkedinUrl"),
+        "linkedin_url": linkedin_url,
         "twitter_url": social_obj.get("xUrl"),
         "city": location_obj.get("city"),
         "state": location_obj.get("state"),

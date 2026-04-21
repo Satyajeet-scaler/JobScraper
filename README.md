@@ -93,6 +93,8 @@ Chromium + Playwright) and [`railway.toml`](railway.toml) with
    role-config JSON survive redeploys.
 5. Add a Railway MySQL service and set the standard Railway MySQL env vars.
    Run `migrations/001_recruiter_crm_mysql.sql` once on that database.
+   If you already created tables before the LinkedIn URL dedupe fix, also run
+   `migrations/002_enforce_unique_linkedin_url.sql`.
 
 All write endpoints under `/internal/*` require the
 `x-internal-token: $INTERNAL_TRIGGER_TOKEN` header.

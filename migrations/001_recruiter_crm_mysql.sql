@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS lusha_recruiters (
     updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
     PRIMARY KEY (id),
     UNIQUE KEY uq_lusha_contact_id (lusha_contact_id),
-    KEY idx_lusha_recruiters_linkedin_url (linkedin_url),
+    UNIQUE KEY uq_lusha_recruiters_linkedin_url (linkedin_url),
     KEY idx_lusha_recruiters_company_name (company_name),
     KEY idx_lusha_recruiters_country_iso2 (country_iso2),
     KEY idx_lusha_recruiters_updated_at (updated_at)

@@ -91,6 +91,8 @@ Chromium + Playwright) and [`railway.toml`](railway.toml) with
    `CRON_TIMEZONE`.
 4. Mount a Railway volume at `/data` so LinkedIn sessions and uploaded
    role-config JSON survive redeploys.
+5. Add a Railway MySQL service and set the standard Railway MySQL env vars.
+   Run `migrations/001_recruiter_crm_mysql.sql` once on that database.
 
 All write endpoints under `/internal/*` require the
 `x-internal-token: $INTERNAL_TRIGGER_TOKEN` header.
@@ -713,6 +715,8 @@ for the long tail.
 - `LUSHA_TOP_CONTACTS_PER_JOB` — max contacts to enrich per job row (default `1`).
 - `LUSHA_RECRUITER_TITLES` — optional comma-separated title override for contact search.
 - `RECRUITER_PROFILE_BACKFILL_COMPANY_SIZE_ALLOWLIST` — comma-separated `company_size` values from the relevant jobs tab that may be sent to Lusha (default `startup,mid_level`). Set to empty or `*` to disable filtering (legacy tabs without `company_size`).
+- `MYSQLHOST`, `MYSQLPORT`, `MYSQLUSER`, `MYSQLPASSWORD`, `MYSQLDATABASE` —
+  Railway MySQL connection vars used by the recruiter-store upsert path.
 
 **Slack / handover**
 

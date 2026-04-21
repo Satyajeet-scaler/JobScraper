@@ -11,6 +11,7 @@ import requests
 
 from services.google_sheets import GoogleSheetsWriter
 from services.handover_owners import worksheet_row_dicts
+from services.mysql_recruiter_store import upsert_lusha_recruiter
 from services.role_pipeline import role_relevant_tab_name
 from services.role_recruiter_info_service import role_recruiters_tab_name_for_role
 
@@ -442,6 +443,15 @@ def _build_rows_from_lusha(
                         "lusha_contact_id": contact_id,
                         "lusha_credits_charged": charged,
                     }
+                )
+                upsert_lusha_recruiter(
+                    contact_id=contact_id,
+                    request_id=request_id,
+                    search_contact=contact,
+                    search_response=search_response,
+                    enrich_response=enrich_response,
+                    enriched_contact=enriched_contact,
+                    source_app="recruiter_profile_backfill",
                 )
         except Exception as exc:
             lush_errors.append(f"{job_url}: {exc}")

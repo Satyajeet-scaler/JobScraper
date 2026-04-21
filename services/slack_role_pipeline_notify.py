@@ -56,7 +56,6 @@ def send_role_handover_notifications(
         "min_candidate_match": min_candidate_match,
         "recruiter_messages_sent": 0,
         "recruiter_detail_leads": 0,
-        "internal_poc_leads": 0,
         "skipped_reason": None,
         "upstream_run_id": upstream_run_id or "",
         "assigned_owner_rows_updated": 0,
@@ -75,19 +74,17 @@ def send_role_handover_notifications(
         out["skipped_reason"] = "no recruiter rows"
         return out
 
-    case3, case2 = _split_recruiter_cases(
+    case3 = _split_recruiter_case3_rows(
         recruiter_rows,
         resolved_date,
         upstream_run_id=upstream_run_id,
     )
     case3 = [row for row in case3 if not _is_handover_sent(row)]
-    case2 = [row for row in case2 if not _is_handover_sent(row)]
     candidate_match_count_map = load_candidate_match_count_map_for_role(
         role=resolved_role,
         run_date=resolved_date,
     )
     n_case3_before = len(case3)
-    n_case2_before = len(case2)
     case3 = [
         row
         for row in case3
@@ -95,26 +92,15 @@ def send_role_handover_notifications(
             row, candidate_match_count_map, min_candidate_match
         )
     ]
-    case2 = [
-        row
-        for row in case2
-        if _row_meets_recruiter_handover_threshold(
-            row, candidate_match_count_map, min_candidate_match
-        )
-    ]
-    if n_case3_before != len(case3) or n_case2_before != len(case2):
+    if n_case3_before != len(case3):
         logger.info(
-            "role slack handover: role=%s min_candidate_match=%s recruiter cases "
-            "case3 %s->%s case2 %s->%s",
+            "role slack handover: role=%s min_candidate_match=%s recruiter cases case3 %s->%s",
             resolved_role,
             min_candidate_match,
             n_case3_before,
             len(case3),
-            n_case2_before,
-            len(case2),
         )
     out["recruiter_detail_leads"] = len(case3)
-    out["internal_poc_leads"] = len(case2)
 
     owner_rows = load_owner_rows_for_handover() or []
     sent_case3_keys: set[tuple[str, str, str, str]] = set()
@@ -202,14 +188,13 @@ def _read_role_recruiter_rows(
     return [dict(r) for r in worksheet_row_dicts(raw)]
 
 
-def _split_recruiter_cases(
+def _split_recruiter_case3_rows(
     rows: list[dict[str, str]],
     run_date: str,
     *,
     upstream_run_id: str | None = None,
-) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+) -> list[dict[str, str]]:
     case3: list[dict[str, str]] = []
-    case2: list[dict[str, str]] = []
     for row in rows:
         row_run_date = (row.get("run_date") or "").strip()
         if row_run_date and row_run_date != run_date:
@@ -219,12 +204,9 @@ def _split_recruiter_cases(
             if row_upstream and row_upstream != upstream_run_id:
                 continue
         profile = (row.get("recruiter_profile_url") or "").strip()
-        email = (row.get("recruiter_email") or "").strip()
         if profile:
             case3.append(row)
-        elif email:
-            case2.append(row)
-    return case3, case2
+    return case3
 
 
 def _normalize_job_key(url: str) -> str:

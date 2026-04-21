@@ -127,13 +127,12 @@ def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
         logger.info("pipeline[%s] parallel scraping completed", pipeline_run_id)
 
         # --- Phase 2: send ALL Slack messages SEQUENTIALLY ---
-        # Case 3 (recruiter detail) + Case 2 (internal POC) first
+        # Recruiter-detail handovers first
         handover_notifications_sent = 0
         recruiter_case3_count = 0
-        recruiter_case2_count = 0
         try:
             handover_notifications_sent = _post_recruiter_handover_notifications(run_date=run_date)
-            recruiter_case3_count, recruiter_case2_count = _get_recruiter_handover_case_counts(run_date=run_date)
+            recruiter_case3_count = _get_recruiter_handover_case_counts(run_date=run_date)
             logger.info(
                 "pipeline[%s] recruiter handover notifications sent=%s",
                 pipeline_run_id, handover_notifications_sent,
@@ -162,12 +161,11 @@ def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
             int(linkedin_posts_metrics.get("relevant_count", 0)) if linkedin_posts_metrics else 0
         )
         logger.info(
-            "pipeline[%s] final summary: leads_scraped=%s relevant=%s recruiter_detail=%s internal_poc=%s linkedin_posts=%s",
+            "pipeline[%s] final summary: leads_scraped=%s relevant=%s recruiter_detail=%s linkedin_posts=%s",
             pipeline_run_id,
             len(deduped),
             len(relevant_deduped),
             recruiter_case3_count,
-            recruiter_case2_count,
             linkedin_case1_count,
         )
 
@@ -182,7 +180,6 @@ def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
             "recruiter_sheet_rows": recruiter_sheet_rows,
             "handover_notifications_sent": handover_notifications_sent,
             "handover_case3_recruiter_detail_count": recruiter_case3_count,
-            "handover_case2_internal_poc_count": recruiter_case2_count,
             "handover_case1_linkedin_post_count": linkedin_case1_count,
             "linkedin_posts_enabled": run_linkedin_posts_enabled,
             "linkedin_posts_status": (
@@ -1233,19 +1230,17 @@ def _write_relevant_jobs_to_google_sheets(
 
 
 def _post_recruiter_handover_notifications(run_date: str) -> int:
-    """Recruiter LinkedIn profile + internal POC handovers (reads recruiters sheet)."""
+    """Recruiter LinkedIn profile handovers (reads recruiters sheet)."""
     summary = send_handover_notifications(
         run_date,
         send_linkedin_post=False,
         send_recruiter_info=True,
-        send_internal_poc=True,
     )
     sent = int(summary.get("recruiter_messages_sent", 0))
     logger.info(
-        "handover slack posted recruiter messages=%s (detail_leads=%s internal_poc_leads=%s)",
+        "handover slack posted recruiter messages=%s (detail_leads=%s)",
         sent,
         summary.get("recruiter_detail_leads"),
-        summary.get("internal_poc_leads"),
     )
     return sent
 
@@ -1255,11 +1250,11 @@ def _load_relevant_linkedin_posts_from_sheet(run_date: str) -> list[dict[str, An
     return load_linkedin_relevant_posts_from_sheet(run_date)
 
 
-def _get_recruiter_handover_case_counts(run_date: str) -> tuple[int, int]:
-    """Return (case3_recruiter_detail_count, case2_internal_poc_count) for recruiters_info rows."""
+def _get_recruiter_handover_case_counts(run_date: str) -> int:
+    """Return recruiter-detail handover count for recruiters_info rows."""
     spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
     if not spreadsheet_id:
-        return 0, 0
+        return 0
     recruiters_tab = os.getenv("RECRUITERS_INFO_WORKSHEET") or f"recruiters_info_{run_date}"
     try:
         writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
@@ -1268,21 +1263,17 @@ def _get_recruiter_handover_case_counts(run_date: str) -> tuple[int, int]:
         rows = worksheet_row_dicts(raw)
     except Exception as exc:
         logger.warning("handover summary counts skipped: recruiters tab unavailable: %s", exc)
-        return 0, 0
+        return 0
 
     case3 = 0
-    case2 = 0
     for row in rows:
         row_run_date = (row.get("run_date") or "").strip()
         if row_run_date and row_run_date != run_date:
             continue
         recruiter_profile_url = (row.get("recruiter_profile_url") or "").strip()
-        recruiter_email = (row.get("recruiter_email") or "").strip()
         if recruiter_profile_url:
             case3 += 1
-        elif recruiter_email:
-            case2 += 1
-    return case3, case2
+    return case3
 
 
 def _post_daily_pipeline_final_summary(
@@ -1291,16 +1282,14 @@ def _post_daily_pipeline_final_summary(
     leads_scraped: int,
     relevant: int,
     recruiter_detail_available: int,
-    internal_poc: int,
     linkedin_post_leads: int,
 ) -> None:
-    handover_total = recruiter_detail_available + internal_poc + linkedin_post_leads
+    handover_total = recruiter_detail_available + linkedin_post_leads
     text = (
         f"Data ({run_date}):\n"
         f"Leads Scraped: {leads_scraped}\n"
         f"Relevant: {relevant}\n"
         f"Handover: {handover_total}\n"
-        f"Internal POC: {internal_poc}\n"
         f"Recruiter Detail available: {recruiter_detail_available}\n"
         f"Lead Type = Linkedin Post: {linkedin_post_leads}"
     )

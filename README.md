@@ -324,7 +324,7 @@ All endpoints require `x-internal-token: $INTERNAL_TRIGGER_TOKEN`.
 | POST   | `/internal/run-role-recruiter-info`                  | LinkedIn recruiter profile scrape.                   |
 | GET    | `/internal/run-role-recruiter-info/{run_id}`         | Recruiter run metrics.                               |
 | POST   | `/internal/run-role-candidate-jd-evaluator`          | Score candidates vs JDs (writes `candidate_match_*`). |
-| POST   | `/internal/send-role-slack-handover`                 | Slack recruiter/internal-POC + LinkedIn-post leads.  |
+| POST   | `/internal/send-role-slack-handover`                 | Slack recruiter + LinkedIn-post leads.                |
 | POST   | `/internal/send-role-relevant-jobs-handover`         | Bulk Slack from `role_relevant_*` (legacy).          |
 | POST   | `/internal/sync-role-handover-log`                   | Append handover rows to `HANDOVER_LOG_SPREADSHEET_ID`. |
 | POST   | `/internal/role-pipeline-role-config`                | Upload role config JSON to volume file.              |
@@ -724,7 +724,6 @@ for the long tail.
 
 - `SLACK_BOT_TOKEN`, `SLACK_CHANNEL_ID`.
 - `OWNER_SHEET_NAME` (default `owner_slack_ID`).
-- `INTERNAL_POC_TAG_SHEET_NAME` (default `internal_poc_slack`).
 - `COMPANY_CONTACTS_SHEET_NAME`, `COMPANY_CONTACTS_COMPANY_COLUMN`,
   `COMPANY_CONTACTS_EMAIL_COLUMN`.
 - `LINKEDIN_POSTS_OWNER_HANDOVER` (default `true`).

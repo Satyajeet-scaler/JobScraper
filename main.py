@@ -438,14 +438,12 @@ def _slack_handover_work(run_date: str) -> None:
         run_date=run_date,
         send_linkedin_post=True,
         send_recruiter_info=True,
-        send_internal_poc=True,
     )
     logger.info("scheduler slack-handover summary=%s", summary)
     summary_counts = send_handover_summary_to_slack(
         run_date=run_date,
         send_linkedin_post=True,
         send_recruiter_info=True,
-        send_internal_poc=True,
     )
     logger.info("scheduler slack-handover summary-counts=%s", summary_counts)
 
@@ -1940,7 +1938,6 @@ def internal_send_slack_handover(
     - ``run_date``: YYYY-MM-DD (default: today on server)
     - ``send_linkedin_post``: bool (default true)
     - ``send_recruiter_info``: recruiter LinkedIn profile case (default true)
-    - ``send_internal_poc``: internal POC email case (default true)
     - Optional Slack overrides: ``webhook_url``, ``channel``, ``username``, ``icon_emoji``
     """
     validate_internal_trigger_token(x_internal_token)
@@ -1962,7 +1959,6 @@ def internal_send_slack_handover(
         run_date,
         send_linkedin_post=_bool_flag("send_linkedin_post", True),
         send_recruiter_info=_bool_flag("send_recruiter_info", True),
-        send_internal_poc=_bool_flag("send_internal_poc", True),
         webhook_url=body.get("webhook_url") if isinstance(body.get("webhook_url"), str) else None,
         channel=body.get("channel") if isinstance(body.get("channel"), str) else None,
         username=body.get("username") if isinstance(body.get("username"), str) else None,
@@ -1983,7 +1979,6 @@ def internal_send_slack_handover_summary(
     - ``run_date``: YYYY-MM-DD (default: today in cron timezone)
     - ``send_linkedin_post``: bool (default true)
     - ``send_recruiter_info``: bool (default true)
-    - ``send_internal_poc``: bool (default true)
     - Optional Slack overrides: ``webhook_url``, ``channel``, ``username``, ``icon_emoji``
     """
     validate_internal_trigger_token(x_internal_token)
@@ -2005,7 +2000,6 @@ def internal_send_slack_handover_summary(
         run_date=run_date,
         send_linkedin_post=_bool_flag("send_linkedin_post", True),
         send_recruiter_info=_bool_flag("send_recruiter_info", True),
-        send_internal_poc=_bool_flag("send_internal_poc", True),
         webhook_url=body.get("webhook_url") if isinstance(body.get("webhook_url"), str) else None,
         channel=body.get("channel") if isinstance(body.get("channel"), str) else None,
         username=body.get("username") if isinstance(body.get("username"), str) else None,

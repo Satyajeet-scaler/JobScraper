@@ -1,4 +1,4 @@
-"""Slack handover notifications: LinkedIn post, recruiter LinkedIn profile, internal POC."""
+"""Slack handover notifications: LinkedIn post and recruiter LinkedIn profile."""
 
 from __future__ import annotations
 
@@ -16,7 +16,6 @@ import requests
 
 from services.google_sheets import GoogleSheetsWriter
 from services.handover_owners import (
-    load_internal_poc_tag_rows,
     load_owner_rows_for_handover,
     worksheet_row_dicts,
 )
@@ -30,14 +29,12 @@ T = TypeVar("T")
 class HandoverSlackCase(str, Enum):
     LINKEDIN_POST = "linkedin_post"
     RECRUITER_DETAIL = "recruiter_detail"
-    INTERNAL_POC = "internal_poc"
 
 
 HEADING_LINKEDIN_POST = ":rotating_light: *INCOMING LINKEDIN JOB POST VIA VALIDATED AUTHOR*"
 HEADING_RECRUITER_DETAIL = (
     ":rotating_light: *INCOMING LEAD WITH RECRUITER DETAILS AVAILABLE ON LINKEDIN*"
 )
-HEADING_INTERNAL_POC = ":rotating_light: *INCOMING LEAD with EXISTING INTERNAL POC*"
 
 
 def heading_for_case(case: HandoverSlackCase | str) -> str:
@@ -45,7 +42,6 @@ def heading_for_case(case: HandoverSlackCase | str) -> str:
     return {
         HandoverSlackCase.LINKEDIN_POST: HEADING_LINKEDIN_POST,
         HandoverSlackCase.RECRUITER_DETAIL: HEADING_RECRUITER_DETAIL,
-        HandoverSlackCase.INTERNAL_POC: HEADING_INTERNAL_POC,
     }[c]
 
 
@@ -113,83 +109,14 @@ def recruiter_row_role_label_for_slack(row: dict[str, str]) -> str:
     return "-"
 
 
-def normalize_email(value: str | None) -> str:
-    """Strip and lowercase for matching ``recruiter_email`` to internal POC sheet rows."""
-    if not value:
-        return ""
-    return value.strip().lower()
-
-
-def _poc_tag_row_email(row: dict[str, str]) -> str:
-    return (row.get("owner_email") or row.get("email") or "").strip()
-
-
-def internal_poc_email_owner_map(rows: list[dict[str, str]]) -> dict[str, dict[str, str]]:
-    """Map normalized email -> owner row; first row wins; log duplicates."""
-    out: dict[str, dict[str, str]] = {}
-    for row in rows:
-        key = normalize_email(_poc_tag_row_email(row))
-        if not key:
-            continue
-        if key in out:
-            logger.warning("internal POC tag sheet: duplicate email %s (extra row ignored)", key)
-            continue
-        out[key] = row
-    return out
-
-
-def split_recruiter_email_field(raw: str | None) -> list[str]:
-    """
-    ``recruiters_info.recruiter_email`` may list multiple addresses (comma or semicolon).
-    Returns stripped tokens in order; drops empties.
-    """
-    if not raw:
-        return []
-    parts: list[str] = []
-    for chunk in raw.replace(";", ",").split(","):
-        t = chunk.strip()
-        if t:
-            parts.append(t)
-    return parts
-
-
-def match_internal_poc_owners_ordered(
-    raw_recruiter_email: str,
-    email_map: dict[str, dict[str, str]],
-) -> list[dict[str, str]]:
-    """
-    Every distinct token that appears in ``email_map`` becomes one tagged owner, in field order.
-    Duplicate tokens (same email twice) are only tagged once.
-    """
-    seen_matched: set[str] = set()
-    out: list[dict[str, str]] = []
-    for token in split_recruiter_email_field(raw_recruiter_email):
-        key = normalize_email(token)
-        if not key or key in seen_matched:
-            continue
-        if key in email_map:
-            seen_matched.add(key)
-            out.append(email_map[key])
-    return out
-
-
-def internal_poc_owner_tag_line(matched_owners: list[dict[str, str]]) -> str:
-    """Slack tag line: one owner or several joined with `` · ``."""
-    if not matched_owners:
-        return "*Unassigned*"
-    if len(matched_owners) == 1:
-        return owner_tag_for_handover(matched_owners[0])
-    return " · ".join(owner_tag_for_handover(o) for o in matched_owners)
-
-
 def load_recruiter_rows_split_for_handover(
     run_date: str,
-) -> tuple[list[dict[str, str]], list[dict[str, str]], list[dict[str, str]]]:
-    """Load recruiters sheet; return (all_filtered_rows, case3_profile_rows, case2_email_rows)."""
+) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
+    """Load recruiters sheet; return (all_filtered_rows, case3_profile_rows)."""
     spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
     if not spreadsheet_id:
         logger.info("handover sheets skipped: GOOGLE_SPREADSHEET_ID not configured")
-        return [], [], []
+        return [], []
 
     recruiters_tab = os.getenv("RECRUITERS_INFO_WORKSHEET") or f"recruiters_info_{run_date}"
     try:
@@ -201,7 +128,7 @@ def load_recruiter_rows_split_for_handover(
         )
     except Exception as exc:
         logger.warning("recruiter sheet unavailable tab=%s err=%s", recruiters_tab, exc)
-        return [], [], []
+        return [], []
 
     recruiter_rows = worksheet_row_dicts(raw)
     filtered: list[dict[str, str]] = []
@@ -212,13 +139,10 @@ def load_recruiter_rows_split_for_handover(
         filtered.append(row)
 
     case3: list[dict[str, str]] = []
-    case2: list[dict[str, str]] = []
     for row in filtered:
         if (row.get("recruiter_profile_url") or "").strip():
             case3.append(row)
-        elif (row.get("recruiter_email") or "").strip():
-            case2.append(row)
-    return filtered, case3, case2
+    return filtered, case3
 
 
 def linkedin_posts_relevant_tab_name(run_date: str) -> str:
@@ -400,66 +324,6 @@ def send_recruiter_handover_case(
     return sent
 
 
-def send_internal_poc_handover_case(
-    rows: list[dict[str, str]],
-    *,
-    run_date: str,
-    defaults: SlackNotifyDefaults,
-    candidate_match_count_map: dict[str, int],
-) -> int:
-    """
-    Case 2: heading + per-lead tag(s) from ``INTERNAL_POC_TAG_SHEET_NAME`` (all matching emails), else *Unassigned*.
-    Does not use the main owner round-robin sheet.
-    """
-    if not rows:
-        return 0
-    poc_sheet_rows = load_internal_poc_tag_rows()
-    email_map = internal_poc_email_owner_map(poc_sheet_rows)
-    sent = 0
-    if not send_slack_text(
-        heading_for_case(HandoverSlackCase.INTERNAL_POC), defaults=defaults, sleep_after=1.0
-    ):
-        return 0
-    sent += 1
-
-    for row in rows:
-        poc_email = (row.get("recruiter_email") or "-").strip() or "-"
-        raw_for_match = "" if poc_email == "-" else poc_email
-        tokens = split_recruiter_email_field(raw_for_match)
-        matched_owners = match_internal_poc_owners_ordered(raw_for_match, email_map)
-        unmatched_nk: set[str] = set()
-        unmatched_tokens: list[str] = []
-        for t in tokens:
-            nk = normalize_email(t)
-            if not nk:
-                continue
-            if nk not in email_map and nk not in unmatched_nk:
-                unmatched_nk.add(nk)
-                unmatched_tokens.append(t)
-        if unmatched_tokens:
-            logger.warning(
-                "internal POC handover: no Slack tag mapping for email(s) %s (recruiter_email=%s)",
-                ", ".join(unmatched_tokens),
-                poc_email,
-            )
-        elif tokens and not matched_owners:
-            logger.warning(
-                "internal POC handover: no Slack tag mapping for recruiter_email=%s",
-                poc_email,
-            )
-        tag = internal_poc_owner_tag_line(matched_owners)
-        company = (row.get("company") or "-").strip() or "-"
-        role = recruiter_row_role_label_for_slack(row)
-        job_url = (row.get("job_url") or "-").strip() or "-"
-        matched_count = candidate_match_count_map.get(_normalize_job_url_for_match(job_url), 0)
-        msg = format_internal_poc_lead(tag, company, role, job_url, poc_email, matched_count)
-        if send_slack_text(msg, defaults=defaults, sleep_after=1.0):
-            sent += 1
-
-    _persist_internal_poc_assigned_owner(run_date=run_date, email_map=email_map)
-    return sent
-
-
 def send_linkedin_post_handover_messages(
     relevant_rows: list[dict[str, Any]],
     *,
@@ -525,7 +389,6 @@ def send_handover_notifications(
     *,
     send_linkedin_post: bool = True,
     send_recruiter_info: bool = True,
-    send_internal_poc: bool = True,
     webhook_url: str | None = None,
     channel: str | None = None,
     username: str | None = None,
@@ -550,7 +413,6 @@ def send_handover_notifications(
         "recruiter_messages_sent": 0,
         "linkedin_messages_sent": 0,
         "recruiter_detail_leads": 0,
-        "internal_poc_leads": 0,
         "linkedin_post_leads": 0,
     }
 
@@ -559,9 +421,8 @@ def send_handover_notifications(
         logger.info("handover slack skipped: SLACK_WEBHOOK_URL not configured")
         return result
 
-    _, case3, case2 = load_recruiter_rows_split_for_handover(rd)
+    _, case3 = load_recruiter_rows_split_for_handover(rd)
     result["recruiter_detail_leads"] = len(case3)
-    result["internal_poc_leads"] = len(case2)
     candidate_match_count_map = load_candidate_match_count_map(rd)
 
     owner_rows_opt = load_owner_rows_for_handover()
@@ -576,14 +437,6 @@ def send_handover_notifications(
         result["recruiter_messages_sent"] += send_recruiter_handover_case(
             case3,
             owner_rows,
-            run_date=rd,
-            defaults=defaults,
-            candidate_match_count_map=candidate_match_count_map,
-        )
-
-    if send_internal_poc and case2:
-        result["recruiter_messages_sent"] += send_internal_poc_handover_case(
-            case2,
             run_date=rd,
             defaults=defaults,
             candidate_match_count_map=candidate_match_count_map,
@@ -716,28 +569,6 @@ def format_recruiter_detail_lead(
     return body.rstrip("\n")
 
 
-def format_internal_poc_lead(
-    owner_tag: str,
-    company: str,
-    role: str,
-    job_url: str,
-    poc_email: str,
-    candidate_match_count: int,
-    *,
-    include_candidate_match: bool = True,
-) -> str:
-    body = (
-        f"{owner_tag}\n"
-        f"Company: {company}\n"
-        f"Role: {role}\n"
-        f"Job URL: {job_url}\n"
-        f"Internal POC Email: {poc_email}\n"
-    )
-    if include_candidate_match:
-        body += f"Candidate match — {candidate_match_count} candidate(s) with AI score > 70"
-    return body.rstrip("\n")
-
-
 def send_handover_case_batch(
     case: HandoverSlackCase | str,
     lead_bodies: list[str],
@@ -808,87 +639,6 @@ def _persist_recruiter_detail_assigned_owner(
     )
 
 
-def _persist_internal_poc_assigned_owner(
-    *,
-    run_date: str,
-    email_map: dict[str, dict[str, str]],
-) -> None:
-    """Set ``assigned owner`` per Case 2 row from ``INTERNAL_POC_TAG_SHEET_NAME`` email match."""
-    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
-    if not spreadsheet_id:
-        return
-    tab = os.getenv("RECRUITERS_INFO_WORKSHEET") or f"recruiters_info_{run_date}"
-
-    def selector_case2(row: dict[str, str]) -> bool:
-        row_run_date = (row.get("run_date") or "").strip()
-        if row_run_date and row_run_date != run_date:
-            return False
-        has_profile = bool((row.get("recruiter_profile_url") or "").strip())
-        has_email = bool((row.get("recruiter_email") or "").strip())
-        return (not has_profile) and has_email
-
-    try:
-        writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-        ws = writer.open_worksheet(tab)
-        values = writer.worksheet_get_all_values(ws, f"persist_internal_poc:{tab}:get_all_values")
-        if not values:
-            return
-        headers = [str(h or "").strip() for h in values[0]]
-        data_rows = [list(r) for r in values[1:]]
-
-        normalized_headers = [h.lower() for h in headers]
-        assigned_header = "assigned owner"
-        if assigned_header in normalized_headers:
-            assigned_col_idx = normalized_headers.index(assigned_header)
-        else:
-            headers.append(assigned_header)
-            assigned_col_idx = len(headers) - 1
-            normalized_headers.append(assigned_header)
-
-        for row in data_rows:
-            while len(row) < len(headers):
-                row.append("")
-
-        updated = 0
-        for row in data_rows:
-            row_dict: dict[str, str] = {}
-            for idx, header in enumerate(normalized_headers):
-                row_dict[header] = row[idx].strip() if idx < len(row) else ""
-            if not selector_case2(row_dict):
-                continue
-            raw_rec = (row_dict.get("recruiter_email") or "").strip()
-            matched_owners = match_internal_poc_owners_ordered(raw_rec, email_map)
-            if matched_owners:
-                row[assigned_col_idx] = "; ".join(_owner_display_name(o) for o in matched_owners)
-            else:
-                row[assigned_col_idx] = "Unassigned"
-            updated += 1
-
-        if not updated:
-            return
-
-        writer.worksheet_update(ws, "A1", [headers], f"persist_internal_poc:{tab}:update_headers")
-        col_letter = _column_letter(assigned_col_idx + 1)
-        end_row = len(data_rows) + 1
-        if end_row >= 2:
-            col_values = [[row[assigned_col_idx]] for row in data_rows]
-            rng = f"{col_letter}2:{col_letter}{end_row}"
-            writer.worksheet_update(ws, rng, col_values, f"persist_internal_poc:{tab}:update_column")
-        logger.info(
-            "internal POC assigned owner persisted sheet=%s tab=%s updated_rows=%s",
-            spreadsheet_id,
-            tab,
-            updated,
-        )
-    except Exception as exc:
-        logger.warning(
-            "failed to persist internal POC assigned owner sheet=%s tab=%s err=%s",
-            spreadsheet_id,
-            tab,
-            exc,
-        )
-
-
 def _persist_linkedin_posts_assigned_owner(
     *,
     run_date: str | None,
@@ -929,91 +679,6 @@ def persist_assigned_owner_round_robin(
         owner_rows=owner_rows,
         selector=selector,
     )
-
-
-def persist_assigned_owner_from_email_map(
-    *,
-    spreadsheet_id: str,
-    worksheet_title: str,
-    email_map: dict[str, dict[str, str]],
-    selector: Callable[[dict[str, str]], bool],
-) -> None:
-    """Public helper to persist assigned owner via recruiter email mapping."""
-    if not spreadsheet_id:
-        return
-    try:
-        writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-        ws = writer.open_worksheet(worksheet_title)
-        values = writer.worksheet_get_all_values(
-            ws,
-            f"persist_email_map:{worksheet_title}:get_all_values",
-        )
-        if not values:
-            return
-        headers = [str(h or "").strip() for h in values[0]]
-        data_rows = [list(r) for r in values[1:]]
-
-        normalized_headers = [h.lower() for h in headers]
-        assigned_header = "assigned owner"
-        if assigned_header in normalized_headers:
-            assigned_col_idx = normalized_headers.index(assigned_header)
-        else:
-            headers.append(assigned_header)
-            assigned_col_idx = len(headers) - 1
-            normalized_headers.append(assigned_header)
-
-        for row in data_rows:
-            while len(row) < len(headers):
-                row.append("")
-
-        updated = 0
-        for row in data_rows:
-            row_dict: dict[str, str] = {}
-            for idx, header in enumerate(normalized_headers):
-                row_dict[header] = row[idx].strip() if idx < len(row) else ""
-            if not selector(row_dict):
-                continue
-            raw_rec = (row_dict.get("recruiter_email") or "").strip()
-            matched_owners = match_internal_poc_owners_ordered(raw_rec, email_map)
-            if matched_owners:
-                row[assigned_col_idx] = "; ".join(_owner_display_name(o) for o in matched_owners)
-            else:
-                row[assigned_col_idx] = "Unassigned"
-            updated += 1
-
-        if not updated:
-            return
-
-        writer.worksheet_update(
-            ws,
-            "A1",
-            [headers],
-            f"persist_email_map:{worksheet_title}:update_headers",
-        )
-        col_letter = _column_letter(assigned_col_idx + 1)
-        end_row = len(data_rows) + 1
-        if end_row >= 2:
-            col_values = [[row[assigned_col_idx]] for row in data_rows]
-            rng = f"{col_letter}2:{col_letter}{end_row}"
-            writer.worksheet_update(
-                ws,
-                rng,
-                col_values,
-                f"persist_email_map:{worksheet_title}:update_column",
-            )
-        logger.info(
-            "assigned owner via email-map persisted sheet=%s tab=%s updated_rows=%s",
-            spreadsheet_id,
-            worksheet_title,
-            updated,
-        )
-    except Exception as exc:
-        logger.warning(
-            "failed to persist assigned owner via email-map sheet=%s tab=%s err=%s",
-            spreadsheet_id,
-            worksheet_title,
-            exc,
-        )
 
 
 def _persist_assigned_owner_column(

@@ -33,22 +33,11 @@ def _count_recruiter_case3(rows: list[dict[str, str]]) -> int:
     return sum(1 for row in rows if (row.get("recruiter_profile_url") or "").strip())
 
 
-def _count_recruiter_case2(rows: list[dict[str, str]]) -> int:
-    total = 0
-    for row in rows:
-        has_profile = bool((row.get("recruiter_profile_url") or "").strip())
-        has_email = bool((row.get("recruiter_email") or "").strip())
-        if (not has_profile) and has_email:
-            total += 1
-    return total
-
-
 def build_handover_summary(
     run_date: str | None = None,
     *,
     send_linkedin_post: bool = True,
     send_recruiter_info: bool = True,
-    send_internal_poc: bool = True,
 ) -> dict[str, Any]:
     rd = (run_date or date.today().isoformat()).strip()
 
@@ -61,15 +50,12 @@ def build_handover_summary(
     scraped_jobs_count = len(scraped_jobs_rows)
     relevant_jobs_count = len(relevant_jobs_rows)
     linkedin_recruiter_count = _count_recruiter_case3(recruiter_rows)
-    internal_poc_count = _count_recruiter_case2(recruiter_rows)
     linkedin_posts_scraped_count = len(linkedin_posts_scraped_rows)
     linkedin_posts_relevant_count = len(linkedin_posts_relevant_rows)
 
     handover_count = 0
     if send_recruiter_info:
         handover_count += linkedin_recruiter_count
-    if send_internal_poc:
-        handover_count += internal_poc_count
     if send_linkedin_post:
         handover_count += linkedin_posts_relevant_count
 
@@ -77,11 +63,9 @@ def build_handover_summary(
         "run_date": rd,
         "send_linkedin_post": send_linkedin_post,
         "send_recruiter_info": send_recruiter_info,
-        "send_internal_poc": send_internal_poc,
         "scraped_jobs_count": scraped_jobs_count,
         "relevant_jobs_count": relevant_jobs_count,
         "linkedin_recruiter_count": linkedin_recruiter_count,
-        "internal_poc_count": internal_poc_count,
         "linkedin_posts_scraped_count": linkedin_posts_scraped_count,
         "linkedin_posts_relevant_count": linkedin_posts_relevant_count,
         "handover_count": handover_count,
@@ -93,57 +77,30 @@ def format_handover_summary_message(summary: dict[str, Any]) -> str:
     parts.append(f"run_date: {summary['run_date']}")
     parts.append("")
 
-    all_three = (
-        summary["send_linkedin_post"]
-        and summary["send_recruiter_info"]
-        and summary["send_internal_poc"]
-    )
-    if all_three:
+    both_enabled = summary["send_linkedin_post"] and summary["send_recruiter_info"]
+    if both_enabled:
         parts.extend(
             [
                 f"job scraped - {summary['scraped_jobs_count']}",
                 f"relevant - {summary['relevant_jobs_count']}",
                 (
                     f"handover - {summary['linkedin_posts_relevant_count']} + "
-                    f"{summary['internal_poc_count']} + {summary['linkedin_recruiter_count']} = "
+                    f"{summary['linkedin_recruiter_count']} = "
                     f"{summary['handover_count']}"
                 ),
                 f"linkedin total post count- {summary['linkedin_posts_scraped_count']}",
                 f"relevant post classified count- {summary['linkedin_posts_relevant_count']}",
-                f"internal poc count- {summary['internal_poc_count']}",
                 f"linkedin recruiter details count - {summary['linkedin_recruiter_count']}",
             ]
         )
         return "\n".join(parts).strip()
 
-    recruiter_and_poc_enabled = summary["send_recruiter_info"] and summary["send_internal_poc"]
-    if recruiter_and_poc_enabled:
-        parts.extend(
-            [
-                f"scraped jobs count: {summary['scraped_jobs_count']}",
-                f"relevant jobs count: {summary['relevant_jobs_count']}",
-                "",
-                f"linkedin recruiter count: {summary['linkedin_recruiter_count']}",
-                "",
-                f"internal poc matched jobs count: {summary['internal_poc_count']}",
-                "",
-            ]
-        )
-    elif summary["send_recruiter_info"]:
+    if summary["send_recruiter_info"]:
         parts.extend(
             [
                 f"scraped jobs count: {summary['scraped_jobs_count']}",
                 f"relevant jobs count: {summary['relevant_jobs_count']}",
                 f"linkedin recruiter count: {summary['linkedin_recruiter_count']}",
-                "",
-            ]
-        )
-    elif summary["send_internal_poc"]:
-        parts.extend(
-            [
-                f"scraped jobs count: {summary['scraped_jobs_count']}",
-                f"relevant jobs count: {summary['relevant_jobs_count']}",
-                f"internal poc matched jobs count: {summary['internal_poc_count']}",
                 "",
             ]
         )
@@ -165,7 +122,6 @@ def send_handover_summary_to_slack(
     *,
     send_linkedin_post: bool = True,
     send_recruiter_info: bool = True,
-    send_internal_poc: bool = True,
     webhook_url: str | None = None,
     channel: str | None = None,
     username: str | None = None,
@@ -175,7 +131,6 @@ def send_handover_summary_to_slack(
         run_date=run_date,
         send_linkedin_post=send_linkedin_post,
         send_recruiter_info=send_recruiter_info,
-        send_internal_poc=send_internal_poc,
     )
     defaults = merge_slack_defaults(
         webhook_url=webhook_url,

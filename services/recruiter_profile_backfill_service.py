@@ -522,8 +522,27 @@ def _lusha_contact_search(
             },
         },
     }
-    if location:
+    use_location_filter = _lusha_contact_search_uses_location()
+    if use_location_filter and location:
         payload["filters"]["contacts"]["include"]["locations"] = [location]
+        try:
+            response = _lusha_request_json(
+                method="POST",
+                path="/prospecting/contact/search",
+                json_payload=payload,
+            )
+            return response, _extract_contact_candidates(response)
+        except Exception as exc:
+            if _is_lusha_location_validation_error(exc):
+                payload["filters"]["contacts"]["include"].pop("locations", None)
+                logger.warning(
+                    "recruiter-profile-backfill lusha-search-location-filter-rejected company=%s location=%s error=%s; retrying-without-location",
+                    company,
+                    location,
+                    exc,
+                )
+            else:
+                raise
 
     response = _lusha_request_json(
         method="POST",
@@ -531,6 +550,27 @@ def _lusha_contact_search(
         json_payload=payload,
     )
     return response, _extract_contact_candidates(response)
+
+
+def _lusha_contact_search_uses_location() -> bool:
+    """Location filter is opt-in because some Lusha plans reject string locations."""
+    return (os.getenv("LUSHA_CONTACT_SEARCH_USE_LOCATION") or "false").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def _is_lusha_location_validation_error(exc: Exception) -> bool:
+    msg = str(exc).lower()
+    return (
+        "failed [400]" in msg
+        and "locations" in msg
+        and (
+            "value in nested property locations must be either object or array" in msg
+            or "locations.each value" in msg
+        )
+    )
 
 
 def _lusha_contact_enrich(*, request_id: str, contact_ids: list[str]) -> dict[str, Any]:

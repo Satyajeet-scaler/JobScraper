@@ -25,6 +25,30 @@ DEFAULT_RECRUITER_TITLES: tuple[str, ...] = (
     "Hiring Manager",
 )
 
+_DEFAULT_COMPANY_SIZE_ALLOWLIST = "startup,mid_level"
+
+
+def _company_size_allowlist() -> frozenset[str] | None:
+    """When None, company_size filtering is disabled (all candidate rows pass)."""
+    raw = os.getenv("RECRUITER_PROFILE_BACKFILL_COMPANY_SIZE_ALLOWLIST")
+    if raw is None:
+        raw = _DEFAULT_COMPANY_SIZE_ALLOWLIST
+    stripped = raw.strip()
+    if not stripped or stripped == "*":
+        return None
+    parts = [x.strip().lower() for x in stripped.split(",") if x.strip()]
+    return frozenset(parts) if parts else None
+
+
+def _normalized_company_size(row: dict[str, Any]) -> str:
+    return str(row.get("company_size") or "").strip().lower()
+
+
+def _passes_company_size_filter(row: dict[str, Any], allowlist: frozenset[str] | None) -> bool:
+    if allowlist is None:
+        return True
+    return _normalized_company_size(row) in allowlist
+
 
 def run_recruiter_profile_backfill(
     run_id: str | None = None,
@@ -63,11 +87,20 @@ def run_recruiter_profile_backfill(
         )
 
         existing_with_profile_urls = _job_urls_with_recruiter_profile(existing_recruiter_rows)
-        candidates = [
+        base_candidates = [
             dict(row)
             for row in relevant_rows
             if _normalized_job_url(row) and _normalized_job_url(row) not in existing_with_profile_urls
         ]
+        size_allowlist = _company_size_allowlist()
+        if size_allowlist is None:
+            candidates = base_candidates
+            jobs_skipped_by_company_size = 0
+        else:
+            candidates = [
+                row for row in base_candidates if _passes_company_size_filter(row, size_allowlist)
+            ]
+            jobs_skipped_by_company_size = len(base_candidates) - len(candidates)
         enriched_rows, lush_metrics = _build_rows_from_lusha(
             run_date=resolved_run_date,
             relevant_tab=resolved_tabs["relevant_tab"],
@@ -89,6 +122,8 @@ def run_recruiter_profile_backfill(
             "relevant_rows_scanned": len(relevant_rows),
             "existing_recruiter_rows_scanned": len(existing_recruiter_rows),
             "jobs_skipped_with_existing_profile_url": len(existing_with_profile_urls),
+            "candidate_jobs_before_company_size_filter": len(base_candidates),
+            "jobs_skipped_by_company_size": jobs_skipped_by_company_size,
             "candidate_jobs_for_backfill": len(candidates),
             "jobs_searched_on_lusha": lush_metrics["jobs_searched_on_lusha"],
             "jobs_with_lusha_search_hits": lush_metrics["jobs_with_lusha_search_hits"],

@@ -60,6 +60,8 @@ def _print_summary(metrics: dict[str, Any]) -> None:
         "recruiters_tab",
         "relevant_rows_scanned",
         "jobs_skipped_with_existing_profile_url",
+        "candidate_jobs_before_company_size_filter",
+        "jobs_skipped_by_company_size",
         "candidate_jobs_for_backfill",
         "candidate_linkedin_jobs_for_backfill",
         "jobs_with_new_recruiter_profiles_found",

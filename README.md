@@ -712,6 +712,7 @@ for the long tail.
 - `LUSHA_RETRY_COUNT` — retry attempts for failed Lusha calls (default `2`).
 - `LUSHA_TOP_CONTACTS_PER_JOB` — max contacts to enrich per job row (default `1`).
 - `LUSHA_RECRUITER_TITLES` — optional comma-separated title override for contact search.
+- `RECRUITER_PROFILE_BACKFILL_COMPANY_SIZE_ALLOWLIST` — comma-separated `company_size` values from the relevant jobs tab that may be sent to Lusha (default `startup,mid_level`). Set to empty or `*` to disable filtering (legacy tabs without `company_size`).
 
 **Slack / handover**
 

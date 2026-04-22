@@ -400,7 +400,7 @@ def mark_jobs_relevancy_checked(job_ids: list[int]) -> int:
 
 
 def fetch_recruiter_unchecked_jobs_for_role(*, role: str, run_date: str) -> list[dict[str, Any]]:
-    """Return classified jobs that have not yet had recruiter info extracted."""
+    """Return classified jobs (only relevant ones) that have not yet had recruiter info extracted."""
     sql = """
     SELECT
         j.id AS _job_id,
@@ -417,7 +417,7 @@ def fetch_recruiter_unchecked_jobs_for_role(*, role: str, run_date: str) -> list
         r.role_category,
         r.priority
     FROM jobs j
-    LEFT JOIN job_relevance r ON r.job_id = j.id
+    INNER JOIN job_relevance r ON r.job_id = j.id
     WHERE j.requested_role = %s
       AND j.run_date = %s
       AND j.relevancy_checked = TRUE

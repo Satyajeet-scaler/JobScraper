@@ -291,7 +291,15 @@ def mark_recruiter_contacts_handover_sent(
 
 
 def upsert_job_candidate_match(row: dict[str, Any], candidate_email: str, ai_score: int | None, ai_reason: str | None) -> None:
-    job_id = upsert_job(row)
+    import logging
+    _logger = logging.getLogger(__name__)
+
+    job_url = str(row.get("job_url") or "").strip()
+    job_id = _lookup_job_id_by_url(job_url)
+    if not job_id:
+        _logger.warning("upsert_job_candidate_match: no existing job found for url=%s, skipping", job_url)
+        return
+
     sql = """
     INSERT INTO job_candidate_matches (
         job_id, run_date, role_slug, candidate_email, ai_score, ai_reason

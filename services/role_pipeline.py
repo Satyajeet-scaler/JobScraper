@@ -14,7 +14,12 @@ import gspread
 from services.description_text_parts import apply_three_part_text_columns
 from services.google_sheets import GoogleSheetsWriter
 from services.handover_owners import worksheet_row_dicts
-from services.mysql_jobs_store import upsert_job_relevance, upsert_job_scrape
+from services.mysql_jobs_store import (
+    fetch_unclassified_jobs_for_role,
+    mark_jobs_relevancy_checked,
+    upsert_job_relevance,
+    upsert_job_scrape,
+)
 from services.pipeline import _classify_relevant_jobs, _dedupe_jobs, _parse_csv_env, _retry
 from services.role_scrapers import SCRAPER_REGISTRY
 
@@ -169,17 +174,13 @@ def run_role_classify_only(
     }
 
     try:
-        scraped_tab = _scraped_tab_name(role_slug=role_slug, run_date=resolved_run_date)
         relevant_tab = _relevant_tab_name(role_slug=role_slug, run_date=resolved_run_date)
 
-        scraped_rows = _read_rows_from_tab(scraped_tab)
-        deduped_scraped = _dedupe_jobs(scraped_rows)
-        existing_relevant_rows = _read_rows_from_tab(relevant_tab, allow_missing=True)
-        relevant_run_seq = _next_run_sequence(existing_relevant_rows)
-        classify_input_rows = _filter_extra_jobs_by_site_job_url(
-            rows=deduped_scraped,
-            existing_rows=existing_relevant_rows,
+        # ---- read unclassified jobs from MySQL ----
+        classify_input_rows = fetch_unclassified_jobs_for_role(
+            role=resolved_role, run_date=resolved_run_date,
         )
+        classify_job_ids = [int(r["_job_id"]) for r in classify_input_rows if r.get("_job_id")]
 
         if classify_input_rows:
             relevant, classifier_metrics = _classify_relevant_jobs_for_role_pipeline(
@@ -191,18 +192,27 @@ def run_role_classify_only(
             classifier_metrics = {"classification_errors": 0}
 
         relevant_deduped = _dedupe_jobs(relevant)
-        relevant_new_rows = _filter_extra_jobs_by_site_job_url(
-            rows=relevant_deduped,
-            existing_rows=existing_relevant_rows,
-        )
         relevant_rows_with_run = _attach_run_tracking(
-            rows=relevant_new_rows,
+            rows=relevant_deduped,
             run_id=pipeline_run_id,
-            run_seq=relevant_run_seq,
+            run_seq=1,
         )
-        appended_relevant_count = _append_rows_to_tab(relevant_tab, relevant_rows_with_run)
-        total_relevant_after_append = len(existing_relevant_rows) + appended_relevant_count
-        relevant_tab = _relevant_tab_name(role_slug=role_slug, run_date=resolved_run_date)
+
+        # ---- write results ----
+        # MySQL: upsert relevance rows
+        for row in relevant_rows_with_run:
+            upsert_job_relevance(row)
+
+        # Sheet: append if enabled
+        write_sheet = (os.getenv("ROLE_PIPELINE_SHEET_WRITE_ENABLED") or "true").strip().lower() in (
+            "1", "true", "yes",
+        )
+        appended_relevant_count = 0
+        if write_sheet:
+            appended_relevant_count = _append_rows_to_tab(relevant_tab, relevant_rows_with_run)
+
+        # ---- mark all input jobs as classified ----
+        mark_jobs_relevancy_checked(classify_job_ids)
 
         metrics = {
             "run_id": pipeline_run_id,
@@ -210,16 +220,10 @@ def run_role_classify_only(
             "run_date": resolved_run_date,
             "role": resolved_role,
             "role_slug": role_slug,
-            "scraped_input_count": len(scraped_rows),
-            "deduped_input_count": len(deduped_scraped),
             "classify_input_count": len(classify_input_rows),
-            "existing_relevant_count": len(existing_relevant_rows),
             "relevant_count": len(relevant_deduped),
             "new_relevant_count": appended_relevant_count,
-            "total_relevant_count_after_append": total_relevant_after_append,
-            "relevant_run_seq": relevant_run_seq,
             "classification_errors": classifier_metrics.get("classification_errors", 0),
-            "source_scraped_tab": scraped_tab,
             "relevant_tab": relevant_tab,
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
@@ -240,7 +244,6 @@ def run_role_classify_only(
                     run_date=resolved_run_date,
                     role=resolved_role,
                     upstream_run_id=pipeline_run_id,
-                    upstream_run_seq=relevant_run_seq,
                 )
             except Exception as exc:
                 recruiter_summary = {"status": "failed", "error": str(exc)}

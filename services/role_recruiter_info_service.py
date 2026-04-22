@@ -5,8 +5,9 @@ from datetime import date
 from time import perf_counter
 from typing import Any
 
-from services.role_pipeline import _read_rows_from_tab, _role_slug, _relevant_tab_name
+from services.role_pipeline import _role_slug, _relevant_tab_name
 from services.linkedin_recruiter.sheets_pipeline import write_linkedin_recruiters_for_relevant_jobs
+from services.mysql_jobs_store import fetch_recruiter_unchecked_jobs_for_role, mark_jobs_recruiter_info_checked
 
 logger = logging.getLogger(__name__)
 
@@ -39,13 +40,13 @@ def run_role_recruiter_info_extraction(
     try:
         relevant_tab = _relevant_tab_name(role_slug=role_slug, run_date=resolved_run_date)
         recruiters_tab = _role_recruiters_tab_name(role_slug=role_slug, run_date=resolved_run_date)
-        relevant_jobs_all = _read_rows_from_tab(relevant_tab)
-        relevant_jobs = _filter_rows_for_upstream_run(
-            relevant_jobs_all,
-            upstream_run_id=upstream_run_id,
+
+        # ---- read unchecked jobs from MySQL ----
+        relevant_jobs = fetch_recruiter_unchecked_jobs_for_role(
+            role=resolved_role, run_date=resolved_run_date,
         )
-        recruiters_existing_rows = _read_recruiter_rows(recruiters_tab)
-        recruiter_run_seq = _next_recruiter_run_sequence(recruiters_existing_rows)
+        recruiter_job_ids = [int(r["_job_id"]) for r in relevant_jobs if r.get("_job_id")]
+
         rows_written, urls_with_recruiters = write_linkedin_recruiters_for_relevant_jobs(
             run_date=resolved_run_date,
             relevant_jobs=relevant_jobs,
@@ -57,9 +58,12 @@ def run_role_recruiter_info_extraction(
                 "role_pipeline_upstream_run_id": upstream_run_id or "",
                 "role_pipeline_upstream_run_seq": upstream_run_seq or "",
                 "role_pipeline_recruiter_run_id": pipeline_run_id,
-                "role_pipeline_recruiter_run_seq": recruiter_run_seq,
             },
         )
+
+        # ---- mark all input jobs as recruiter-checked ----
+        mark_jobs_recruiter_info_checked(recruiter_job_ids)
+
         metrics = {
             "run_id": pipeline_run_id,
             "status": "completed",
@@ -67,12 +71,9 @@ def run_role_recruiter_info_extraction(
             "role": resolved_role,
             "role_slug": role_slug,
             "upstream_run_id": upstream_run_id or "",
-            "upstream_run_seq": upstream_run_seq or "",
-            "relevant_total_count": len(relevant_jobs_all),
             "relevant_input_count": len(relevant_jobs),
             "recruiters_rows_written": rows_written,
             "jobs_with_recruiter_profiles_count": len(urls_with_recruiters),
-            "recruiter_run_seq": recruiter_run_seq,
             "relevant_tab": relevant_tab,
             "recruiters_tab": recruiters_tab,
             "duration_seconds": round(perf_counter() - started_at, 2),

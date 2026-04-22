@@ -347,3 +347,144 @@ def fetch_all_candidate_match_counts(*, run_date: str) -> dict[str, int]:
             for r in rows:
                 out[str(r["job_url"])] = int(r["gt_70_count"])
     return out
+
+
+# ---------------------------------------------------------------------------
+# Pipeline stage tracking: fetch unprocessed + mark processed
+# ---------------------------------------------------------------------------
+
+
+def fetch_unclassified_jobs_for_role(*, role: str, run_date: str) -> list[dict[str, Any]]:
+    """Return scraped jobs that have not yet been classified (relevancy_checked=FALSE)."""
+    sql = """
+    SELECT
+        j.id AS _job_id,
+        j.site,
+        j.job_url,
+        j.job_url_normalized,
+        j.title,
+        j.company,
+        j.location,
+        j.date_posted,
+        j.requested_role,
+        j.run_date,
+        COALESCE(s.role_query, '') AS role_query,
+        COALESCE(s.description_full, '') AS description,
+        COALESCE(s.experience, '') AS experience,
+        COALESCE(s.salary, '') AS salary,
+        COALESCE(s.job_type, '') AS job_type
+    FROM jobs j
+    LEFT JOIN job_scrapes s ON s.job_id = j.id
+    WHERE j.requested_role = %s
+      AND j.run_date = %s
+      AND j.relevancy_checked = FALSE
+    ORDER BY j.id ASC
+    """
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (role, run_date))
+            rows = cur.fetchall() or []
+    return [dict(r) for r in rows]
+
+
+def mark_jobs_relevancy_checked(job_ids: list[int]) -> int:
+    """Set relevancy_checked=TRUE for the given job IDs."""
+    if not job_ids:
+        return 0
+    placeholders = ",".join(["%s"] * len(job_ids))
+    sql = f"UPDATE jobs SET relevancy_checked = TRUE, updated_at = CURRENT_TIMESTAMP WHERE id IN ({placeholders})"
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(job_ids))
+            return int(cur.rowcount or 0)
+
+
+def fetch_recruiter_unchecked_jobs_for_role(*, role: str, run_date: str) -> list[dict[str, Any]]:
+    """Return classified jobs that have not yet had recruiter info extracted."""
+    sql = """
+    SELECT
+        j.id AS _job_id,
+        j.site,
+        j.job_url,
+        j.job_url_normalized,
+        j.title,
+        j.company,
+        j.location,
+        j.date_posted,
+        j.requested_role,
+        j.run_date,
+        r.matched_role,
+        r.role_category,
+        r.priority
+    FROM jobs j
+    LEFT JOIN job_relevance r ON r.job_id = j.id
+    WHERE j.requested_role = %s
+      AND j.run_date = %s
+      AND j.relevancy_checked = TRUE
+      AND j.recruiter_info_checked = FALSE
+    ORDER BY j.id ASC
+    """
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (role, run_date))
+            rows = cur.fetchall() or []
+    return [dict(r) for r in rows]
+
+
+def mark_jobs_recruiter_info_checked(job_ids: list[int]) -> int:
+    """Set recruiter_info_checked=TRUE for the given job IDs."""
+    if not job_ids:
+        return 0
+    placeholders = ",".join(["%s"] * len(job_ids))
+    sql = f"UPDATE jobs SET recruiter_info_checked = TRUE, updated_at = CURRENT_TIMESTAMP WHERE id IN ({placeholders})"
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(job_ids))
+            return int(cur.rowcount or 0)
+
+
+def fetch_jd_eval_pending_jobs_for_role(*, role: str, run_date: str) -> list[dict[str, Any]]:
+    """Return jobs that have recruiter info but have not yet been through candidate JD eval."""
+    sql = """
+    SELECT
+        j.id AS _job_id,
+        j.site,
+        j.job_url,
+        j.job_url_normalized,
+        j.title,
+        j.company,
+        j.location,
+        j.requested_role,
+        j.run_date,
+        COALESCE(s.description_full, '') AS jd
+    FROM jobs j
+    LEFT JOIN job_scrapes s ON s.job_id = j.id
+    WHERE j.requested_role = %s
+      AND j.run_date = %s
+      AND j.recruiter_info_checked = TRUE
+      AND j.candidates_jd_eval_done = FALSE
+    ORDER BY j.id ASC
+    """
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (role, run_date))
+            rows = cur.fetchall() or []
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        item["_jd_key"] = "jd"
+        item["_recruiter_sheet_row_number"] = str(item.get("_job_id") or "")
+        out.append(item)
+    return out
+
+
+def mark_jobs_jd_eval_done(job_ids: list[int]) -> int:
+    """Set candidates_jd_eval_done=TRUE for the given job IDs."""
+    if not job_ids:
+        return 0
+    placeholders = ",".join(["%s"] * len(job_ids))
+    sql = f"UPDATE jobs SET candidates_jd_eval_done = TRUE, updated_at = CURRENT_TIMESTAMP WHERE id IN ({placeholders})"
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(job_ids))
+            return int(cur.rowcount or 0)

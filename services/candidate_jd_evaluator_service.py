@@ -142,13 +142,16 @@ def run_candidate_jd_evaluator_for_role(
 ) -> dict[str, Any]:
     """Role-aware candidate vs JD matching.
 
-    Reads JDs via the same recruiter-sheet mapping as the legacy evaluator:
-    ``role_recruiters_info_{role_slug}_{date}`` rows (``relevant_jobs_tab`` →
-    ``role_relevant_*`` / ``relevant_jobs_*``), skips job URLs already present
-    in ``candidate_match_{role_slug}_{date}``, and appends new summary rows.
+    Reads pending JDs from MySQL (jobs with recruiter_info_checked=TRUE and
+    candidates_jd_eval_done=FALSE), evaluates candidates against each JD,
+    and flips candidates_jd_eval_done=TRUE after processing.
     """
     from services.role_pipeline import _role_slug
-    from services.role_recruiter_info_service import role_recruiters_tab_name_for_role
+    from services.mysql_jobs_store import (
+        fetch_jd_eval_pending_jobs_for_role,
+        mark_jobs_jd_eval_done,
+        upsert_job_candidate_match,
+    )
 
     pipeline_run_id = run_id or str(uuid.uuid4())
     resolved_run_date = _resolve_run_date(run_date)
@@ -159,7 +162,6 @@ def run_candidate_jd_evaluator_for_role(
     started_at = perf_counter()
 
     output_sheet = _role_candidate_match_tab_name(role_slug=role_slug, run_date=resolved_run_date)
-    recruiters_tab = role_recruiters_tab_name_for_role(role=resolved_role, run_date=resolved_run_date)
     CANDIDATE_JD_EVALUATOR_RUN_METRICS[pipeline_run_id] = {
         "run_id": pipeline_run_id,
         "status": "running",
@@ -167,51 +169,18 @@ def run_candidate_jd_evaluator_for_role(
         "role": resolved_role,
         "role_slug": role_slug,
         "output_sheet": output_sheet,
-        "recruiters_tab": recruiters_tab,
     }
     try:
         candidates_writer = GoogleSheetsWriter(spreadsheet_id=_require_spreadsheet_id())
         candidates = _read_candidates(candidates_writer)
 
-        use_mysql = (os.getenv("ROLE_PIPELINE_MYSQL_READ_ENABLED") or "false").strip().lower() in (
-            "1",
-            "true",
-            "yes",
+        # ---- read pending JD rows from MySQL ----
+        jd_rows = fetch_jd_eval_pending_jobs_for_role(
+            role=resolved_role, run_date=resolved_run_date,
         )
-        if use_mysql:
-            jd_rows_all = fetch_jd_rows_for_role(role=resolved_role, run_date=resolved_run_date)
-        else:
-            writer = GoogleSheetsWriter(spreadsheet_id=_require_spreadsheet_id())
-            jd_rows_all = _read_jd_rows_for_date(
-                writer,
-                resolved_run_date,
-                recruiters_tab,
-                allow_empty=True,
-                pipeline_role=resolved_role,
-            )
-
-        already_evaluated = _existing_candidate_match_job_urls(
-            spreadsheet_id=_require_spreadsheet_id(),
-            tab=output_sheet,
-            role_slug=role_slug,
-            run_date=resolved_run_date,
-        )
-
-        jd_rows: list[dict[str, str]] = []
-        for row in jd_rows_all:
-            job_url = (row.get("job_url") or "").strip()
-            if not job_url:
-                continue
-            if _normalize_job_url(job_url) in already_evaluated:
-                continue
-            jd_rows.append(row)
+        eval_job_ids = [int(r["_job_id"]) for r in jd_rows if r.get("_job_id")]
 
         if not jd_rows:
-            skipped_reason = (
-                "no new JD rows to evaluate"
-                if jd_rows_all
-                else "no JD rows mapped from role recruiters sheet (empty or no matches for run_date)"
-            )
             metrics = {
                 "run_id": pipeline_run_id,
                 "status": "completed",
@@ -220,9 +189,6 @@ def run_candidate_jd_evaluator_for_role(
                 "role_slug": role_slug,
                 "candidate_count": len(candidates),
                 "jd_count": 0,
-                "already_evaluated_count": len(already_evaluated),
-                "jd_rows_mapped_from_recruiters": len(jd_rows_all),
-                "recruiters_tab": recruiters_tab,
                 "output_sheet": output_sheet,
                 "total_rows_written": 0,
                 "appended_rows": 0,
@@ -230,7 +196,7 @@ def run_candidate_jd_evaluator_for_role(
                 "failed_jd_runs": 0,
                 "jd_results": [],
                 "failures": [],
-                "skipped_reason": skipped_reason,
+                "skipped_reason": "no pending JD rows to evaluate",
                 "duration_seconds": round(perf_counter() - started_at, 2),
             }
             CANDIDATE_JD_EVALUATOR_RUN_METRICS[pipeline_run_id] = metrics
@@ -251,17 +217,14 @@ def run_candidate_jd_evaluator_for_role(
                 summary_row["run_date"] = resolved_run_date
                 combined_output_rows.append(summary_row)
 
-                use_mysql_write = (os.getenv("ROLE_PIPELINE_MYSQL_DUAL_WRITE_ENABLED") or "false").strip().lower() in ("1", "true", "yes")
-                if use_mysql_write:
-                    from services.mysql_jobs_store import upsert_job_candidate_match
-                    for candidate in ranked:
-                        if candidate.get("ai_score") is not None:
-                            upsert_job_candidate_match(
-                                row=summary_row,
-                                candidate_email=candidate.get("email", ""),
-                                ai_score=int(candidate["ai_score"]),
-                                ai_reason=str(candidate.get("ai_reason") or ""),
-                            )
+                for candidate in ranked:
+                    if candidate.get("ai_score") is not None:
+                        upsert_job_candidate_match(
+                            row=summary_row,
+                            candidate_email=candidate.get("email", ""),
+                            ai_score=int(candidate["ai_score"]),
+                            ai_reason=str(candidate.get("ai_reason") or ""),
+                        )
 
                 results.append(
                     {
@@ -295,13 +258,20 @@ def run_candidate_jd_evaluator_for_role(
                 )
                 failures.append({"jd_index": str(idx), "error": str(exc)})
 
+        # Sheet: append if enabled
         appended = 0
-        if combined_output_rows:
+        write_sheet = (os.getenv("ROLE_PIPELINE_SHEET_WRITE_ENABLED") or "true").strip().lower() in (
+            "1", "true", "yes",
+        )
+        if write_sheet and combined_output_rows:
             appended = _append_candidate_match_rows(
                 spreadsheet_id=_require_spreadsheet_id(),
                 tab=output_sheet,
                 rows=combined_output_rows,
             )
+
+        # ---- mark all input jobs as evaluated ----
+        mark_jobs_jd_eval_done(eval_job_ids)
 
         metrics = {
             "run_id": pipeline_run_id,
@@ -311,9 +281,6 @@ def run_candidate_jd_evaluator_for_role(
             "role_slug": role_slug,
             "candidate_count": len(candidates),
             "jd_count": len(jd_rows),
-            "already_evaluated_count": len(already_evaluated),
-            "jd_rows_mapped_from_recruiters": len(jd_rows_all),
-            "recruiters_tab": recruiters_tab,
             "output_sheet": output_sheet,
             "total_rows_written": len(combined_output_rows),
             "appended_rows": appended,
@@ -333,7 +300,6 @@ def run_candidate_jd_evaluator_for_role(
             "role": resolved_role,
             "role_slug": role_slug,
             "output_sheet": output_sheet,
-            "recruiters_tab": recruiters_tab,
             "error": str(exc),
             "traceback": traceback.format_exc(),
             "duration_seconds": round(perf_counter() - started_at, 2),

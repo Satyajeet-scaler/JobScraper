@@ -193,6 +193,8 @@ def run_candidate_jd_evaluator_for_role(
         already_evaluated = _existing_candidate_match_job_urls(
             spreadsheet_id=_require_spreadsheet_id(),
             tab=output_sheet,
+            role_slug=role_slug,
+            run_date=resolved_run_date,
         )
 
         jd_rows: list[dict[str, str]] = []
@@ -248,6 +250,19 @@ def run_candidate_jd_evaluator_for_role(
                 summary_row["role_slug"] = role_slug
                 summary_row["run_date"] = resolved_run_date
                 combined_output_rows.append(summary_row)
+
+                use_mysql_write = (os.getenv("ROLE_PIPELINE_MYSQL_DUAL_WRITE_ENABLED") or "false").strip().lower() in ("1", "true", "yes")
+                if use_mysql_write:
+                    from services.mysql_jobs_store import upsert_job_candidate_match
+                    for candidate in ranked:
+                        if candidate.get("ai_score") is not None:
+                            upsert_job_candidate_match(
+                                row=summary_row,
+                                candidate_email=candidate.get("email", ""),
+                                ai_score=int(candidate["ai_score"]),
+                                ai_reason=str(candidate.get("ai_reason") or ""),
+                            )
+
                 results.append(
                     {
                         "jd_index": idx,
@@ -352,9 +367,17 @@ def _role_candidate_match_tab_name(*, role_slug: str, run_date: str) -> str:
     return template.format(role_slug=role_slug, date=run_date)
 
 
-def _existing_candidate_match_job_urls(*, spreadsheet_id: str, tab: str) -> set[str]:
+def _existing_candidate_match_job_urls(*, spreadsheet_id: str, tab: str, role_slug: str | None = None, run_date: str | None = None) -> set[str]:
     """Return the set of normalized job_urls already present in the
-    candidate_match tab (so repeat runs don't re-evaluate them)."""
+    candidate_match tab (or MySQL)."""
+    use_mysql = (os.getenv("ROLE_PIPELINE_MYSQL_READ_ENABLED") or "false").strip().lower() in ("1", "true", "yes")
+    if use_mysql and role_slug and run_date:
+        from services.mysql_jobs_store import fetch_evaluated_job_urls_for_role
+        try:
+            return fetch_evaluated_job_urls_for_role(role_slug=role_slug, run_date=run_date)
+        except Exception as exc:
+            logger.warning("failed to fetch already evaluated job urls from mysql role=%s err=%s", role_slug, exc)
+
     try:
         writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
         ws = writer.open_worksheet(tab)

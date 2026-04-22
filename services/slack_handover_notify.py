@@ -215,6 +215,16 @@ def load_candidate_match_count_map_for_role(*, role: str, run_date: str) -> dict
     Falls back to the generic ``candidate_match_{date}`` tab when the role tab
     is missing or empty (same behavior as role-pipeline relevant-jobs tooling).
     """
+    import os
+    use_mysql = (os.getenv("ROLE_PIPELINE_MYSQL_READ_ENABLED") or "false").strip().lower() in ("1", "true", "yes")
+    if use_mysql:
+        from services.role_pipeline import _role_slug
+        from services.mysql_jobs_store import fetch_candidate_match_counts_for_role
+        try:
+            return fetch_candidate_match_counts_for_role(role_slug=_role_slug(role), run_date=run_date)
+        except Exception as exc:
+            logger.warning("failed to fetch candidate match counts from mysql role=%s err=%s", role, exc)
+
     from services.role_pipeline import _role_slug
 
     spreadsheet_id = (os.getenv("GOOGLE_SPREADSHEET_ID") or "").strip()

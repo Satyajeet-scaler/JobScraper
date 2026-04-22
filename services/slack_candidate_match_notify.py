@@ -76,6 +76,28 @@ def send_candidate_match_slack_notifications(run_date: str | None = None) -> dic
         logger.info("candidate-match slack skipped: %s", out["skipped_reason"])
         return out
 
+    use_mysql = (os.getenv("ROLE_PIPELINE_MYSQL_READ_ENABLED") or "false").strip().lower() in ("1", "true", "yes")
+    sleep_between = float(os.getenv("CANDIDATE_MATCH_SLACK_SLEEP_SEC", "1.0"))
+    
+    if use_mysql:
+        from services.mysql_jobs_store import fetch_all_candidate_match_counts
+        counts_map = fetch_all_candidate_match_counts(run_date=resolved)
+        messages_sent = 0
+        date_header = f":calendar: *Candidate match date:* `{resolved}`"
+        if send_slack_text(date_header, defaults=defaults, sleep_after=sleep_between, log_skip_message=None):
+            messages_sent += 1
+        for job_url, count_val in counts_map.items():
+            text = f"*Candidate match* — *{count_val}* candidate(s) with AI score > 70\n{job_url}"
+            if send_slack_text(text, defaults=defaults, sleep_after=sleep_between, log_skip_message=None):
+                messages_sent += 1
+        return {
+            "run_date": resolved,
+            "worksheet": "mysql_db",
+            "rows_read": len(counts_map),
+            "messages_sent": messages_sent,
+            "skipped_reason": None,
+        }
+
     spreadsheet_id = (os.getenv("GOOGLE_SPREADSHEET_ID") or "").strip()
     if not spreadsheet_id:
         out = {

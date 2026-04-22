@@ -265,3 +265,85 @@ def mark_recruiter_contacts_handover_sent(
                 cur.execute(sql, (role, run_date, job_key, profile, email, source))
                 updated += int(cur.rowcount or 0)
     return updated
+
+
+def upsert_job_candidate_match(row: dict[str, Any], candidate_email: str, ai_score: int | None, ai_reason: str | None) -> None:
+    job_id = upsert_job(row)
+    sql = """
+    INSERT INTO job_candidate_matches (
+        job_id, run_date, role_slug, candidate_email, ai_score, ai_reason
+    ) VALUES (
+        %(job_id)s, %(run_date)s, %(role_slug)s, %(candidate_email)s, %(ai_score)s, %(ai_reason)s
+    )
+    ON DUPLICATE KEY UPDATE
+        ai_score = VALUES(ai_score),
+        ai_reason = VALUES(ai_reason),
+        updated_at = CURRENT_TIMESTAMP
+    """
+    payload = {
+        "job_id": job_id,
+        "run_date": _to_date(row.get("run_date")),
+        "role_slug": row.get("role_slug"),
+        "candidate_email": str(candidate_email).strip().lower(),
+        "ai_score": ai_score,
+        "ai_reason": ai_reason,
+    }
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, payload)
+
+
+def fetch_candidate_match_counts_for_role(*, role_slug: str, run_date: str) -> dict[str, int]:
+    """Returns mapping of normalized job_url to count of candidates with ai_score > 70."""
+    sql = """
+    SELECT j.job_url_normalized, COUNT(c.id) as gt_70_count
+    FROM job_candidate_matches c
+    JOIN jobs j ON j.id = c.job_id
+    WHERE c.role_slug = %s AND c.run_date = %s AND c.ai_score > 70
+    GROUP BY j.job_url_normalized
+    """
+    out: dict[str, int] = {}
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (role_slug, run_date))
+            rows = cur.fetchall() or []
+            for r in rows:
+                out[r["job_url_normalized"]] = int(r["gt_70_count"])
+    return out
+
+
+def fetch_evaluated_job_urls_for_role(*, role_slug: str, run_date: str) -> set[str]:
+    """Returns set of normalized job_urls that have been evaluated for this role/date."""
+    sql = """
+    SELECT DISTINCT j.job_url_normalized
+    FROM job_candidate_matches c
+    JOIN jobs j ON j.id = c.job_id
+    WHERE c.role_slug = %s AND c.run_date = %s
+    """
+    out: set[str] = set()
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (role_slug, run_date))
+            rows = cur.fetchall() or []
+            for r in rows:
+                out.add(r["job_url_normalized"])
+    return out
+
+
+def fetch_all_candidate_match_counts(*, run_date: str) -> dict[str, int]:
+    """Returns mapping of raw job_url to count of candidates with ai_score > 70 across all roles."""
+    sql = """
+    SELECT j.job_url, COUNT(c.id) as gt_70_count
+    FROM job_candidate_matches c
+    JOIN jobs j ON j.id = c.job_id
+    WHERE c.run_date = %s AND c.ai_score > 70
+    GROUP BY j.job_url
+    """
+    out: dict[str, int] = {}
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (run_date,))
+            rows = cur.fetchall() or []
+            for r in rows:
+                out[str(r["job_url"])] = int(r["gt_70_count"])
+    return out

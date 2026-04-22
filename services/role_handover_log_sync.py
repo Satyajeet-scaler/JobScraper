@@ -13,7 +13,7 @@ from services.linkedin_posts_slack_row import slack_post_url_from_row
 from services.role_linkedin_posts_pipeline import _role_linkedin_relevant_tab_name
 from services.role_pipeline import _role_slug
 from services.role_recruiter_info_service import role_recruiters_tab_name_for_role
-from services.slack_role_pipeline_notify import _read_role_recruiter_rows, _split_recruiter_cases
+from services.slack_role_pipeline_notify import _read_role_recruiter_rows, _split_recruiter_case3_rows
 
 logger = logging.getLogger(__name__)
 
@@ -94,13 +94,17 @@ def sync_role_handover_log_to_sheet(*, run_date: str, role: str) -> dict[str, An
     recruiters_tab = role_recruiters_tab_name_for_role(role=resolved_role, run_date=run_date)
     linkedin_tab = _role_linkedin_relevant_tab_name(role_slug=role_slug, run_date=run_date)
 
-    recruiter_sheet_rows = _read_role_recruiter_rows(recruiters_tab)
-    case3, case2 = _split_recruiter_cases(
+    recruiter_sheet_rows = _read_role_recruiter_rows(
+        recruiters_tab,
+        role=resolved_role,
+        run_date=run_date,
+    )
+    case3 = _split_recruiter_case3_rows(
         recruiter_sheet_rows,
         run_date,
         upstream_run_id=None,
     )
-    recruiter_rows_for_log = case3 + case2
+    recruiter_rows_for_log = case3
     linkedin_rows = [
         r for r in _load_rows(linkedin_tab)
         if (str(r.get("run_date") or "").strip() in ("", run_date))

@@ -104,7 +104,6 @@ def write_linkedin_recruiters_for_relevant_jobs(
     append_mode: bool = False,
     dedupe_existing_on: tuple[str, ...] | None = None,
     extra_columns: dict[str, Any] | None = None,
-    include_company_contacts_fallback: bool = True,
 ) -> LinkedinRecruiterSheetResult:
     """
     Scrape LinkedIn recruiter cards for relevant LinkedIn job URLs and append rows to
@@ -212,43 +211,7 @@ def write_linkedin_recruiters_for_relevant_jobs(
                 }
             )
 
-    contacts_map = _load_company_contact_email_map() if include_company_contacts_fallback else {}
-    if contacts_map:
-        for job in relevant_jobs:
-            url = (job.get("job_url") or "").strip()
-            site = str(job.get("site") or "").strip().lower()
-            # For LinkedIn only, add fallback rows when recruiter profiles were not found.
-            if site == "linkedin" and url and url in job_urls_with_recruiter_profile:
-                continue
-            company = (job.get("company") or "").strip()
-            if not company:
-                continue
-            normalized = _normalize_company_name(company)
-            if not normalized:
-                continue
-            emails = contacts_map.get(normalized, [])
-            if not emails:
-                continue
-            rows.append(
-                {
-                    "run_date": run_date,
-                    "relevant_jobs_tab": relevant_tab_name,
-                    "job_url": url,
-                    "title": job.get("title", ""),
-                    "company": company,
-                    "site": job.get("site", ""),
-                    "matched_role": job.get("matched_role", ""),
-                    "role_category": job.get("role_category", ""),
-                    "priority": job.get("priority", ""),
-                    "recruiter_name": "",
-                    "recruiter_headline": "",
-                    "recruiter_profile_url": "",
-                    "recruiter_email": ",".join(emails),
-                    "meet_the_team_section_found": False,
-                    "recruiter_source": "company_contacts_sheet",
-                    "scrape_error": "",
-                }
-            )
+
 
     if extra_columns:
         for row in rows:
@@ -366,50 +329,7 @@ def _stringify_cell(value: Any) -> str:
     return str(value)
 
 
-def _load_company_contact_email_map() -> dict[str, list[str]]:
-    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
-    if not spreadsheet_id:
-        return {}
-    sheet_name = os.getenv("COMPANY_CONTACTS_SHEET_NAME", "Data_")
-    company_header = os.getenv("COMPANY_CONTACTS_COMPANY_COLUMN", "Name of company").strip().lower()
-    email_header = os.getenv("COMPANY_CONTACTS_EMAIL_COLUMN", "Email Address").strip().lower()
 
-    try:
-        writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-        worksheet = writer.open_worksheet(sheet_name)
-        rows = writer.worksheet_get_all_values(
-            worksheet,
-            f"linkedin_recruiter_sheets:{sheet_name}:get_all_values",
-        )
-    except Exception as exc:
-        logger.warning("linkedin recruiter sheet: contacts tab unavailable sheet=%s err=%s", sheet_name, exc)
-        return {}
-
-    if len(rows) <= 1:
-        return {}
-    headers = rows[0]
-    header_map = {h.strip().lower(): i for i, h in enumerate(headers) if h.strip()}
-    company_idx = header_map.get(company_header)
-    email_idx = header_map.get(email_header)
-    if company_idx is None or email_idx is None:
-        logger.warning(
-            "linkedin recruiter sheet: contacts headers missing company=%s email=%s",
-            company_header,
-            email_header,
-        )
-        return {}
-
-    by_company: dict[str, set[str]] = {}
-    for row in rows[1:]:
-        company = row[company_idx].strip() if len(row) > company_idx else ""
-        email = row[email_idx].strip() if len(row) > email_idx else ""
-        if not company or not email:
-            continue
-        normalized = _normalize_company_name(company)
-        if not normalized:
-            continue
-        by_company.setdefault(normalized, set()).add(email)
-    return {k: sorted(v) for k, v in by_company.items()}
 
 
 def _normalize_company_name(value: Any) -> str:

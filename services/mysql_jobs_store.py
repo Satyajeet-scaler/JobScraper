@@ -492,3 +492,55 @@ def mark_jobs_jd_eval_done(job_ids: list[int]) -> int:
         with conn.cursor() as cur:
             cur.execute(sql, tuple(job_ids))
             return int(cur.rowcount or 0)
+
+
+# ---------------------------------------------------------------------------
+# Slack Handover
+# ---------------------------------------------------------------------------
+
+
+def fetch_pending_recruiter_slack_handovers(*, role: str, run_date: str) -> list[dict[str, Any]]:
+    """Return recruiter leads that have not yet been sent to Slack.
+    Uses AI candidate matches dynamically.
+    """
+    sql = """
+    SELECT
+        j.id AS _job_id,
+        j.company,
+        j.title,
+        r.matched_role,
+        r.role_category,
+        j.job_url,
+        j.site,
+        rc.id AS _rc_id,
+        rc.recruiter_profile_url,
+        (
+            SELECT COUNT(*)
+            FROM job_candidate_matches cm
+            WHERE cm.job_id = j.id AND CAST(cm.ai_score AS SIGNED) >= 70
+        ) AS _candidate_match_count
+    FROM jobs j
+    INNER JOIN job_recruiter_contacts rc ON j.id = rc.job_id
+    LEFT JOIN job_relevance r ON r.job_id = j.id
+    WHERE j.requested_role = %s
+      AND j.run_date = %s
+      AND rc.recruiter_source = 'linkedin_meet_the_team'
+      AND rc.handover_sent = FALSE
+    """
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (role, run_date))
+            rows = cur.fetchall() or []
+    return [dict(r) for r in rows]
+
+
+def mark_recruiter_contacts_handover_sent(rc_assignments: list[tuple[int, str]]) -> int:
+    """Mark RC entries as sent and assign owner. Takes a list of (rc_id, owner_name)."""
+    if not rc_assignments:
+        return 0
+    sql = "UPDATE job_recruiter_contacts SET handover_sent = TRUE, assigned_owner = %s, updated_at = CURRENT_TIMESTAMP WHERE id = %s"
+    updates = [(o, r) for r, o in rc_assignments]
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(sql, updates)
+            return int(cur.rowcount or 0)

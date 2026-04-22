@@ -34,11 +34,7 @@ def send_role_handover_notifications(
     upstream_run_id: str | None = None,
     send_recruiter_info: bool = True,
 ) -> dict[str, Any]:
-    """Post Case 3 (recruiter LinkedIn profile) Slack handovers for a role.
-
-    Internal POC (Case 2) Slack messages are intentionally not sent from this
-    notifier; use the global ``send_handover_notifications`` if needed.
-    """
+    """Post LinkedIn Meet The Team (Case 3) Slack handovers for a role."""
     resolved_date = (run_date or date.today().isoformat()).strip()
     resolved_role = (role or "").strip()
     if not resolved_role:
@@ -48,7 +44,7 @@ def send_role_handover_notifications(
     defaults = slack_notify_defaults_from_env()
     min_candidate_match = _resolve_min_candidate_match(resolved_role)
     include_cm_slack = _role_includes_candidate_match_in_slack(resolved_role)
-    out = {
+    out: dict[str, Any] = {
         "run_date": resolved_date,
         "role": resolved_role,
         "role_slug": role_slug,
@@ -64,60 +60,40 @@ def send_role_handover_notifications(
         out["skipped_reason"] = "SLACK_WEBHOOK_URL not configured"
         return out
 
-    recruiter_rows = _read_role_recruiter_rows(
-        recruiters_tab,
-        role=resolved_role,
-        run_date=resolved_date,
-        upstream_run_id=upstream_run_id,
-    )
-    if not recruiter_rows:
-        out["skipped_reason"] = "no recruiter rows"
+    # Fetch directly from MySQL (combining case3 recruiter contacts + AI candidate matches)
+    from services.mysql_jobs_store import fetch_pending_recruiter_slack_handovers, mark_recruiter_contacts_handover_sent
+    from services.slack_relevant_jobs_handover import _owner_display_name
+
+    case3_raw = fetch_pending_recruiter_slack_handovers(role=resolved_role, run_date=resolved_date)
+    if not case3_raw:
+        out["skipped_reason"] = "no pending recruiter handovers found in db"
         return out
 
-    case3 = _split_recruiter_case3_rows(
-        recruiter_rows,
-        resolved_date,
-        upstream_run_id=upstream_run_id,
-    )
-    case3 = [row for row in case3 if not _is_handover_sent(row)]
-    candidate_match_count_map = load_candidate_match_count_map_for_role(
-        role=resolved_role,
-        run_date=resolved_date,
-    )
-    n_case3_before = len(case3)
-    case3 = [
-        row
-        for row in case3
-        if _row_meets_recruiter_handover_threshold(
-            row, candidate_match_count_map, min_candidate_match
-        )
-    ]
-    if n_case3_before != len(case3):
-        logger.info(
-            "role slack handover: role=%s min_candidate_match=%s recruiter cases case3 %s->%s",
-            resolved_role,
-            min_candidate_match,
-            n_case3_before,
-            len(case3),
-        )
-    out["recruiter_detail_leads"] = len(case3)
+    case3 = []
+    for db_row in case3_raw:
+        count = int(db_row.get("_candidate_match_count") or 0)
+        if count >= min_candidate_match:
+            case3.append(db_row)
 
+    out["recruiter_detail_leads"] = len(case3)
     owner_rows = load_owner_rows_for_handover() or []
-    sent_case3_keys: set[tuple[str, str, str, str]] = set()
+    sent_assignments: list[tuple[str, int]] = []
+
     if send_recruiter_info and case3 and owner_rows:
         if send_slack_text(HEADING_RECRUITER_DETAIL, defaults=defaults, sleep_after=1.0):
             out["recruiter_messages_sent"] += 1
-            owner_buckets: dict[int, list[dict[str, str]]] = {i: [] for i in range(len(owner_rows))}
+            owner_buckets: dict[int, list[dict[str, Any]]] = {i: [] for i in range(len(owner_rows))}
             for idx, row in enumerate(case3):
                 owner_buckets[idx % len(owner_rows)].append(row)
             for owner_idx, owner in enumerate(owner_rows):
+                owner_name = _owner_display_name(owner)
                 for row in owner_buckets.get(owner_idx, []):
                     tag = owner_tag_for_handover(owner)
                     company = (row.get("company") or "-").strip() or "-"
                     role_category = recruiter_row_role_label_for_slack(row)
                     job_url = (row.get("job_url") or "-").strip() or "-"
                     profile_url = (row.get("recruiter_profile_url") or "-").strip() or "-"
-                    count = candidate_match_count_map.get(_normalize_job_key(job_url), 0)
+                    count = int(row.get("_candidate_match_count") or 0)
                     msg = format_recruiter_detail_lead(
                         tag,
                         company,
@@ -129,28 +105,11 @@ def send_role_handover_notifications(
                     )
                     if send_slack_text(msg, defaults=defaults, sleep_after=1.0):
                         out["recruiter_messages_sent"] += 1
-                        sent_case3_keys.add(_recruiter_row_identity(row))
+                        sent_assignments.append((row["_rc_id"], owner_name))
 
-    spreadsheet_id = _google_spreadsheet_id()
-    if sent_case3_keys and owner_rows and spreadsheet_id:
-        persist_assigned_owner_round_robin(
-            spreadsheet_id=spreadsheet_id,
-            worksheet_title=recruiters_tab,
-            owner_rows=owner_rows,
-            selector=lambda row: _is_recruiter_case3_selected(
-                row,
-                run_date=resolved_date,
-                upstream_run_id=upstream_run_id,
-                selected_keys=sent_case3_keys,
-            ),
-        )
-        out["assigned_owner_rows_updated"] += len(sent_case3_keys)
-    if sent_case3_keys:
-        out["handover_sent_rows_updated"] = mark_recruiter_contacts_handover_sent(
-            role=resolved_role,
-            run_date=resolved_date,
-            identities=sent_case3_keys,
-        )
+    if sent_assignments:
+        out["assigned_owner_rows_updated"] = len(sent_assignments)
+        out["handover_sent_rows_updated"] = mark_recruiter_contacts_handover_sent(sent_assignments)
     else:
         out["handover_sent_rows_updated"] = 0
 

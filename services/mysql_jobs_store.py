@@ -45,7 +45,7 @@ def upsert_job(row: dict[str, Any]) -> int:
         "company": row.get("company"),
         "location": row.get("location"),
         "date_posted": row.get("date_posted"),
-        "requested_role": row.get("requested_role"),
+        "requested_role": row.get("requested_role") or row.get("role_query"),
         "run_date": _to_date(row.get("run_date")),
     }
 

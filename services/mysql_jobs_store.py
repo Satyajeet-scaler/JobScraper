@@ -151,9 +151,32 @@ def upsert_job_relevance(row: dict[str, Any]) -> None:
             cur.execute(sql, payload)
 
 
+def _lookup_job_id_by_url(job_url: str) -> int | None:
+    """Find the existing job ID by normalized URL. Returns None if not found."""
+    normalized = normalize_job_url(job_url)
+    if not normalized:
+        return None
+    sql = "SELECT id FROM jobs WHERE job_url_normalized = %s ORDER BY id ASC LIMIT 1"
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (normalized,))
+            row = cur.fetchone()
+    return int(row["id"]) if row else None
+
+
 def upsert_job_recruiter_contact(row: dict[str, Any]) -> None:
+    import logging
+    logger = logging.getLogger(__name__)
+
     mapped = canonicalize_recruiter_row(row)
-    job_id = upsert_job(mapped)
+    job_url = str(mapped.get("job_url") or "").strip()
+
+    # Look up existing job instead of creating a new one (avoids phantom NULL-role rows)
+    job_id = _lookup_job_id_by_url(job_url)
+    if not job_id:
+        logger.warning("upsert_job_recruiter_contact: no existing job found for url=%s, skipping", job_url)
+        return
+
     sql = """
     INSERT INTO job_recruiter_contacts (
         job_id, run_date, recruiter_name, recruiter_headline, recruiter_profile_url, recruiter_profile_url_normalized,

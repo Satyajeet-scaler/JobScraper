@@ -444,9 +444,13 @@ def mark_jobs_recruiter_info_checked(job_ids: list[int]) -> int:
 
 
 def fetch_jd_eval_pending_jobs_for_role(*, role: str, run_date: str) -> list[dict[str, Any]]:
-    """Return jobs that have recruiter info but have not yet been through candidate JD eval."""
+    """Return jobs that have recruiter contacts and have not yet been through candidate JD eval.
+
+    Only jobs with at least one entry in ``job_recruiter_contacts`` are returned,
+    ensuring we only evaluate JDs where a recruiter was actually found.
+    """
     sql = """
-    SELECT
+    SELECT DISTINCT
         j.id AS _job_id,
         j.site,
         j.job_url,
@@ -458,10 +462,10 @@ def fetch_jd_eval_pending_jobs_for_role(*, role: str, run_date: str) -> list[dic
         j.run_date,
         COALESCE(s.description_full, '') AS jd
     FROM jobs j
+    INNER JOIN job_recruiter_contacts rc ON rc.job_id = j.id
     LEFT JOIN job_scrapes s ON s.job_id = j.id
     WHERE j.requested_role = %s
       AND j.run_date = %s
-      AND j.recruiter_info_checked = TRUE
       AND j.candidates_jd_eval_done = FALSE
     ORDER BY j.id ASC
     """

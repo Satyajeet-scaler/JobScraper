@@ -694,17 +694,16 @@ def _role_scrape_sources_for_current_slot() -> list[str]:
     tz = ZoneInfo(os.getenv("CRON_TIMEZONE", "Asia/Kolkata"))
     current_hour = datetime.now(tz).hour
     hirecafe_enabled = os.getenv("ROLE_PIPELINE_HIRECAFE_ENABLED", "false").lower() in ("1", "true", "yes")
-    # First and last scrape cron slots (07:30, 16:30) run every major source.
-    # Middle slots (10:30, 13:30) skip Naukri to reduce Apify spend.
-    if current_hour in (7, 16):
+
+    # First scrape cron slot (07:30) runs every major source.
+    # 10:30, 13:30 and 16:30 slots use jobspy and wellfound only.
+    if current_hour == 7:
         sources = ["jobspy", "naukri", "wellfound", "hirist"]
         if hirecafe_enabled:
             sources.append("hirecafe")
         return sources
-    sources = ["jobspy", "hirist", "wellfound"]
-    if hirecafe_enabled:
-        sources.append("hirecafe")
-    return sources
+
+    return ["jobspy", "wellfound"]
 
 
 def _run_recruiter_info_from_scheduler() -> None:
@@ -931,14 +930,14 @@ def _build_scheduler() -> BackgroundScheduler:
         # 4 slots per day, 3-hour interval.
         # Pipeline stages are staggered so each stage's inputs exist by the time
         # it runs:
-        #   07:30 scrape -> 08:00 classify -> 08:15 recruiter-info (LinkedIn profiles)
-        #   -> 08:30 candidate-jd-eval (maps from role_recruiters_info -> role_relevant)
+        #   07:00 scrape -> 07:45 classify -> 08:50 recruiter-info (LinkedIn profiles)
+        #   -> 09:05 candidate-jd-eval (maps from role_recruiters_info -> role_relevant)
         #   -> 09:30 slack handover (recruiter sheet cases + LinkedIn posts)
-        #   -> 09:35 handover log sync (recruiter + LinkedIn tabs)
+        #   -> 09:45 handover log sync (recruiter + LinkedIn tabs)
         # Repeats at +3h intervals for each stage.
         scheduler.add_job(
             _run_role_scrape_from_scheduler,
-            trigger=CronTrigger(hour="7,10,13,16", minute=30, timezone=timezone),
+            trigger=CronTrigger(hour="7,10,13,16", minute=0, timezone=timezone),
             id="intraday-role-scrape-only",
             replace_existing=True,
             max_instances=1,
@@ -947,7 +946,7 @@ def _build_scheduler() -> BackgroundScheduler:
         )
         scheduler.add_job(
             _run_role_classify_from_scheduler,
-            trigger=CronTrigger(hour="8,11,14,17", minute=0, timezone=timezone),
+            trigger=CronTrigger(hour="7,10,13,16", minute=45, timezone=timezone),
             id="intraday-role-classify-only",
             replace_existing=True,
             max_instances=1,
@@ -956,7 +955,7 @@ def _build_scheduler() -> BackgroundScheduler:
         )
         scheduler.add_job(
             _run_role_recruiter_info_from_scheduler,
-            trigger=CronTrigger(hour="8,11,14,17", minute=15, timezone=timezone),
+            trigger=CronTrigger(hour="8,11,14,17", minute=50, timezone=timezone),
             id="intraday-role-recruiter-info-only",
             replace_existing=True,
             max_instances=1,
@@ -965,7 +964,7 @@ def _build_scheduler() -> BackgroundScheduler:
         )
         scheduler.add_job(
             _run_role_candidate_jd_eval_from_scheduler,
-            trigger=CronTrigger(hour="8,11,14,17", minute=30, timezone=timezone),
+            trigger=CronTrigger(hour="9,12,15,18", minute=5, timezone=timezone),
             id="intraday-role-candidate-jd-eval",
             replace_existing=True,
             max_instances=1,
@@ -983,7 +982,7 @@ def _build_scheduler() -> BackgroundScheduler:
         )
         scheduler.add_job(
             _run_role_handover_log_sync_from_scheduler,
-            trigger=CronTrigger(hour="9,12,15,18", minute=35, timezone=timezone),
+            trigger=CronTrigger(hour="9,12,15,18", minute=45, timezone=timezone),
             id="intraday-role-handover-log-sync",
             replace_existing=True,
             max_instances=1,
@@ -991,12 +990,12 @@ def _build_scheduler() -> BackgroundScheduler:
             misfire_grace_time=1800,
         )
     if role_linkedin_posts_enabled:
-        # Role LinkedIn posts: scrape 7/10/13/16 :50, classify 8/11/14/17 :20 (CRON_TIMEZONE).
+        # Role LinkedIn posts: scrape 7:30/13:30, classify 8:20/14:20 (CRON_TIMEZONE).
         # Runs once per role from ROLE_LINKEDIN_POSTS_ROLE_CONFIG_JSON keys when set,
         # else same roles as ROLE_PIPELINE_CRON_ROLES / ROLE_PIPELINE_CRON_ROLE.
         scheduler.add_job(
             _run_role_linkedin_posts_scrape_from_scheduler,
-            trigger=CronTrigger(hour="7,10,13,16", minute=50, timezone=timezone),
+            trigger=CronTrigger(hour="7,13", minute=30, timezone=timezone),
             id="intraday-role-linkedin-posts-scrape-only",
             replace_existing=True,
             max_instances=1,
@@ -1005,7 +1004,7 @@ def _build_scheduler() -> BackgroundScheduler:
         )
         scheduler.add_job(
             _run_role_linkedin_posts_classify_from_scheduler,
-            trigger=CronTrigger(hour="8,11,14,17", minute=20, timezone=timezone),
+            trigger=CronTrigger(hour="8,14", minute=20, timezone=timezone),
             id="intraday-role-linkedin-posts-classify-only",
             replace_existing=True,
             max_instances=1,

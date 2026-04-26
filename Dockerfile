@@ -34,6 +34,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # Non-root user — reduces bot detection flags from running as uid 0
 RUN groupadd -r appuser && useradd -r -g appuser -m -d /home/appuser appuser
 
+# Copy chromedriver to a writable location so undetected-chromedriver can patch it
+RUN cp /usr/bin/chromedriver /usr/local/bin/chromedriver \
+    && chown appuser:appuser /usr/local/bin/chromedriver \
+    && chmod 755 /usr/local/bin/chromedriver
+
 RUN pip install --no-cache-dir --upgrade pip
 
 COPY requirements.txt /app/requirements.txt

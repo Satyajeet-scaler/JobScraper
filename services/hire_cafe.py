@@ -651,7 +651,7 @@ def _launch_hirecafe_driver():
         driver = uc.Chrome(
             options=options,
             browser_executable_path="/usr/bin/chromium",
-            driver_executable_path="/usr/bin/chromedriver",
+            driver_executable_path="/usr/local/bin/chromedriver",
         )
     else:
         driver = uc.Chrome(options=options, version_main=147)

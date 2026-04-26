@@ -21,7 +21,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium-driver \
     xauth \
     xvfb \
+    fontconfig \
+    fonts-liberation \
+    fonts-dejavu-core \
+    fonts-noto-color-emoji \
     && rm -rf /var/lib/apt/lists/*
+
+# Non-root user — reduces bot detection flags from running as uid 0
+RUN groupadd -r appuser && useradd -r -g appuser -m -d /home/appuser appuser
 
 RUN pip install --no-cache-dir --upgrade pip
 
@@ -33,4 +40,8 @@ RUN playwright install --with-deps chromium
 
 COPY . /app
 
-CMD sh -c "xvfb-run -a uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"
+# Profile dir for persistent chrome data (Railway volume at /data)
+RUN mkdir -p /data/chrome_profile && chown -R appuser:appuser /app /data
+USER appuser
+
+CMD sh -c "xvfb-run -a --server-args='-screen 0 1920x1080x24' uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"

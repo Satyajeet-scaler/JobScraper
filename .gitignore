@@ -34,3 +34,6 @@ dist/
 
 # Playwright LinkedIn session (cookies); do not commit
 data/linkedin_storage.json
+
+# Local Chrome profile for HireCafe; contains cookies/secrets
+data/chrome_profile/

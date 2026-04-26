@@ -13,3 +13,7 @@ agent-transcripts
 data/linkedin_storage.json
 .env
 .env.*
+
+# Chrome profile comes from Railway volume, not baked into image
+chrome_user_data/
+data/chrome_profile/

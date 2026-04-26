@@ -4,10 +4,12 @@ import json
 import math
 import multiprocessing
 import os
+import shutil
 import sys
 import tempfile
 import uuid
 import logging
+import zipfile
 from pathlib import Path
 from typing import Any, Literal, Optional
 from zoneinfo import ZoneInfo
@@ -15,7 +17,7 @@ from zoneinfo import ZoneInfo
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi.encoders import jsonable_encoder
-from fastapi import BackgroundTasks, Body, FastAPI, Header, HTTPException, Query, Request, status
+from fastapi import BackgroundTasks, Body, FastAPI, File, Header, HTTPException, Query, Request, UploadFile, status
 from fastapi.responses import FileResponse, JSONResponse
 from jobspy import scrape_jobs
 from pandas import DataFrame
@@ -1679,6 +1681,76 @@ def get_hirecafe_run_status(
     if not metrics:
         raise HTTPException(status_code=404, detail="Run ID not found.")
     return JSONResponse(content=metrics)
+
+
+@app.post("/internal/hirecafe/upload-profile")
+async def upload_hirecafe_profile(
+    file: UploadFile = File(...),
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """
+    Receive a ZIP of the Chrome profile and extract it to the location
+    defined by HIRECAFE_CHROME_PROFILE_DIR.
+    """
+    validate_internal_trigger_token(x_internal_token)
+
+    from services.hire_cafe import HIRECAFE_CHROME_PROFILE_DIR
+    target_dir = Path(HIRECAFE_CHROME_PROFILE_DIR)
+    if not target_dir.is_absolute():
+        target_dir = BASE_DIR / target_dir
+
+    # Security: ensure it's in /data or app data
+    try:
+        _assert_writable_role_config_path(str(target_dir))
+    except ValueError as exc:
+        # Fallback if the dir doesn't exist yet (mkdir parents)
+        if not target_dir.parent.exists():
+            target_dir.parent.mkdir(parents=True, exist_ok=True)
+            _assert_writable_role_config_path(str(target_dir))
+        else:
+            raise HTTPException(status_code=400, detail=str(exc))
+
+    logger.info("hirecafe-profile-upload starting target=%s", target_dir)
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        zip_path = Path(tmp_dir) / "profile.zip"
+        with open(zip_path, "wb") as f:
+            shutil.copyfileobj(file.file, f)
+
+        # Extraction dir
+        extract_dir = Path(tmp_dir) / "extract"
+        extract_dir.mkdir()
+
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zip_ref:
+                zip_ref.extractall(extract_dir)
+        except Exception as exc:
+            logger.error("hirecafe-profile-upload zip extraction failed: %s", exc)
+            raise HTTPException(status_code=400, detail="Invalid zip file.")
+
+        # Atomic-ish swap: delete old, move new
+        if target_dir.exists():
+            shutil.rmtree(target_dir)
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        # If the zip contained the profile dir itself vs contents, handle both
+        # We expect contents. If there's exactly one dir inside, we take its contents.
+        items = list(extract_dir.iterdir())
+        source = extract_dir
+        if len(items) == 1 and items[0].is_dir() and items[0].name == "chrome_profile":
+            source = items[0]
+
+        for item in source.iterdir():
+            if item.is_dir():
+                shutil.copytree(item, target_dir / item.name)
+            else:
+                shutil.copy2(item, target_dir / item.name)
+
+    logger.info("hirecafe-profile-upload completed successfully")
+    return JSONResponse(
+        status_code=status.HTTP_200_OK,
+        content={"status": "success", "target": str(target_dir)},
+    )
 
 
 @app.post("/internal/run-hirist-scrape")

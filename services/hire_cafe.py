@@ -6,10 +6,14 @@ Requires xvfb virtual display on headless servers (the uvicorn process should
 be launched via ``xvfb-run -a``).
 """
 
+import glob
 import html
 import json
 import logging
+import math
 import os
+import random
+import shutil
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,6 +67,126 @@ HIRECAFE_BROWSER_MODE = os.getenv("HIRECAFE_BROWSER_MODE", "stealth").strip().lo
 HIRECAFE_DETECTABLE_HEADLESS = os.getenv("HIRECAFE_DETECTABLE_HEADLESS", "true").lower() not in (
     "false", "0", "no",
 )
+
+# ---------------------------------------------------------------------------
+#  Persistent browser profile
+# ---------------------------------------------------------------------------
+HIRECAFE_CHROME_PROFILE_DIR = os.getenv(
+    "HIRECAFE_CHROME_PROFILE_DIR", "data/chrome_profile"
+).strip()
+
+# ---------------------------------------------------------------------------
+#  TLS / header alignment — matches Debian bookworm Chromium 131
+# ---------------------------------------------------------------------------
+_CHROME_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+)
+_CHROME_SEC_CH_UA = '"Chromium";v="131", "Not_A Brand";v="24"'
+
+# ---------------------------------------------------------------------------
+#  Stealth JavaScript — injected via Page.addScriptToEvaluateOnNewDocument
+#  Eliminates common headless fingerprints before any page loads.
+# ---------------------------------------------------------------------------
+_STEALTH_JS = """
+// 1. Remove navigator.webdriver flag
+Object.defineProperty(navigator, 'webdriver', {
+    get: () => undefined,
+    configurable: true
+});
+
+// 2. Realistic hardware concurrency & device memory
+Object.defineProperty(navigator, 'hardwareConcurrency', {
+    get: () => 8,
+    configurable: true
+});
+Object.defineProperty(navigator, 'deviceMemory', {
+    get: () => 8,
+    configurable: true
+});
+
+// 3. Override navigator.languages
+Object.defineProperty(navigator, 'languages', {
+    get: () => ['en-US', 'en'],
+    configurable: true
+});
+
+// 4. WebGL vendor/renderer spoofing
+(function() {
+    const getParameter = WebGLRenderingContext.prototype.getParameter;
+    WebGLRenderingContext.prototype.getParameter = function(parameter) {
+        if (parameter === 37445) return 'Google Inc. (NVIDIA)';
+        if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 SUPER, OpenGL 4.5)';
+        return getParameter.call(this, parameter);
+    };
+    if (typeof WebGL2RenderingContext !== 'undefined') {
+        const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
+        WebGL2RenderingContext.prototype.getParameter = function(parameter) {
+            if (parameter === 37445) return 'Google Inc. (NVIDIA)';
+            if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 SUPER, OpenGL 4.5)';
+            return getParameter2.call(this, parameter);
+        };
+    }
+})();
+
+// 5. Fake plugins (headless Chrome returns empty)
+Object.defineProperty(navigator, 'plugins', {
+    get: () => {
+        const arr = [
+            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer',
+              description: 'Portable Document Format',
+              length: 1, item: (i) => ({ type: 'application/x-google-chrome-pdf' }) },
+            { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai',
+              description: '', length: 1,
+              item: (i) => ({ type: 'application/pdf' }) },
+            { name: 'Native Client', filename: 'internal-nacl-plugin',
+              description: '', length: 2,
+              item: (i) => ({ type: i === 0 ? 'application/x-nacl' : 'application/x-pnacl' }) }
+        ];
+        arr.item = (i) => arr[i] || null;
+        arr.namedItem = (n) => arr.find(p => p.name === n) || null;
+        arr.refresh = () => {};
+        return arr;
+    },
+    configurable: true
+});
+
+// 6. Fix Notification.permission
+try {
+    Object.defineProperty(Notification, 'permission', {
+        get: () => 'default',
+        configurable: true
+    });
+} catch(e) {}
+
+// 7. Fix navigator.permissions.query
+(function() {
+    const origQuery = navigator.permissions.query.bind(navigator.permissions);
+    navigator.permissions.query = function(params) {
+        if (params && params.name === 'notifications') {
+            return Promise.resolve({ state: 'prompt', onchange: null });
+        }
+        return origQuery(params);
+    };
+})();
+
+// 8. Mask automation-related properties
+delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
+delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
+delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
+
+// 9. Chrome runtime (headless lacks this)
+if (!window.chrome) {
+    window.chrome = {};
+}
+if (!window.chrome.runtime) {
+    window.chrome.runtime = {
+        connect: function() {},
+        sendMessage: function() {},
+        id: undefined
+    };
+}
+"""
 HIRECAFE_CHROMEDRIVER_PATH = os.getenv("HIRECAFE_CHROMEDRIVER_PATH", "").strip()
 HIRECAFE_CHROME_BINARY = os.getenv("HIRECAFE_CHROME_BINARY", "").strip()
 
@@ -377,6 +501,123 @@ def _launch_detectable_driver():
     return webdriver.Chrome(service=service, options=options)
 
 
+def _cleanup_profile_locks(profile_dir: str) -> None:
+    """Remove stale Chrome lock files that prevent profile reuse."""
+    lock_names = ("SingletonLock", "SingletonCookie", "SingletonSocket")
+    for name in lock_names:
+        lock_path = os.path.join(profile_dir, name)
+        try:
+            if os.path.exists(lock_path):
+                os.remove(lock_path)
+                logger.info("hirecafe removed stale lock: %s", lock_path)
+        except Exception as exc:
+            logger.debug("hirecafe lock cleanup failed %s: %s", name, exc)
+
+
+def _inject_stealth_scripts(driver) -> None:
+    """Inject anti-fingerprint JavaScript before any page loads."""
+    try:
+        driver.execute_cdp_cmd(
+            "Page.addScriptToEvaluateOnNewDocument",
+            {"source": _STEALTH_JS},
+        )
+        logger.info("hirecafe stealth scripts injected")
+    except Exception as exc:
+        logger.warning("hirecafe stealth injection failed: %s", exc)
+
+    # Align sec-ch-ua / sec-ch-ua-platform headers with the spoofed UA
+    try:
+        driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {
+            "headers": {
+                "sec-ch-ua": _CHROME_SEC_CH_UA,
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"Linux"',
+            }
+        })
+    except Exception:
+        pass
+
+
+def _bezier_point(
+    t: float,
+    p0: tuple[float, float],
+    p1: tuple[float, float],
+    p2: tuple[float, float],
+    p3: tuple[float, float],
+) -> tuple[float, float]:
+    """Evaluate a cubic Bézier curve at parameter *t* ∈ [0, 1]."""
+    u = 1 - t
+    x = u**3 * p0[0] + 3 * u**2 * t * p1[0] + 3 * u * t**2 * p2[0] + t**3 * p3[0]
+    y = u**3 * p0[1] + 3 * u**2 * t * p1[1] + 3 * u * t**2 * p2[1] + t**3 * p3[1]
+    return (x, y)
+
+
+def _human_mouse_path(
+    x0: float, y0: float, x1: float, y1: float,
+) -> list[tuple[float, float]]:
+    """Generate 20-40 waypoints along a cubic Bézier from (x0,y0) to (x1,y1)
+    with Gaussian pixel jitter simulating hand tremor."""
+    steps = random.randint(20, 40)
+    dx = x1 - x0
+    dy = y1 - y0
+    # Two random control points — create an organic bow
+    cp1 = (
+        x0 + dx * random.uniform(0.2, 0.4) + random.uniform(-60, 60),
+        y0 + dy * random.uniform(0.0, 0.3) + random.uniform(-40, 40),
+    )
+    cp2 = (
+        x0 + dx * random.uniform(0.6, 0.8) + random.uniform(-60, 60),
+        y0 + dy * random.uniform(0.7, 1.0) + random.uniform(-40, 40),
+    )
+    p0 = (x0, y0)
+    p3 = (x1, y1)
+    path: list[tuple[float, float]] = []
+    for i in range(steps + 1):
+        t = i / steps
+        bx, by = _bezier_point(t, p0, cp1, cp2, p3)
+        # Gaussian jitter — skip on first/last point to hit origin/target exactly
+        if 0 < i < steps:
+            bx += random.gauss(0, 1.5)
+            by += random.gauss(0, 1.5)
+        path.append((bx, by))
+    return path
+
+
+def _human_click(driver, x: int, y: int) -> bool:
+    """Move the mouse along a Bézier curve to (x, y) with realistic timing,
+    then perform a press-hold-release click sequence."""
+    try:
+        # Random origin offset (upper-left of target)
+        ox = x + random.randint(-180, -40)
+        oy = y + random.randint(-120, -25)
+        path = _human_mouse_path(float(ox), float(oy), float(x), float(y))
+
+        for wx, wy in path:
+            driver.execute_cdp_cmd(
+                "Input.dispatchMouseEvent",
+                {"type": "mouseMoved", "x": int(wx), "y": int(wy)},
+            )
+            time.sleep(random.uniform(0.008, 0.025))
+
+        # Pre-click hover pause
+        time.sleep(random.uniform(0.08, 0.20))
+
+        driver.execute_cdp_cmd(
+            "Input.dispatchMouseEvent",
+            {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1},
+        )
+        # Hold duration — simulate finger on trackpad
+        time.sleep(random.uniform(0.05, 0.12))
+        driver.execute_cdp_cmd(
+            "Input.dispatchMouseEvent",
+            {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1},
+        )
+        return True
+    except Exception as exc:
+        logger.info("hirecafe human click failed at (%s,%s): %s", x, y, type(exc).__name__)
+        return False
+
+
 def _launch_hirecafe_driver():
     options = uc.ChromeOptions()
     options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
@@ -386,15 +627,37 @@ def _launch_hirecafe_driver():
         if detectable_driver is not None:
             return detectable_driver
 
+    # --- Chrome hardening flags ---
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument(f"--user-agent={_CHROME_UA}")
+
+    # --- Persistent browser profile ---
+    profile_dir = HIRECAFE_CHROME_PROFILE_DIR
+    if profile_dir:
+        profile_path = Path(profile_dir)
+        if not profile_path.is_absolute():
+            profile_path = Path.cwd() / profile_path
+        profile_path.mkdir(parents=True, exist_ok=True)
+        _cleanup_profile_locks(str(profile_path))
+        options.add_argument(f"--user-data-dir={profile_path}")
+        logger.info("hirecafe using persistent profile: %s", profile_path)
+
     is_server = os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("PORT")
     if is_server:
         logger.info("hirecafe detected server environment, using system chromium binaries")
-        return uc.Chrome(
+        driver = uc.Chrome(
             options=options,
             browser_executable_path="/usr/bin/chromium",
             driver_executable_path="/usr/bin/chromedriver",
         )
-    return uc.Chrome(options=options, version_main=145)
+    else:
+        driver = uc.Chrome(options=options, version_main=147)
+
+    _inject_stealth_scripts(driver)
+    return driver
 
 
 def _press_escape_before_scroll(driver) -> None:
@@ -414,23 +677,8 @@ def _press_escape_before_scroll(driver) -> None:
 
 
 def _click_viewport_coordinate(driver, x: int, y: int) -> bool:
-    try:
-        driver.execute_cdp_cmd(
-            "Input.dispatchMouseEvent",
-            {"type": "mouseMoved", "x": x, "y": y, "button": "left", "clickCount": 1},
-        )
-        driver.execute_cdp_cmd(
-            "Input.dispatchMouseEvent",
-            {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1},
-        )
-        driver.execute_cdp_cmd(
-            "Input.dispatchMouseEvent",
-            {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1},
-        )
-        return True
-    except Exception as exc:
-        logger.info("hirecafe hardcoded click failed at (%s,%s): %s", x, y, type(exc).__name__)
-        return False
+    """Click at viewport coordinates using human-like Bézier mouse movement."""
+    return _human_click(driver, x, y)
 
 
 def _extract_viewjob_id(url_or_href: str) -> str | None:

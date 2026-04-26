@@ -5,5 +5,5 @@ if [ -d /data ]; then
     chown -R appuser:appuser /data 2>/dev/null || true
 fi
 
-exec su-exec appuser xvfb-run -a --server-args="-screen 0 1920x1080x24" \
+exec gosu appuser xvfb-run -a --server-args="-screen 0 1920x1080x24" \
     uvicorn main:app --host 0.0.0.0 --port "${PORT:-8000}"

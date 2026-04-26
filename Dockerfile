@@ -25,7 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation \
     fonts-dejavu-core \
     fonts-noto-color-emoji \
-    su-exec \
+    gosu \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user — reduces bot detection flags from running as uid 0

@@ -12,6 +12,8 @@ ENV MALLOC_ARENA_MAX=2
 ENV MALLOC_MMAP_THRESHOLD_=65536
 ENV MALLOC_TRIM_THRESHOLD_=131072
 ENV MALLOC_MMAP_MAX_=65536
+# Playwright browsers in a shared location (not /root/.cache)
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/pw-browsers
 
 WORKDIR /app
 
@@ -36,13 +38,15 @@ RUN pip install --no-cache-dir --upgrade pip
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Playwright Chromium (e.g. headless LinkedIn flows); install browsers after pip
-RUN playwright install --with-deps chromium
+# Playwright Chromium — install to shared path so appuser can access it
+RUN playwright install --with-deps chromium \
+    && chmod -R o+rX ${PLAYWRIGHT_BROWSERS_PATH}
 
 COPY . /app
 
-# Ensure app dir is owned by appuser; /data is fixed at runtime by entrypoint
-RUN mkdir -p /data/chrome_profile && chown -R appuser:appuser /app /data
+# Ensure app dir and browser cache are accessible by appuser
+RUN mkdir -p /data/chrome_profile /home/appuser/.cache \
+    && chown -R appuser:appuser /app /data /home/appuser
 
 COPY entrypoint.sh /app/entrypoint.sh
 RUN chmod +x /app/entrypoint.sh

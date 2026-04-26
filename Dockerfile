@@ -25,6 +25,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-liberation \
     fonts-dejavu-core \
     fonts-noto-color-emoji \
+    su-exec \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user — reduces bot detection flags from running as uid 0
@@ -40,8 +41,10 @@ RUN playwright install --with-deps chromium
 
 COPY . /app
 
-# Profile dir for persistent chrome data (Railway volume at /data)
+# Ensure app dir is owned by appuser; /data is fixed at runtime by entrypoint
 RUN mkdir -p /data/chrome_profile && chown -R appuser:appuser /app /data
-USER appuser
 
-CMD sh -c "xvfb-run -a --server-args='-screen 0 1920x1080x24' uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"
+COPY entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
+ENTRYPOINT ["/app/entrypoint.sh"]

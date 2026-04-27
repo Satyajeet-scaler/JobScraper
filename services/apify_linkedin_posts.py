@@ -1,9 +1,13 @@
 import json
+import logging
 import os
 import re
+import time
 from typing import Any
 
 from apify_client import ApifyClient
+
+logger = logging.getLogger(__name__)
 
 
 DEFAULT_LINKEDIN_POSTS_ACTOR_ID = "buIWk2uOUzTmcLsuB"
@@ -61,10 +65,64 @@ def scrape_linkedin_posts(run_input: dict[str, Any]) -> list[dict[str, Any]]:
     if not dataset_id:
         return []
 
+    fetch_timeout_s = max(30, int(float(os.getenv("APIFY_LINKEDIN_POSTS_DATASET_FETCH_TIMEOUT_S", "180"))))
+    page_size = max(1, int(float(os.getenv("APIFY_LINKEDIN_POSTS_DATASET_PAGE_SIZE", "200"))))
+    max_items = max(1, int(float(os.getenv("APIFY_LINKEDIN_POSTS_DATASET_MAX_ITEMS", "10000"))))
+
+    dataset_client = client.dataset(dataset_id)
+    started_at = time.monotonic()
+    dataset_info = dataset_client.get() or {}
+    expected_item_count = int(dataset_info.get("itemCount") or 0)
+    target_count = min(expected_item_count, max_items) if expected_item_count > 0 else max_items
+
+    logger.info(
+        "apify linkedin-posts dataset fetch start dataset_id=%s expected_item_count=%s page_size=%d timeout_s=%d max_items=%d",
+        dataset_id,
+        expected_item_count,
+        page_size,
+        fetch_timeout_s,
+        max_items,
+    )
+
     items: list[dict[str, Any]] = []
-    for item in client.dataset(dataset_id).iterate_items():
-        if isinstance(item, dict):
-            items.append(item)
+    offset = 0
+    while offset < target_count:
+        elapsed = time.monotonic() - started_at
+        if elapsed > fetch_timeout_s:
+            logger.warning(
+                "apify linkedin-posts dataset fetch timeout dataset_id=%s fetched=%d expected_item_count=%s elapsed_s=%.1f",
+                dataset_id,
+                len(items),
+                expected_item_count,
+                elapsed,
+            )
+            break
+
+        page = dataset_client.list_items(limit=min(page_size, target_count - offset), offset=offset)
+        page_items = page.get("items") if isinstance(page, dict) else getattr(page, "items", None)
+        if not page_items:
+            break
+
+        dict_batch = [item for item in page_items if isinstance(item, dict)]
+        items.extend(dict_batch)
+        offset += len(page_items)
+
+        logger.info(
+            "apify linkedin-posts dataset fetch progress dataset_id=%s fetched=%d expected_item_count=%s",
+            dataset_id,
+            len(items),
+            expected_item_count,
+        )
+
+        if len(page_items) < min(page_size, target_count - (offset - len(page_items))):
+            break
+
+    logger.info(
+        "apify linkedin-posts dataset fetch done dataset_id=%s fetched=%d expected_item_count=%s",
+        dataset_id,
+        len(items),
+        expected_item_count,
+    )
     return items
 
 

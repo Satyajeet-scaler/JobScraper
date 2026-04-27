@@ -29,24 +29,29 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     fonts-noto-color-emoji \
     gosu \
     x11-xserver-utils \
+    libgtk-3-0 \
+    libasound2 \
+    libx11-xcb1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user — reduces bot detection flags from running as uid 0
 RUN groupadd -r appuser && useradd -r -g appuser -m -d /home/appuser appuser
 
-# Copy chromedriver to a writable location so undetected-chromedriver can patch it
-RUN cp /usr/bin/chromedriver /usr/local/bin/chromedriver \
-    && chown appuser:appuser /usr/local/bin/chromedriver \
-    && chmod 755 /usr/local/bin/chromedriver
+# No longer patching chromedriver for undetected-chromedriver
 
 RUN pip install --no-cache-dir --upgrade pip
 
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Playwright Chromium — install to shared path so appuser can access it
+# Playwright Chromium & Camoufox Firefox
+# Install browser binaries as root, then ensure appuser owns the cache
 RUN playwright install --with-deps chromium \
-    && chmod -R o+rX ${PLAYWRIGHT_BROWSERS_PATH}
+    && python3 -m camoufox fetch \
+    && mkdir -p /home/appuser/.cache/camoufox \
+    && (cp -r /root/.cache/camoufox/* /home/appuser/.cache/camoufox/ 2>/dev/null || true) \
+    && chown -R appuser:appuser /home/appuser/.cache /opt/pw-browsers \
+    && chmod -R 755 /home/appuser/.cache /opt/pw-browsers
 
 COPY . /app
 

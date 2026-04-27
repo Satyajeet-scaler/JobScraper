@@ -24,7 +24,20 @@ from services.slack_handover_notify import (
     send_linkedin_post_handover_messages,
     slack_notify_defaults_from_env,
 )
-from services.mysql_linkedin_posts_store import upsert_linkedin_post, upsert_linkedin_post_relevance
+from services.mysql_linkedin_posts_store import (
+    CLASSIFY_STATUS_DONE,
+    CLASSIFY_STATUS_FAILED,
+    CLASSIFY_STATUS_PENDING,
+    CLASSIFY_STATUS_PROCESSING,
+    count_linkedin_posts_by_classify_status,
+    existing_linkedin_post_url_normalized_set,
+    fetch_pending_linkedin_posts_for_classify,
+    mark_linkedin_posts_classify_done,
+    mark_linkedin_posts_classify_failed,
+    mark_linkedin_posts_classify_processing,
+    upsert_linkedin_post,
+    upsert_linkedin_post_relevance,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,7 +98,29 @@ def run_role_linkedin_posts_scrape_only(
             run_seq_field="role_linkedin_posts_run_seq",
         )
         appended_count = _append_rows_to_tab(scraped_tab, new_rows_with_run)
-        _dual_write_scraped_to_mysql(new_rows_with_run)
+        run_d = date.fromisoformat(resolved_run_date)
+        try:
+            existing_mysql_urls = existing_linkedin_post_url_normalized_set(
+                requested_role=resolved_role,
+                run_date=run_d,
+            )
+        except Exception as exc:
+            logger.warning("role-linkedin-posts: could not load MySQL URL set for dedupe: %s", exc)
+            existing_mysql_urls = set()
+        mysql_new_rows = _filter_new_rows_against_normalized_url_set(enriched_rows, existing_mysql_urls)
+        mysql_new_rows_with_run = _attach_run_tracking(
+            rows=mysql_new_rows,
+            run_id=pipeline_run_id,
+            run_seq=scrape_run_seq,
+            run_id_field="role_linkedin_posts_run_id",
+            run_seq_field="role_linkedin_posts_run_seq",
+        )
+        _dual_write_scraped_to_mysql(mysql_new_rows_with_run)
+        if mysql_new_rows_with_run and not appended_count:
+            logger.info(
+                "role-linkedin-posts: mysql backfill only — %d row(s) upserted, 0 new sheet rows (dedupe was sheet-only before)",
+                len(mysql_new_rows_with_run),
+            )
         metrics = {
             "run_id": pipeline_run_id,
             "status": "completed",
@@ -97,6 +132,8 @@ def run_role_linkedin_posts_scrape_only(
             "existing_scraped_count": len(existing_scraped_rows),
             "new_scraped_count": appended_count,
             "total_scraped_count_after_append": len(existing_scraped_rows) + appended_count,
+            "existing_mysql_url_count": len(existing_mysql_urls),
+            "new_scraped_mysql_count": len(mysql_new_rows_with_run),
             "scraped_run_seq": scrape_run_seq,
             "scraped_tab": scraped_tab,
             "duration_seconds": round(perf_counter() - started_at, 2),
@@ -138,20 +175,63 @@ def run_role_linkedin_posts_classify_only(
         "role_slug": role_slug,
     }
     try:
+        classify_source = (os.getenv("ROLE_LINKEDIN_POSTS_CLASSIFY_SOURCE") or "db").strip().lower()
+        if classify_source not in {"db", "sheet"}:
+            classify_source = "db"
         scraped_tab = _role_linkedin_scraped_tab_name(role_slug=role_slug, run_date=resolved_run_date)
         relevant_tab = _role_linkedin_relevant_tab_name(role_slug=role_slug, run_date=resolved_run_date)
-        scraped_rows = _read_rows_from_tab(scraped_tab)
-        deduped_scraped = _dedupe_rows_by_post_url(scraped_rows)
         existing_relevant_rows = _read_rows_from_tab(relevant_tab, allow_missing=True)
         relevant_run_seq = _next_run_sequence(existing_relevant_rows, seq_field="role_linkedin_posts_classify_run_seq")
-        classify_input_rows = _filter_new_rows_by_post_url(deduped_scraped, existing_relevant_rows)
-        if classify_input_rows:
-            relevant_rows, classification_errors = _classify_relevant_posts_for_role_pipeline(
-                classify_input_rows,
-                role=resolved_role,
+        scraped_rows: list[dict[str, Any]] = []
+        deduped_scraped: list[dict[str, Any]] = []
+        classify_input_rows: list[dict[str, Any]] = []
+        db_status_counts_before: dict[str, int] = {}
+        db_status_counts_after: dict[str, int] = {}
+        db_claimed_count = 0
+
+        if classify_source == "db":
+            run_date_obj = date.fromisoformat(resolved_run_date)
+            db_status_counts_before = count_linkedin_posts_by_classify_status(
+                requested_role=resolved_role,
+                run_date=run_date_obj,
+            )
+            pending_rows = fetch_pending_linkedin_posts_for_classify(
+                requested_role=resolved_role,
+                run_date=run_date_obj,
+                limit=int(os.getenv("ROLE_LINKEDIN_POSTS_CLASSIFY_DB_LIMIT", "500")),
+            )
+            claimed_post_ids = [int(row.get("id") or 0) for row in pending_rows if int(row.get("id") or 0) > 0]
+            db_claimed_count = mark_linkedin_posts_classify_processing(post_ids=claimed_post_ids)
+            claimed_id_set = set(claimed_post_ids)
+            classify_input_rows = [
+                row
+                for row in pending_rows
+                if int(row.get("id") or 0) > 0 and int(row.get("id") or 0) in claimed_id_set
+            ]
+            if classify_input_rows:
+                relevant_rows, classification_errors = _classify_relevant_posts_for_role_pipeline(
+                    classify_input_rows,
+                    role=resolved_role,
+                )
+                classify_post_ids = [int(r.get("id") or 0) for r in classify_input_rows if int(r.get("id") or 0) > 0]
+                mark_linkedin_posts_classify_done(post_ids=classify_post_ids)
+            else:
+                relevant_rows, classification_errors = [], 0
+            db_status_counts_after = count_linkedin_posts_by_classify_status(
+                requested_role=resolved_role,
+                run_date=run_date_obj,
             )
         else:
-            relevant_rows, classification_errors = [], 0
+            scraped_rows = _read_rows_from_tab(scraped_tab)
+            deduped_scraped = _dedupe_rows_by_post_url(scraped_rows)
+            classify_input_rows = _filter_new_rows_by_post_url(deduped_scraped, existing_relevant_rows)
+            if classify_input_rows:
+                relevant_rows, classification_errors = _classify_relevant_posts_for_role_pipeline(
+                    classify_input_rows,
+                    role=resolved_role,
+                )
+            else:
+                relevant_rows, classification_errors = [], 0
         relevant_rows = _enrich_role_context(relevant_rows, resolved_role, role_slug)
         relevant_rows = _dedupe_linkedin_relevant_rows(relevant_rows)
         relevant_new_rows = _filter_new_rows_by_post_url(relevant_rows, existing_relevant_rows)
@@ -167,12 +247,18 @@ def run_role_linkedin_posts_classify_only(
         metrics = {
             "run_id": pipeline_run_id,
             "status": "completed",
+            "classify_source": classify_source,
             "run_date": resolved_run_date,
             "role": resolved_role,
             "role_slug": role_slug,
             "scraped_input_count": len(scraped_rows),
             "deduped_input_count": len(deduped_scraped),
             "classify_input_count": len(classify_input_rows),
+            "db_claimed_count": db_claimed_count,
+            "db_pending_count": db_status_counts_after.get(CLASSIFY_STATUS_PENDING, 0),
+            "db_processing_count": db_status_counts_after.get(CLASSIFY_STATUS_PROCESSING, 0),
+            "db_done_count": db_status_counts_after.get(CLASSIFY_STATUS_DONE, 0),
+            "db_failed_count": db_status_counts_after.get(CLASSIFY_STATUS_FAILED, 0),
             "existing_relevant_count": len(existing_relevant_rows),
             "relevant_count": len(relevant_rows),
             "new_relevant_count": appended_relevant_count,
@@ -183,6 +269,9 @@ def run_role_linkedin_posts_classify_only(
             "relevant_tab": relevant_tab,
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
+        if classify_source == "db":
+            metrics["db_counts_before"] = db_status_counts_before
+            metrics["db_counts_after"] = db_status_counts_after
         notify_enabled = (
             post_classify_notify_enabled
             if post_classify_notify_enabled is not None
@@ -199,6 +288,15 @@ def run_role_linkedin_posts_classify_only(
         ROLE_LINKEDIN_POSTS_CLASSIFY_RUN_METRICS[pipeline_run_id] = metrics
         return metrics
     except Exception as exc:
+        if "classify_input_rows" in locals() and classify_input_rows:
+            try:
+                failed_post_ids = [int(r.get("id") or 0) for r in classify_input_rows if int(r.get("id") or 0) > 0]
+                mark_linkedin_posts_classify_failed(post_ids=failed_post_ids, error=str(exc))
+            except Exception:
+                logger.exception(
+                    "role-linkedin-posts-classify-only[%s] failed to mark DB posts as failed",
+                    pipeline_run_id,
+                )
         metrics = {
             "run_id": pipeline_run_id,
             "status": "failed",
@@ -699,6 +797,14 @@ def _filter_new_rows_by_post_url(
         post_url = _normalized_post_url(row.get("post_url"))
         if post_url:
             seen.add(post_url)
+    return _filter_new_rows_against_normalized_url_set(rows, seen)
+
+
+def _filter_new_rows_against_normalized_url_set(
+    rows: list[dict[str, Any]],
+    existing_normalized_urls: set[str],
+) -> list[dict[str, Any]]:
+    seen: set[str] = set(existing_normalized_urls)
     out: list[dict[str, Any]] = []
     for row in rows:
         post_url = _normalized_post_url(row.get("post_url"))

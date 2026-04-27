@@ -9,6 +9,11 @@ from services.mysql_recruiter_store import _db
 
 logger = logging.getLogger(__name__)
 
+CLASSIFY_STATUS_PENDING = "pending"
+CLASSIFY_STATUS_PROCESSING = "processing"
+CLASSIFY_STATUS_DONE = "done"
+CLASSIFY_STATUS_FAILED = "failed"
+
 
 def _safe_int(value: Any) -> int | None:
     try:
@@ -46,6 +51,12 @@ def _to_date(value: Any) -> date:
         return date.today()
 
 
+def _coerce_date(value: date | str) -> date:
+    if isinstance(value, date):
+        return value
+    return _to_date(value)
+
+
 def _json_dump(value: Any) -> str | None:
     if value is None:
         return None
@@ -65,6 +76,197 @@ def _normalized_post_url(raw_url: Any) -> str:
     if not netloc and not path:
         return text.rstrip("/")
     return f"{netloc}{path}"
+
+
+def existing_linkedin_post_url_normalized_set(*, requested_role: str, run_date: date) -> set[str]:
+    """Return normalized post_url values already stored for this role and run_date (scrape dedupe)."""
+    role = (requested_role or "").strip()
+    if not role:
+        return set()
+    sql = """
+    SELECT post_url_normalized
+    FROM linkedin_posts
+    WHERE requested_role = %s AND run_date = %s
+    """
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (role, run_date))
+            rows = cur.fetchall() or []
+    out: set[str] = set()
+    for r in rows:
+        u = str((r or {}).get("post_url_normalized") or "").strip()
+        if u:
+            out.add(u)
+    return out
+
+
+def fetch_pending_linkedin_posts_for_classify(
+    *,
+    requested_role: str,
+    run_date: date | str,
+    limit: int = 500,
+) -> list[dict[str, Any]]:
+    role = (requested_role or "").strip()
+    if not role:
+        return []
+    run_date_obj = _coerce_date(run_date)
+    limit = max(1, int(limit))
+    sql = """
+    SELECT
+        id,
+        post_url, post_url_normalized, post_id, search_query, content_type, post_text, posted_at,
+        author_name, author_profile_url, author_info, author_type, company, job_title_hint,
+        likes_count, comments_count, reposts_count, requested_role, role_slug, run_date, run_id, run_seq,
+        raw_payload_json, classify_status
+    FROM linkedin_posts
+    WHERE requested_role = %s
+      AND run_date = %s
+      AND classify_status IN (%s, %s)
+    ORDER BY id ASC
+    LIMIT %s
+    """
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                sql,
+                (
+                    role,
+                    run_date_obj,
+                    CLASSIFY_STATUS_PENDING,
+                    CLASSIFY_STATUS_FAILED,
+                    limit,
+                ),
+            )
+            rows = cur.fetchall() or []
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        raw_json = item.get("raw_payload_json")
+        if raw_json:
+            try:
+                item["raw_payload"] = json.loads(str(raw_json))
+            except Exception:
+                item["raw_payload"] = {}
+        out.append(item)
+    return out
+
+
+def mark_linkedin_posts_classify_processing(*, post_ids: list[int]) -> int:
+    if not post_ids:
+        return 0
+    cleaned = [int(pid) for pid in post_ids if int(pid) > 0]
+    if not cleaned:
+        return 0
+    placeholders = ",".join(["%s"] * len(cleaned))
+    sql = f"""
+    UPDATE linkedin_posts
+    SET classify_status = %s,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id IN ({placeholders})
+      AND classify_status IN (%s, %s)
+    """
+    params: list[Any] = [
+        CLASSIFY_STATUS_PROCESSING,
+        *cleaned,
+        CLASSIFY_STATUS_PENDING,
+        CLASSIFY_STATUS_FAILED,
+    ]
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return int(cur.rowcount or 0)
+
+
+def mark_linkedin_post_classify_done(*, post_id: int) -> None:
+    sql = """
+    UPDATE linkedin_posts
+    SET classify_status = %s,
+        classified_at = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = %s
+    """
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (CLASSIFY_STATUS_DONE, int(post_id)))
+
+
+def mark_linkedin_posts_classify_done(*, post_ids: list[int]) -> int:
+    if not post_ids:
+        return 0
+    cleaned = [int(pid) for pid in post_ids if int(pid) > 0]
+    if not cleaned:
+        return 0
+    placeholders = ",".join(["%s"] * len(cleaned))
+    sql = f"""
+    UPDATE linkedin_posts
+    SET classify_status = %s,
+        classified_at = CURRENT_TIMESTAMP,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id IN ({placeholders})
+    """
+    params: list[Any] = [CLASSIFY_STATUS_DONE, *cleaned]
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return int(cur.rowcount or 0)
+
+
+def mark_linkedin_post_classify_failed(*, post_id: int, error: str) -> None:
+    _ = error
+    sql = """
+    UPDATE linkedin_posts
+    SET classify_status = %s,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = %s
+    """
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (CLASSIFY_STATUS_FAILED, int(post_id)))
+
+
+def mark_linkedin_posts_classify_failed(*, post_ids: list[int], error: str) -> int:
+    _ = error
+    if not post_ids:
+        return 0
+    cleaned = [int(pid) for pid in post_ids if int(pid) > 0]
+    if not cleaned:
+        return 0
+    placeholders = ",".join(["%s"] * len(cleaned))
+    sql = f"""
+    UPDATE linkedin_posts
+    SET classify_status = %s,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id IN ({placeholders})
+    """
+    params: list[Any] = [CLASSIFY_STATUS_FAILED, *cleaned]
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return int(cur.rowcount or 0)
+
+
+def count_linkedin_posts_by_classify_status(*, requested_role: str, run_date: date | str) -> dict[str, int]:
+    role = (requested_role or "").strip()
+    if not role:
+        return {}
+    run_date_obj = _coerce_date(run_date)
+    sql = """
+    SELECT classify_status, COUNT(*) AS c
+    FROM linkedin_posts
+    WHERE requested_role = %s AND run_date = %s
+    GROUP BY classify_status
+    """
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (role, run_date_obj))
+            rows = cur.fetchall() or []
+    out: dict[str, int] = {}
+    for row in rows:
+        key = str((row or {}).get("classify_status") or "").strip()
+        if not key:
+            continue
+        out[key] = int((row or {}).get("c") or 0)
+    return out
 
 
 def upsert_linkedin_post(row: dict[str, Any]) -> int:

@@ -827,10 +827,13 @@ def _dual_write_scraped_to_mysql(rows: list[dict[str, Any]]) -> None:
     if not enabled or not rows:
         return
     try:
+        count = 0
         for row in rows:
             upsert_linkedin_post(row)
+            count += 1
+        logger.info("role-linkedin-posts mysql dual-write (scraped) success count=%d/%d", count, len(rows))
     except Exception as exc:
-        logger.warning("role-linkedin-posts mysql dual-write (scraped) failed err=%s", exc)
+        logger.error("role-linkedin-posts mysql dual-write (scraped) failed err=%s", exc, exc_info=True)
 
 
 def _dual_write_relevance_to_mysql(rows: list[dict[str, Any]]) -> None:
@@ -838,7 +841,10 @@ def _dual_write_relevance_to_mysql(rows: list[dict[str, Any]]) -> None:
     if not enabled or not rows:
         return
     try:
+        count = 0
         for row in rows:
             upsert_linkedin_post_relevance(row)
+            count += 1
+        logger.info("role-linkedin-posts mysql dual-write (relevance) success count=%d/%d", count, len(rows))
     except Exception as exc:
-        logger.warning("role-linkedin-posts mysql dual-write (relevance) failed err=%s", exc)
+        logger.error("role-linkedin-posts mysql dual-write (relevance) failed err=%s", exc, exc_info=True)

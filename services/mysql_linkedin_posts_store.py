@@ -145,7 +145,12 @@ def upsert_linkedin_post(row: dict[str, Any]) -> int:
                 (post_url_normalized, requested_role, run_date),
             )
             row_id = cur.fetchone() or {}
-    return int(row_id.get("id") or 0)
+            res_id = int(row_id.get("id") or 0)
+    if res_id:
+        logger.info("Successfully upserted linkedin_post id=%d url_normalized=%s", res_id, post_url_normalized)
+    else:
+        logger.warning("upsert_linkedin_post: failed to retrieve id for %s", post_url_normalized)
+    return res_id
 
 
 def upsert_linkedin_post_relevance(row: dict[str, Any]) -> None:
@@ -201,6 +206,7 @@ def upsert_linkedin_post_relevance(row: dict[str, Any]) -> None:
     with _db() as conn:
         with conn.cursor() as cur:
             cur.execute(sql, payload)
+    logger.info("Successfully upserted linkedin_post_relevance for post_id=%d", post_id)
 
 
 def fetch_relevant_linkedin_posts_for_role(*, role: str, run_date: str) -> list[dict[str, Any]]:

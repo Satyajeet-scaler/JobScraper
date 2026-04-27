@@ -21,7 +21,12 @@ from services.linkedin_posts_pipeline import (
 )
 from services.role_pipeline import _role_slug
 from services.slack_handover_notify import (
-    send_linkedin_post_handover_messages,
+    HandoverSlackCase,
+    format_linkedin_post_lead,
+    heading_for_case,
+    load_owner_rows_for_handover,
+    owner_tag_for_handover,
+    send_slack_text,
     slack_notify_defaults_from_env,
 )
 from services.mysql_linkedin_posts_store import (
@@ -31,7 +36,9 @@ from services.mysql_linkedin_posts_store import (
     CLASSIFY_STATUS_PROCESSING,
     count_linkedin_posts_by_classify_status,
     existing_linkedin_post_url_normalized_set,
+    fetch_unsent_relevant_linkedin_posts_for_role,
     fetch_pending_linkedin_posts_for_classify,
+    mark_linkedin_post_handover_sent,
     mark_linkedin_posts_classify_done,
     mark_linkedin_posts_classify_failed,
     mark_linkedin_posts_classify_processing,
@@ -332,20 +339,15 @@ def send_role_linkedin_posts_notifications(
         "role_slug": role_slug,
     }
     try:
-        relevant_tab = _role_linkedin_relevant_tab_name(role_slug=role_slug, run_date=resolved_run_date)
-        relevant_rows = _read_rows_from_tab(relevant_tab, allow_missing=True)
-        filtered_rows = _filter_relevant_rows_for_notify(
-            relevant_rows,
+        defaults = slack_notify_defaults_from_env()
+        relevant_rows = fetch_unsent_relevant_linkedin_posts_for_role(
+            role=resolved_role,
             run_date=resolved_run_date,
             upstream_run_id=upstream_run_id,
         )
-        unsent_rows = _filter_rows_without_assigned_owner(filtered_rows)
-        defaults = slack_notify_defaults_from_env()
-        messages_sent = send_linkedin_post_handover_messages(
-            unsent_rows,
-            run_date=resolved_run_date,
+        messages_sent, notified_rows = _send_linkedin_post_handover_messages_from_db(
+            relevant_rows,
             defaults=defaults,
-            persist_assigned_owner_tab=relevant_tab,
         )
         summary = {
             "run_id": notify_run_id,
@@ -354,9 +356,9 @@ def send_role_linkedin_posts_notifications(
             "role": resolved_role,
             "role_slug": role_slug,
             "upstream_run_id": upstream_run_id or "",
-            "relevant_tab": relevant_tab,
+            "notify_source": "mysql",
             "input_relevant_count": len(relevant_rows),
-            "notified_relevant_count": len(unsent_rows),
+            "notified_relevant_count": notified_rows,
             "messages_sent": messages_sent,
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
@@ -376,6 +378,63 @@ def send_role_linkedin_posts_notifications(
         ROLE_LINKEDIN_POSTS_NOTIFY_RUN_METRICS[notify_run_id] = summary
         logger.exception("role-linkedin-posts-notify[%s] failed: %s", notify_run_id, exc)
         raise
+
+
+def _send_linkedin_post_handover_messages_from_db(
+    relevant_rows: list[dict[str, Any]],
+    *,
+    defaults: Any,
+) -> tuple[int, int]:
+    """Send LinkedIn handover from DB rows and mark DB handover_sent on success."""
+    if not defaults.webhook_url:
+        logger.info("linkedin-posts slack skipped: SLACK_WEBHOOK_URL not configured")
+        return 0, 0
+    if not relevant_rows:
+        logger.info("linkedin-posts slack: no relevant posts to send")
+        return 0, 0
+
+    sent = 0
+    notified_rows = 0
+    if not send_slack_text(heading_for_case(HandoverSlackCase.LINKEDIN_POST), defaults=defaults, sleep_after=1.0):
+        return 0, 0
+    sent += 1
+
+    owner_rows = load_owner_rows_for_handover()
+    if owner_rows:
+        owner_buckets: dict[int, list[dict[str, Any]]] = {i: [] for i in range(len(owner_rows))}
+        for idx, row in enumerate(relevant_rows):
+            owner_buckets[idx % len(owner_rows)].append(row)
+        for owner_idx, owner in enumerate(owner_rows):
+            bucket = owner_buckets.get(owner_idx, [])
+            if not bucket:
+                continue
+            owner_tag = owner_tag_for_handover(owner)
+            owner_name = (owner.get("owner_name") or "").strip()
+            for row in bucket:
+                post_id = int(row.get("linkedin_post_id") or row.get("id") or 0)
+                if post_id <= 0:
+                    continue
+                author = str(row.get("author_name") or "").strip() or "-"
+                url = str(row.get("post_url") or "").strip() or "-"
+                msg = format_linkedin_post_lead(owner_tag, url, author)
+                if send_slack_text(msg, defaults=defaults, sleep_after=1.0):
+                    sent += 1
+                    notified_rows += 1
+                    mark_linkedin_post_handover_sent(post_id, owner_name)
+    else:
+        for row in relevant_rows:
+            post_id = int(row.get("linkedin_post_id") or row.get("id") or 0)
+            if post_id <= 0:
+                continue
+            author = str(row.get("author_name") or "").strip() or "-"
+            url = str(row.get("post_url") or "").strip() or "-"
+            msg = format_linkedin_post_lead("*Unassigned*", url, author)
+            if send_slack_text(msg, defaults=defaults, sleep_after=1.0):
+                sent += 1
+                notified_rows += 1
+                mark_linkedin_post_handover_sent(post_id, "")
+    logger.info("linkedin-posts handover (db) sent %s slack messages", sent)
+    return sent, notified_rows
 
 
 def get_role_linkedin_posts_scrape_run_metrics(run_id: str) -> dict[str, Any] | None:
@@ -743,35 +802,6 @@ def _enrich_role_context(rows: list[dict[str, Any]], role: str, role_slug: str) 
         copy["role_slug"] = role_slug
         output.append(copy)
     return output
-
-
-def _filter_relevant_rows_for_notify(
-    rows: list[dict[str, Any]],
-    *,
-    run_date: str,
-    upstream_run_id: str | None,
-) -> list[dict[str, Any]]:
-    output: list[dict[str, Any]] = []
-    for row in rows:
-        row_date = str(row.get("run_date") or "").strip()
-        if row_date and row_date != run_date:
-            continue
-        if upstream_run_id:
-            row_upstream = str(row.get("role_linkedin_posts_classify_run_id") or "").strip()
-            if row_upstream != upstream_run_id:
-                continue
-        output.append(dict(row))
-    return output
-
-
-def _filter_rows_without_assigned_owner(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for row in rows:
-        assigned_owner = str(row.get("assigned owner") or row.get("assigned_owner") or "").strip()
-        if assigned_owner:
-            continue
-        out.append(dict(row))
-    return out
 
 
 def _dedupe_rows_by_post_url(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:

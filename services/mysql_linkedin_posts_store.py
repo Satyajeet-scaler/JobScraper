@@ -444,6 +444,51 @@ def fetch_relevant_linkedin_posts_for_role(*, role: str, run_date: str) -> list[
     return out
 
 
+def fetch_unsent_relevant_linkedin_posts_for_role(
+    *,
+    role: str,
+    run_date: str,
+    upstream_run_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Fetch relevant + unsent rows for role/date (optional classify run scope)."""
+    sql = """
+    SELECT
+        lp.id AS linkedin_post_id,
+        lp.*,
+        lpr.is_relevant, lpr.tier, lpr.role_category, lpr.reason,
+        lpr.author_company AS ai_author_company, lpr.hiring_company AS ai_hiring_company,
+        lpr.confidence AS ai_confidence, lpr.priority AS ai_priority,
+        lpr.assigned_owner, lpr.handover_sent,
+        lpr.classify_run_id, lpr.classify_run_seq
+    FROM linkedin_posts lp
+    JOIN linkedin_post_relevance lpr ON lp.id = lpr.linkedin_post_id
+    WHERE lp.requested_role = %s
+      AND lp.run_date = %s
+      AND lpr.is_relevant = TRUE
+      AND lpr.handover_sent = FALSE
+    """
+    params: list[Any] = [role, run_date]
+    if upstream_run_id:
+        sql += " AND lpr.classify_run_id = %s"
+        params.append(upstream_run_id)
+    sql += " ORDER BY lp.id ASC"
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall() or []
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        item = dict(r)
+        raw_json = item.get("raw_payload_json")
+        if raw_json:
+            try:
+                item["raw_payload"] = json.loads(str(raw_json))
+            except Exception:
+                item["raw_payload"] = {}
+        out.append(item)
+    return out
+
+
 def mark_linkedin_post_handover_sent(post_id: int, owner: str) -> bool:
     """Update handover status in DB."""
     sql = """

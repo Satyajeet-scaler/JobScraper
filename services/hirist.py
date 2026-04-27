@@ -8,6 +8,7 @@ import json
 import os
 import random
 import re
+import shutil
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -191,6 +192,55 @@ class HiristTechService:
         return None
 
     @staticmethod
+    def _resolve_writable_chromedriver_path() -> str | None:
+        """
+        Return a chromedriver path that undetected-chromedriver can patch.
+
+        Resolution order:
+        1) HIRIST_CHROMEDRIVER_PATH env override (if executable).
+        2) System chromedriver discovery (common paths + PATH lookup).
+        3) If discovered driver is not writable, copy to /tmp and return copy.
+        """
+        env_override = os.getenv("HIRIST_CHROMEDRIVER_PATH", "").strip()
+        if env_override:
+            candidate = Path(env_override)
+            if candidate.exists() and os.access(candidate, os.X_OK):
+                source_path = str(candidate)
+            else:
+                source_path = ""
+        else:
+            discovered = [
+                "/usr/bin/chromedriver",
+                "/usr/local/bin/chromedriver",
+                shutil.which("chromedriver") or "",
+            ]
+            source_path = next((path for path in discovered if path and os.path.exists(path)), "")
+
+        if not source_path:
+            return None
+
+        # If the binary is writable, let uc patch it directly.
+        if os.access(source_path, os.W_OK):
+            return source_path
+
+        target_dir = Path("/tmp/uc_chromedriver")
+        try:
+            target_dir.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            return None
+
+        target_name = f"chromedriver_{Path(source_path).stat().st_mtime_ns}"
+        target_path = target_dir / target_name
+
+        try:
+            if not target_path.exists():
+                shutil.copy2(source_path, target_path)
+            os.chmod(target_path, 0o755)
+            return str(target_path)
+        except Exception:
+            return None
+
+    @staticmethod
     def _build_driver(headless: bool) -> uc.Chrome:
         options = uc.ChromeOptions()
         options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
@@ -209,7 +259,9 @@ class HiristTechService:
 
         if HiristTechService._is_railway():
             chrome_kwargs["browser_executable_path"] = "/usr/bin/chromium"
-            chrome_kwargs["driver_executable_path"] = "/usr/bin/chromedriver"
+            writable_driver_path = HiristTechService._resolve_writable_chromedriver_path()
+            if writable_driver_path:
+                chrome_kwargs["driver_executable_path"] = writable_driver_path
 
         return uc.Chrome(**chrome_kwargs)
 

@@ -42,7 +42,7 @@ CLOUDFLARE_WAIT_SECONDS = int(os.getenv("HIRECAFE_CLOUDFLARE_WAIT_SECONDS", "10"
 CLOUDFLARE_CLEAR_TIMEOUT_SECONDS = int(os.getenv("HIRECAFE_CF_CLEAR_TIMEOUT_SECONDS", "35"))
 POST_VERIFY_WAIT_SECONDS = int(os.getenv("HIRECAFE_POST_VERIFY_WAIT_SECONDS", "8"))
 
-HARDCODED_CF_CLICK_X = int(os.getenv("HIRECAFE_CF_CLICK_X", "544"))
+HARDCODED_CF_CLICK_X = int(os.getenv("HIRECAFE_CF_CLICK_X", "340"))
 HARDCODED_CF_CLICK_Y = int(os.getenv("HIRECAFE_CF_CLICK_Y", "334"))
 
 SCROLL_PIXELS = int(os.getenv("HIRECAFE_SCROLL_PIXELS", "1200"))
@@ -54,7 +54,7 @@ MAX_IDLE_SECONDS = int(os.getenv("HIRECAFE_MAX_IDLE_SECONDS", "90"))
 MAX_SCROLLS = int(os.getenv("HIRECAFE_MAX_SCROLLS", "500"))
 HEARTBEAT_EVERY_SECONDS = int(os.getenv("HIRECAFE_HEARTBEAT_EVERY_SECONDS", "15"))
 
-CAROUSEL_CLICK_DELAY = float(os.getenv("HIRECAFE_CAROUSEL_CLICK_DELAY", "1.5"))
+CAROUSEL_CLICK_DELAY = float(os.getenv("HIRECAFE_CAROUSEL_CLICK_DELAY", "0.5"))
 PHASE2_MAX_CAROUSEL_CLICKS = max(1, int(os.getenv("HIRECAFE_PHASE2_MAX_CAROUSEL_CLICKS", "40")))
 BOTTOM_IDLE_SCROLLS = int(os.getenv("HIRECAFE_BOTTOM_IDLE_SCROLLS", "5"))
 CAROUSEL_ENABLED = os.getenv("HIRECAFE_CAROUSEL_ENABLED", "true").lower() not in ("false", "0", "no")
@@ -209,13 +209,140 @@ def _wait_for_cloudflare_clearance(
 ) -> tuple[bool, dict[str, Any]]:
     deadline = time.time() + max(0, timeout_seconds)
     last_state = _probe_cloudflare_challenge(page)
+    
+    # Track when we last attempted a manual nudge
+    last_nudge_time = 0.0
+    
     while time.time() < deadline:
         last_state = _probe_cloudflare_challenge(page)
         if not last_state.get("active"):
             return True, last_state
+            
+        # If it's been more than 8 seconds since landing or last nudge, try a manual click nudge
+        if time.time() - last_nudge_time > 8.0:
+            _attempt_turnstile_manual_nudge(page)
+            last_nudge_time = time.time()
+
         time.sleep(max(0.1, poll_interval_seconds))
+    
     last_state = _probe_cloudflare_challenge(page)
     return (not last_state.get("active")), last_state
+
+
+def _attempt_turnstile_manual_nudge(page: Page) -> bool:
+    """Detect and click the Turnstile checkbox using cross-frame JavaScript."""
+    try:
+        # Check every frame for the checkbox
+        all_frames = page.frames
+        logger.info("hirecafe turnstile nudge: checking %s frames", len(all_frames))
+        
+        for frame in all_frames:
+            try:
+                # This script returns the bounding box of the checkbox if found inside the frame
+                box = frame.evaluate("""
+                    () => {
+                        const selectors = [
+                            '.ctp-checkbox-label',
+                            '.ctp-checkbox-container',
+                            '#checkbox',
+                            '[type="checkbox"]',
+                            '#challenge-stage div'
+                        ];
+                        for (const selector of selectors) {
+                            const el = document.querySelector(selector);
+                            if (el && el.offsetWidth > 0 && el.offsetHeight > 0) {
+                                const rect = el.getBoundingClientRect();
+                                return {
+                                    x: rect.left,
+                                    y: rect.top,
+                                    width: rect.width,
+                                    height: rect.height,
+                                    found: true,
+                                    selector: selector
+                                };
+                            }
+                        }
+                        return null;
+                    }
+                """)
+                
+                if box and box.get("found"):
+                    iframe_handle = frame.frame_element()
+                    if not iframe_handle:
+                        # Could be the main frame which doesn't have an iframe_handle
+                        cx = box["x"] + box["width"] / 2 + random.uniform(-3, 3)
+                        cy = box["y"] + box["height"] / 2 + random.uniform(-3, 3)
+                    else:
+                        iframe_box = iframe_handle.bounding_box()
+                        if not iframe_box:
+                            continue
+                        cx = iframe_box["x"] + box["x"] + box["width"] / 2 + random.uniform(-3, 3)
+                        cy = iframe_box["y"] + box["y"] + box["height"] / 2 + random.uniform(-3, 3)
+                    
+                    logger.info("hirecafe turnstile nudge: found %s in frame %s", box["selector"], frame.url)
+                    page.mouse.click(cx, cy)
+                    logger.info("hirecafe turnstile nudge: clicked coordinates (%s, %s)", int(cx), int(cy))
+                    
+                    time.sleep(1.0)
+                    _capture_observation_artifacts(page, "post_turnstile_nudge")
+                    return True
+            except Exception:
+                continue
+                
+        # Fallback: Hardcoded Click
+        viewport = page.viewport_size
+        logger.info("hirecafe turnstile nudge: JS finding failed. Viewport: %s. Trying hardcoded fallback: (%s, %s)", 
+                    viewport, HARDCODED_CF_CLICK_X, HARDCODED_CF_CLICK_Y)
+        
+        # Click with a tiny bit of jitter even for hardcoded
+        cx = HARDCODED_CF_CLICK_X + random.uniform(-2, 2)
+        cy = HARDCODED_CF_CLICK_Y + random.uniform(-2, 2)
+        
+        page.mouse.click(cx, cy)
+        logger.info("hirecafe turnstile nudge: clicked hardcoded coordinates (%s, %s)", int(cx), int(cy))
+        
+        # Inject a visual marker so we can see the click location in the screenshot
+        marker_js = f"""
+            (() => {{
+                const dot = document.createElement('div');
+                dot.id = 'debug-click-marker';
+                dot.style.position = 'fixed';
+                dot.style.left = '{cx - 5}px';
+                dot.style.top = '{cy - 5}px';
+                dot.style.width = '10px';
+                dot.style.height = '10px';
+                dot.style.backgroundColor = 'red';
+                dot.style.borderRadius = '50%';
+                dot.style.zIndex = '999999';
+                dot.style.pointerEvents = 'none';
+                dot.style.border = '2px solid white';
+                document.body.appendChild(dot);
+            }})()
+        """
+        try:
+            page.evaluate(marker_js)
+        except:
+            pass
+
+        # Immediate verification
+        time.sleep(1.0)
+        _capture_observation_artifacts(page, "post_turnstile_nudge_hardcoded_1s")
+        
+        # Delayed verification (to see if it clears)
+        time.sleep(2.0)
+        _capture_observation_artifacts(page, "post_turnstile_nudge_hardcoded_3s")
+        
+        # Cleanup marker (optional, but good practice)
+        try:
+            page.evaluate("() => { const d = document.getElementById('debug-click-marker'); if(d) d.remove(); }")
+        except:
+            pass
+            
+        return True
+
+    except Exception as exc:
+        logger.info("hirecafe turnstile nudge error: %s", exc)
+    return False
 
 
 def _get_camoufox_config() -> dict[str, Any]:
@@ -897,16 +1024,7 @@ def _navigate_to_hirecafe_ready_page(page: Page, target_url: str) -> None:
 
     if initial_challenge.get("active"):
         logger.info("hirecafe detected active Cloudflare challenge. Camoufox should handle it, but we can nudge.")
-        # Optional: manual Turnstile checkbox click if visible
-        try:
-            iframe = page.query_selector("iframe[src*='cloudflare']")
-            if iframe:
-                box = iframe.content_frame().query_selector("input[type='checkbox'], .ctp-checkbox-container")
-                if box:
-                    box.click()
-                    logger.info("Cloudflare checkbox clicked")
-        except Exception:
-            pass
+        _attempt_turnstile_manual_nudge(page)
 
         cleared, clear_state = _wait_for_cloudflare_clearance(page, CLOUDFLARE_CLEAR_TIMEOUT_SECONDS)
         if cleared:

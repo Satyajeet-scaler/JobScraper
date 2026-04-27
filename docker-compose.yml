@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  scraper:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hiring-cafe-scraper
+    container_name: hirecafe-test
+    env_file:
+      - .env
+    ports:
+      - "${PORT:-8000}:${PORT:-8000}"
+    volumes:
+      - ./debug_screenshots:/app/debug_screenshots
+      - ./data:/data
+    restart: on-failure

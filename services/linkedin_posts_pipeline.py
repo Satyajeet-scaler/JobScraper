@@ -18,6 +18,7 @@ from services.description_text_parts import (
     read_positive_int_env,
 )
 from services.google_sheets import GoogleSheetsWriter
+from services.mysql_linkedin_posts_store import upsert_linkedin_post, upsert_linkedin_post_relevance
 from services.slack_handover_notify import send_linkedin_post_handover_messages, slack_notify_defaults_from_env
 
 try:
@@ -841,3 +842,26 @@ def _chunk_slack_entries(prefix: str, entries: list[str]) -> list[str]:
     if current.strip():
         chunks.append(current)
     return chunks
+
+
+def _dual_write_scraped_to_mysql(rows: list[dict[str, Any]]) -> None:
+    enabled = (os.getenv("LINKEDIN_POSTS_MYSQL_DUAL_WRITE_ENABLED") or "true").strip().lower() in ("1", "true", "yes")
+    if not enabled or not rows:
+        return
+    try:
+        for row in rows:
+            upsert_linkedin_post(row)
+    except Exception as exc:
+        logger.warning("linkedin-posts mysql dual-write (scraped) failed err=%s", exc)
+
+
+def _dual_write_relevance_to_mysql(rows: list[dict[str, Any]]) -> None:
+    enabled = (os.getenv("LINKEDIN_POSTS_MYSQL_DUAL_WRITE_ENABLED") or "true").strip().lower() in ("1", "true", "yes")
+    if not enabled or not rows:
+        return
+    try:
+        # Legacy pipeline rows might not have all fields, but upsert handles missing
+        for row in rows:
+            upsert_linkedin_post_relevance(row)
+    except Exception as exc:
+        logger.warning("linkedin-posts mysql dual-write (relevance) failed err=%s", exc)

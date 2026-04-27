@@ -24,6 +24,7 @@ from services.slack_handover_notify import (
     send_linkedin_post_handover_messages,
     slack_notify_defaults_from_env,
 )
+from services.mysql_linkedin_posts_store import upsert_linkedin_post, upsert_linkedin_post_relevance
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,7 @@ def run_role_linkedin_posts_scrape_only(
             run_seq_field="role_linkedin_posts_run_seq",
         )
         appended_count = _append_rows_to_tab(scraped_tab, new_rows_with_run)
+        _dual_write_scraped_to_mysql(new_rows_with_run)
         metrics = {
             "run_id": pipeline_run_id,
             "status": "completed",
@@ -161,6 +163,7 @@ def run_role_linkedin_posts_classify_only(
             run_seq_field="role_linkedin_posts_classify_run_seq",
         )
         appended_relevant_count = _append_rows_to_tab(relevant_tab, relevant_rows_with_run)
+        _dual_write_relevance_to_mysql(relevant_rows_with_run)
         metrics = {
             "run_id": pipeline_run_id,
             "status": "completed",
@@ -817,3 +820,25 @@ def _get_writer() -> GoogleSheetsWriter:
     if not spreadsheet_id:
         raise RuntimeError("Set ROLE_LINKEDIN_POSTS_GOOGLE_SPREADSHEET_ID or GOOGLE_SPREADSHEET_ID.")
     return GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
+
+
+def _dual_write_scraped_to_mysql(rows: list[dict[str, Any]]) -> None:
+    enabled = (os.getenv("LINKEDIN_POSTS_MYSQL_DUAL_WRITE_ENABLED") or "true").strip().lower() in ("1", "true", "yes")
+    if not enabled or not rows:
+        return
+    try:
+        for row in rows:
+            upsert_linkedin_post(row)
+    except Exception as exc:
+        logger.warning("role-linkedin-posts mysql dual-write (scraped) failed err=%s", exc)
+
+
+def _dual_write_relevance_to_mysql(rows: list[dict[str, Any]]) -> None:
+    enabled = (os.getenv("LINKEDIN_POSTS_MYSQL_DUAL_WRITE_ENABLED") or "true").strip().lower() in ("1", "true", "yes")
+    if not enabled or not rows:
+        return
+    try:
+        for row in rows:
+            upsert_linkedin_post_relevance(row)
+    except Exception as exc:
+        logger.warning("role-linkedin-posts mysql dual-write (relevance) failed err=%s", exc)

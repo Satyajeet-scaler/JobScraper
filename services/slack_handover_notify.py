@@ -277,6 +277,18 @@ def load_candidate_match_count_map_for_role(*, role: str, run_date: str) -> dict
 
 
 def load_linkedin_relevant_posts_from_sheet(run_date: str) -> list[dict[str, Any]]:
+    """Read LinkedIn relevant posts for handover. Prefers MySQL if enabled."""
+    use_mysql = (os.getenv("LINKEDIN_POSTS_MYSQL_READ_ENABLED") or "false").strip().lower() in ("1", "true", "yes")
+    if use_mysql:
+        from services.mysql_linkedin_posts_store import fetch_all_relevant_linkedin_posts
+        try:
+            rows = fetch_all_relevant_linkedin_posts(run_date)
+            if rows:
+                logger.info("loaded %s relevant linkedin posts from mysql", len(rows))
+                return rows
+        except Exception as exc:
+            logger.warning("failed to fetch relevant linkedin posts from mysql err=%s", exc)
+
     """Read ``linkedin_posts_relevant_{run_date}`` tab."""
     spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
     if not spreadsheet_id:

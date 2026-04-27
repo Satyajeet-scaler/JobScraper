@@ -19,6 +19,14 @@ def _safe_int(value: Any) -> int | None:
         return None
 
 
+def _safe_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=True, default=str)
+    return str(value)
+
+
 def _to_date(value: Any) -> date:
     raw = str(value or "").strip()
     if not raw:
@@ -68,17 +76,17 @@ def upsert_linkedin_post(row: dict[str, Any]) -> int:
     payload = {
         "post_url": post_url,
         "post_url_normalized": post_url_normalized,
-        "post_id": row.get("post_id"),
-        "search_query": row.get("search_query"),
-        "content_type": row.get("content_type"),
-        "post_text": row.get("post_text"),
-        "posted_at": row.get("posted_at"),
-        "author_name": row.get("author_name"),
-        "author_profile_url": row.get("author_profile_url"),
-        "author_info": row.get("author_info"),
-        "author_type": row.get("author_type"),
-        "company": row.get("company"),
-        "job_title_hint": row.get("job_title_hint"),
+        "post_id": _safe_str(row.get("post_id")),
+        "search_query": _safe_str(row.get("search_query")),
+        "content_type": _safe_str(row.get("content_type")),
+        "post_text": _safe_str(row.get("post_text")),
+        "posted_at": _safe_str(row.get("posted_at")),
+        "author_name": _safe_str(row.get("author_name")),
+        "author_profile_url": _safe_str(row.get("author_profile_url")),
+        "author_info": _safe_str(row.get("author_info")),
+        "author_type": _safe_str(row.get("author_type")),
+        "company": _safe_str(row.get("company")),
+        "job_title_hint": _safe_str(row.get("job_title_hint")),
         "likes_count": _safe_int(row.get("likes_count")),
         "comments_count": _safe_int(row.get("comments_count")),
         "reposts_count": _safe_int(row.get("reposts_count")),
@@ -148,14 +156,14 @@ def upsert_linkedin_post_relevance(row: dict[str, Any]) -> None:
     payload = {
         "linkedin_post_id": post_id,
         "is_relevant": is_relevant,
-        "tier": row.get("tier"),
-        "role_category": row.get("role_category"),
-        "reason": row.get("reason"),
-        "author_company": row.get("author_company"),
-        "hiring_company": row.get("hiring_company"),
+        "tier": _safe_str(row.get("tier")),
+        "role_category": _safe_str(row.get("role_category")),
+        "reason": _safe_str(row.get("reason")),
+        "author_company": _safe_str(row.get("author_company")),
+        "hiring_company": _safe_str(row.get("hiring_company")),
         "confidence": row.get("confidence"),
-        "priority": row.get("priority"),
-        "assigned_owner": row.get("assigned_owner") or row.get("assigned owner"),
+        "priority": _safe_str(row.get("priority")),
+        "assigned_owner": _safe_str(row.get("assigned_owner") or row.get("assigned owner")),
         "handover_sent": bool(row.get("handover_sent")),
         "classify_run_id": row.get("classify_run_id") or row.get("role_linkedin_posts_classify_run_id"),
         "classify_run_seq": _safe_int(row.get("classify_run_seq") or row.get("role_linkedin_posts_classify_run_seq")),

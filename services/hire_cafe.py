@@ -294,9 +294,9 @@ def _attempt_turnstile_manual_nudge(page: Page) -> bool:
         logger.info("hirecafe turnstile nudge: JS finding failed. Viewport: %s. Trying hardcoded fallback: (%s, %s)", 
                     viewport, HARDCODED_CF_CLICK_X, HARDCODED_CF_CLICK_Y)
         
-        # Click with a tiny bit of jitter even for hardcoded
-        cx = HARDCODED_CF_CLICK_X + random.uniform(-2, 2)
-        cy = HARDCODED_CF_CLICK_Y + random.uniform(-2, 2)
+        # Use exact coordinates for hardcoded fallback
+        cx = float(HARDCODED_CF_CLICK_X)
+        cy = float(HARDCODED_CF_CLICK_Y)
         
         page.mouse.click(cx, cy)
         logger.info("hirecafe turnstile nudge: clicked hardcoded coordinates (%s, %s)", int(cx), int(cy))

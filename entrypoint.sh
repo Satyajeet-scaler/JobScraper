@@ -21,6 +21,9 @@ export XAUTHORITY=/home/appuser/.Xauthority
 export DISPLAY=:99
 export PYTHONUNBUFFERED=1
 
+# Cleanup old Xvfb locks to prevent "Server is already active" errors
+rm -f /tmp/.X99-lock /tmp/.X11-unix/X99
+
 echo "[*] Starting Xvfb in background on ${DISPLAY}..."
 # Start Xvfb
 Xvfb :99 -screen 0 1920x1080x24 -ac +extension RANDR +render -noreset >> /tmp/xvfb.log 2>&1 &

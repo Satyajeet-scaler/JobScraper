@@ -19,12 +19,16 @@ def _safe_int(value: Any) -> int | None:
         return None
 
 
-def _safe_str(value: Any) -> str | None:
+def _safe_str(value: Any, max_len: int | None = None) -> str | None:
     if value is None:
         return None
     if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=True, default=str)
-    return str(value)
+        text = json.dumps(value, ensure_ascii=True, default=str)
+    else:
+        text = str(value)
+    if max_len and len(text) > max_len:
+        return text[:max_len]
+    return text
 
 
 def _to_date(value: Any) -> date:
@@ -75,25 +79,25 @@ def upsert_linkedin_post(row: dict[str, Any]) -> int:
 
     payload = {
         "post_url": post_url,
-        "post_url_normalized": post_url_normalized,
-        "post_id": _safe_str(row.get("post_id")),
-        "search_query": _safe_str(row.get("search_query")),
-        "content_type": _safe_str(row.get("content_type")),
+        "post_url_normalized": _safe_str(post_url_normalized, 512),
+        "post_id": _safe_str(row.get("post_id"), 255),
+        "search_query": _safe_str(row.get("search_query"), 512),
+        "content_type": _safe_str(row.get("content_type"), 50),
         "post_text": _safe_str(row.get("post_text")),
-        "posted_at": _safe_str(row.get("posted_at")),
-        "author_name": _safe_str(row.get("author_name")),
+        "posted_at": _safe_str(row.get("posted_at"), 120),
+        "author_name": _safe_str(row.get("author_name"), 512),
         "author_profile_url": _safe_str(row.get("author_profile_url")),
         "author_info": _safe_str(row.get("author_info")),
-        "author_type": _safe_str(row.get("author_type")),
-        "company": _safe_str(row.get("company")),
-        "job_title_hint": _safe_str(row.get("job_title_hint")),
+        "author_type": _safe_str(row.get("author_type"), 100),
+        "company": _safe_str(row.get("company"), 255),
+        "job_title_hint": _safe_str(row.get("job_title_hint"), 512),
         "likes_count": _safe_int(row.get("likes_count")),
         "comments_count": _safe_int(row.get("comments_count")),
         "reposts_count": _safe_int(row.get("reposts_count")),
-        "requested_role": requested_role,
-        "role_slug": row.get("role_slug"),
+        "requested_role": _safe_str(requested_role, 100),
+        "role_slug": _safe_str(row.get("role_slug"), 100),
         "run_date": run_date,
-        "run_id": row.get("run_id") or row.get("role_linkedin_posts_run_id"),
+        "run_id": _safe_str(row.get("run_id") or row.get("role_linkedin_posts_run_id"), 64),
         "run_seq": _safe_int(row.get("run_seq") or row.get("role_linkedin_posts_run_seq")),
         "raw_payload_json": _json_dump(row.get("raw_payload")),
     }
@@ -156,16 +160,16 @@ def upsert_linkedin_post_relevance(row: dict[str, Any]) -> None:
     payload = {
         "linkedin_post_id": post_id,
         "is_relevant": is_relevant,
-        "tier": _safe_str(row.get("tier")),
-        "role_category": _safe_str(row.get("role_category")),
+        "tier": _safe_str(row.get("tier"), 10),
+        "role_category": _safe_str(row.get("role_category"), 255),
         "reason": _safe_str(row.get("reason")),
-        "author_company": _safe_str(row.get("author_company")),
-        "hiring_company": _safe_str(row.get("hiring_company")),
-        "confidence": row.get("confidence"),
-        "priority": _safe_str(row.get("priority")),
-        "assigned_owner": _safe_str(row.get("assigned_owner") or row.get("assigned owner")),
+        "author_company": _safe_str(row.get("author_company"), 255),
+        "hiring_company": _safe_str(row.get("hiring_company"), 255),
+        "confidence": _safe_str(row.get("confidence"), 120),
+        "priority": _safe_str(row.get("priority"), 120),
+        "assigned_owner": _safe_str(row.get("assigned_owner") or row.get("assigned owner"), 255),
         "handover_sent": bool(row.get("handover_sent")),
-        "classify_run_id": row.get("classify_run_id") or row.get("role_linkedin_posts_classify_run_id"),
+        "classify_run_id": _safe_str(row.get("classify_run_id") or row.get("role_linkedin_posts_classify_run_id"), 64),
         "classify_run_seq": _safe_int(row.get("classify_run_seq") or row.get("role_linkedin_posts_classify_run_seq")),
     }
 

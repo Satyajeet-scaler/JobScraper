@@ -19,12 +19,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-import undetected_chromedriver as uc
+from playwright.sync_api import Page, ElementHandle, Response
+from camoufox.sync_api import Camoufox
 from bs4 import BeautifulSoup
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 
 from services.hirecafe_carousel import (
     _click_carousel_next,
@@ -45,7 +42,7 @@ CLOUDFLARE_WAIT_SECONDS = int(os.getenv("HIRECAFE_CLOUDFLARE_WAIT_SECONDS", "10"
 CLOUDFLARE_CLEAR_TIMEOUT_SECONDS = int(os.getenv("HIRECAFE_CF_CLEAR_TIMEOUT_SECONDS", "35"))
 POST_VERIFY_WAIT_SECONDS = int(os.getenv("HIRECAFE_POST_VERIFY_WAIT_SECONDS", "8"))
 
-HARDCODED_CF_CLICK_X = int(os.getenv("HIRECAFE_CF_CLICK_X", "544"))
+HARDCODED_CF_CLICK_X = int(os.getenv("HIRECAFE_CF_CLICK_X", "340"))
 HARDCODED_CF_CLICK_Y = int(os.getenv("HIRECAFE_CF_CLICK_Y", "334"))
 
 SCROLL_PIXELS = int(os.getenv("HIRECAFE_SCROLL_PIXELS", "1200"))
@@ -57,7 +54,7 @@ MAX_IDLE_SECONDS = int(os.getenv("HIRECAFE_MAX_IDLE_SECONDS", "90"))
 MAX_SCROLLS = int(os.getenv("HIRECAFE_MAX_SCROLLS", "500"))
 HEARTBEAT_EVERY_SECONDS = int(os.getenv("HIRECAFE_HEARTBEAT_EVERY_SECONDS", "15"))
 
-CAROUSEL_CLICK_DELAY = float(os.getenv("HIRECAFE_CAROUSEL_CLICK_DELAY", "1.5"))
+CAROUSEL_CLICK_DELAY = float(os.getenv("HIRECAFE_CAROUSEL_CLICK_DELAY", "0.5"))
 PHASE2_MAX_CAROUSEL_CLICKS = max(1, int(os.getenv("HIRECAFE_PHASE2_MAX_CAROUSEL_CLICKS", "40")))
 BOTTOM_IDLE_SCROLLS = int(os.getenv("HIRECAFE_BOTTOM_IDLE_SCROLLS", "5"))
 CAROUSEL_ENABLED = os.getenv("HIRECAFE_CAROUSEL_ENABLED", "true").lower() not in ("false", "0", "no")
@@ -71,125 +68,6 @@ HIRECAFE_DETECTABLE_HEADLESS = os.getenv("HIRECAFE_DETECTABLE_HEADLESS", "true")
 # ---------------------------------------------------------------------------
 #  Persistent browser profile
 # ---------------------------------------------------------------------------
-HIRECAFE_CHROME_PROFILE_DIR = os.getenv(
-    "HIRECAFE_CHROME_PROFILE_DIR", "data/chrome_profile"
-).strip()
-
-# ---------------------------------------------------------------------------
-#  TLS / header alignment — matches Debian bookworm Chromium 131
-# ---------------------------------------------------------------------------
-_CHROME_UA = (
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
-_CHROME_SEC_CH_UA = '"Chromium";v="131", "Not_A Brand";v="24"'
-
-# ---------------------------------------------------------------------------
-#  Stealth JavaScript — injected via Page.addScriptToEvaluateOnNewDocument
-#  Eliminates common headless fingerprints before any page loads.
-# ---------------------------------------------------------------------------
-_STEALTH_JS = """
-// 1. Remove navigator.webdriver flag
-Object.defineProperty(navigator, 'webdriver', {
-    get: () => undefined,
-    configurable: true
-});
-
-// 2. Realistic hardware concurrency & device memory
-Object.defineProperty(navigator, 'hardwareConcurrency', {
-    get: () => 8,
-    configurable: true
-});
-Object.defineProperty(navigator, 'deviceMemory', {
-    get: () => 8,
-    configurable: true
-});
-
-// 3. Override navigator.languages
-Object.defineProperty(navigator, 'languages', {
-    get: () => ['en-US', 'en'],
-    configurable: true
-});
-
-// 4. WebGL vendor/renderer spoofing
-(function() {
-    const getParameter = WebGLRenderingContext.prototype.getParameter;
-    WebGLRenderingContext.prototype.getParameter = function(parameter) {
-        if (parameter === 37445) return 'Google Inc. (NVIDIA)';
-        if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 SUPER, OpenGL 4.5)';
-        return getParameter.call(this, parameter);
-    };
-    if (typeof WebGL2RenderingContext !== 'undefined') {
-        const getParameter2 = WebGL2RenderingContext.prototype.getParameter;
-        WebGL2RenderingContext.prototype.getParameter = function(parameter) {
-            if (parameter === 37445) return 'Google Inc. (NVIDIA)';
-            if (parameter === 37446) return 'ANGLE (NVIDIA, NVIDIA GeForce GTX 1650 SUPER, OpenGL 4.5)';
-            return getParameter2.call(this, parameter);
-        };
-    }
-})();
-
-// 5. Fake plugins (headless Chrome returns empty)
-Object.defineProperty(navigator, 'plugins', {
-    get: () => {
-        const arr = [
-            { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer',
-              description: 'Portable Document Format',
-              length: 1, item: (i) => ({ type: 'application/x-google-chrome-pdf' }) },
-            { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai',
-              description: '', length: 1,
-              item: (i) => ({ type: 'application/pdf' }) },
-            { name: 'Native Client', filename: 'internal-nacl-plugin',
-              description: '', length: 2,
-              item: (i) => ({ type: i === 0 ? 'application/x-nacl' : 'application/x-pnacl' }) }
-        ];
-        arr.item = (i) => arr[i] || null;
-        arr.namedItem = (n) => arr.find(p => p.name === n) || null;
-        arr.refresh = () => {};
-        return arr;
-    },
-    configurable: true
-});
-
-// 6. Fix Notification.permission
-try {
-    Object.defineProperty(Notification, 'permission', {
-        get: () => 'default',
-        configurable: true
-    });
-} catch(e) {}
-
-// 7. Fix navigator.permissions.query
-(function() {
-    const origQuery = navigator.permissions.query.bind(navigator.permissions);
-    navigator.permissions.query = function(params) {
-        if (params && params.name === 'notifications') {
-            return Promise.resolve({ state: 'prompt', onchange: null });
-        }
-        return origQuery(params);
-    };
-})();
-
-// 8. Mask automation-related properties
-delete window.cdc_adoQpoasnfa76pfcZLmcfl_Array;
-delete window.cdc_adoQpoasnfa76pfcZLmcfl_Promise;
-delete window.cdc_adoQpoasnfa76pfcZLmcfl_Symbol;
-
-// 9. Chrome runtime (headless lacks this)
-if (!window.chrome) {
-    window.chrome = {};
-}
-if (!window.chrome.runtime) {
-    window.chrome.runtime = {
-        connect: function() {},
-        sendMessage: function() {},
-        id: undefined
-    };
-}
-"""
-HIRECAFE_CHROMEDRIVER_PATH = os.getenv("HIRECAFE_CHROMEDRIVER_PATH", "").strip()
-HIRECAFE_CHROME_BINARY = os.getenv("HIRECAFE_CHROME_BINARY", "").strip()
-
 HIRECAFE_OBSERVE_PAGES = os.getenv("HIRECAFE_OBSERVE_PAGES", "false").lower() not in (
     "false", "0", "no",
 )
@@ -235,7 +113,7 @@ CLOUDFLARE_HTML_MARKERS = (
 )
 
 
-def _probe_cloudflare_challenge(driver) -> dict[str, Any]:
+def _probe_cloudflare_challenge(page: Page) -> dict[str, Any]:
     """Collect challenge signals from title/text plus known Cloudflare selectors."""
     state: dict[str, Any] = {
         "active": False,
@@ -248,14 +126,14 @@ def _probe_cloudflare_challenge(driver) -> dict[str, Any]:
         "signal_score": 0,
     }
     try:
-        state["url"] = driver.current_url or ""
+        state["url"] = page.url or ""
     except Exception:
         pass
 
     try:
-        title = (driver.title or "").strip()
-        page = (driver.page_source or "")
-        page_lower = page.lower()
+        title = (page.title() or "").strip()
+        html_content = (page.content() or "")
+        page_lower = html_content.lower()
         content = f"{title.lower()}\n{page_lower}"
         state["title"] = title
         state["marker_hits"] = [
@@ -268,22 +146,26 @@ def _probe_cloudflare_challenge(driver) -> dict[str, Any]:
         pass
 
     try:
-        selector_hits = driver.execute_script(
-            "const bodyText=((document.body&&document.body.innerText)||'').toLowerCase();"
-            "return {"
-            "cf_iframe: !!document.querySelector(\"iframe[src*='challenges.cloudflare.com']\"),"
-            "cf_turnstile: !!document.querySelector(\"input[name='cf-turnstile-response'], div.cf-turnstile\"),"
-            "cf_turnstile_input: !!document.querySelector(\"input[name='cf-turnstile-response'], input[id^='cf-chl-widget'][id$='_response']\"),"
-            "cf_turnstile_widget: !!document.querySelector(\"div.cf-turnstile\"),"
-            "cf_challenge_form: !!document.querySelector(\"form#challenge-form, #challenge-stage\"),"
-            "cf_challenge_platform_script: !!document.querySelector(\"script[src*='/cdn-cgi/challenge-platform/']\"),"
-            "cf_turnstile_script: !!document.querySelector(\"script[src*='challenges.cloudflare.com/turnstile']\"),"
-            "cf_challenge_state_nodes: !!document.querySelector(\"#challenge-success-text, #challenge-error-text, .loading-verifying, .ray-id\"),"
-            "cf_meta_refresh: !!document.querySelector(\"meta[http-equiv='refresh'][content]\"),"
-            "cf_ray_id_text: /ray id:/.test(bodyText),"
-            "cf_verify_copy: /performing security verification|this website uses a security service|just a moment|security check|verify you are human|checking your browser/.test(bodyText),"
-            "cf_challenge_text: /just a moment|security check|verify you are human|performing security verification|checking your browser/.test(bodyText)"
-            "};"
+        selector_hits = page.evaluate(
+            """
+            () => {
+              const bodyText = ((document.body && document.body.innerText) || '').toLowerCase();
+              return {
+                cf_iframe: !!document.querySelector("iframe[src*='challenges.cloudflare.com']"),
+                cf_turnstile: !!document.querySelector("input[name='cf-turnstile-response'], div.cf-turnstile"),
+                cf_turnstile_input: !!document.querySelector("input[name='cf-turnstile-response'], input[id^='cf-chl-widget'][id$='_response']"),
+                cf_turnstile_widget: !!document.querySelector("div.cf-turnstile"),
+                cf_challenge_form: !!document.querySelector("form#challenge-form, #challenge-stage"),
+                cf_challenge_platform_script: !!document.querySelector("script[src*='/cdn-cgi/challenge-platform/']"),
+                cf_turnstile_script: !!document.querySelector("script[src*='challenges.cloudflare.com/turnstile']"),
+                cf_challenge_state_nodes: !!document.querySelector("#challenge-success-text, #challenge-error-text, .loading-verifying, .ray-id"),
+                cf_meta_refresh: !!document.querySelector("meta[http-equiv='refresh'][content]"),
+                cf_ray_id_text: /ray id:/.test(bodyText),
+                cf_verify_copy: /performing security verification|this website uses a security service|just a moment|security check|verify you are human|checking your browser/.test(bodyText),
+                cf_challenge_text: /just a moment|security check|verify you are human|performing security verification|checking your browser/.test(bodyText)
+              };
+            }
+            """
         ) or {}
     except Exception:
         selector_hits = {}
@@ -316,97 +198,164 @@ def _probe_cloudflare_challenge(driver) -> dict[str, Any]:
     return state
 
 
-def _is_cloudflare_challenge_active(driver) -> bool:
-    return bool(_probe_cloudflare_challenge(driver).get("active"))
+def _is_cloudflare_challenge_active(page: Page) -> bool:
+    return bool(_probe_cloudflare_challenge(page).get("active"))
 
 
 def _wait_for_cloudflare_clearance(
-    driver,
+    page: Page,
     timeout_seconds: int,
     poll_interval_seconds: float = 1.0,
 ) -> tuple[bool, dict[str, Any]]:
     deadline = time.time() + max(0, timeout_seconds)
-    last_state = _probe_cloudflare_challenge(driver)
+    last_state = _probe_cloudflare_challenge(page)
+    
+    # Track when we last attempted a manual nudge
+    last_nudge_time = 0.0
+    
     while time.time() < deadline:
-        last_state = _probe_cloudflare_challenge(driver)
+        last_state = _probe_cloudflare_challenge(page)
         if not last_state.get("active"):
             return True, last_state
+            
+        # If it's been more than 8 seconds since landing or last nudge, try a manual click nudge
+        if time.time() - last_nudge_time > 8.0:
+            _attempt_turnstile_manual_nudge(page)
+            last_nudge_time = time.time()
+
         time.sleep(max(0.1, poll_interval_seconds))
-    last_state = _probe_cloudflare_challenge(driver)
+    
+    last_state = _probe_cloudflare_challenge(page)
     return (not last_state.get("active")), last_state
 
 
-def _probe_hiring_cafe_page_ready(driver) -> dict[str, Any]:
-    """Probe whether the post-challenge hiring.cafe app shell is ready."""
-    challenge = _probe_cloudflare_challenge(driver)
-    state: dict[str, Any] = {
-        "ready": False,
-        "reason": "unknown",
-        "url": challenge.get("url", ""),
-        "ready_state": None,
-        "has_next_data": False,
-        "has_next_root": False,
-        "has_viewjob_link": False,
-        "challenge": challenge,
-    }
-
+def _attempt_turnstile_manual_nudge(page: Page) -> bool:
+    """Detect and click the Turnstile checkbox using cross-frame JavaScript."""
     try:
-        dom_state = driver.execute_script(
-            "return {"
-            "readyState: document.readyState || null,"
-            "hasNextData: !!document.querySelector(\"script#__NEXT_DATA__\"),"
-            "hasNextRoot: !!document.querySelector(\"#__next\"),"
-            "hasViewjobLink: !!document.querySelector(\"a[href*='/viewjob/']\")"
-            "};"
-        ) or {}
-    except Exception:
-        dom_state = {}
+        # Check every frame for the checkbox
+        all_frames = page.frames
+        logger.info("hirecafe turnstile nudge: checking %s frames", len(all_frames))
+        
+        for frame in all_frames:
+            try:
+                # This script returns the bounding box of the checkbox if found inside the frame
+                box = frame.evaluate("""
+                    () => {
+                        const selectors = [
+                            '.ctp-checkbox-label',
+                            '.ctp-checkbox-container',
+                            '#checkbox',
+                            '[type="checkbox"]',
+                            '#challenge-stage div'
+                        ];
+                        for (const selector of selectors) {
+                            const el = document.querySelector(selector);
+                            if (el && el.offsetWidth > 0 && el.offsetHeight > 0) {
+                                const rect = el.getBoundingClientRect();
+                                return {
+                                    x: rect.left,
+                                    y: rect.top,
+                                    width: rect.width,
+                                    height: rect.height,
+                                    found: true,
+                                    selector: selector
+                                };
+                            }
+                        }
+                        return null;
+                    }
+                """)
+                
+                if box and box.get("found"):
+                    iframe_handle = frame.frame_element()
+                    if not iframe_handle:
+                        # Could be the main frame which doesn't have an iframe_handle
+                        cx = box["x"] + box["width"] / 2 + random.uniform(-3, 3)
+                        cy = box["y"] + box["height"] / 2 + random.uniform(-3, 3)
+                    else:
+                        iframe_box = iframe_handle.bounding_box()
+                        if not iframe_box:
+                            continue
+                        cx = iframe_box["x"] + box["x"] + box["width"] / 2 + random.uniform(-3, 3)
+                        cy = iframe_box["y"] + box["y"] + box["height"] / 2 + random.uniform(-3, 3)
+                    
+                    logger.info("hirecafe turnstile nudge: found %s in frame %s", box["selector"], frame.url)
+                    page.mouse.click(cx, cy)
+                    logger.info("hirecafe turnstile nudge: clicked coordinates (%s, %s)", int(cx), int(cy))
+                    
+                    time.sleep(1.0)
+                    _capture_observation_artifacts(page, "post_turnstile_nudge")
+                    return True
+            except Exception:
+                continue
+                
+        # Fallback: Hardcoded Click
+        viewport = page.viewport_size
+        logger.info("hirecafe turnstile nudge: JS finding failed. Viewport: %s. Trying hardcoded fallback: (%s, %s)", 
+                    viewport, HARDCODED_CF_CLICK_X, HARDCODED_CF_CLICK_Y)
+        
+        # Click with a tiny bit of jitter even for hardcoded
+        cx = HARDCODED_CF_CLICK_X + random.uniform(-2, 2)
+        cy = HARDCODED_CF_CLICK_Y + random.uniform(-2, 2)
+        
+        page.mouse.click(cx, cy)
+        logger.info("hirecafe turnstile nudge: clicked hardcoded coordinates (%s, %s)", int(cx), int(cy))
+        
+        # Inject a visual marker so we can see the click location in the screenshot
+        marker_js = f"""
+            (() => {{
+                const dot = document.createElement('div');
+                dot.id = 'debug-click-marker';
+                dot.style.position = 'fixed';
+                dot.style.left = '{cx - 5}px';
+                dot.style.top = '{cy - 5}px';
+                dot.style.width = '10px';
+                dot.style.height = '10px';
+                dot.style.backgroundColor = 'red';
+                dot.style.borderRadius = '50%';
+                dot.style.zIndex = '999999';
+                dot.style.pointerEvents = 'none';
+                dot.style.border = '2px solid white';
+                document.body.appendChild(dot);
+            }})()
+        """
+        try:
+            page.evaluate(marker_js)
+        except:
+            pass
 
-    state["ready_state"] = dom_state.get("readyState")
-    state["has_next_data"] = bool(dom_state.get("hasNextData"))
-    state["has_next_root"] = bool(dom_state.get("hasNextRoot"))
-    state["has_viewjob_link"] = bool(dom_state.get("hasViewjobLink"))
+        # Immediate verification
+        time.sleep(1.0)
+        _capture_observation_artifacts(page, "post_turnstile_nudge_hardcoded_1s")
+        
+        # Delayed verification (to see if it clears)
+        time.sleep(2.0)
+        _capture_observation_artifacts(page, "post_turnstile_nudge_hardcoded_3s")
+        
+        # Cleanup marker (optional, but good practice)
+        try:
+            page.evaluate("() => { const d = document.getElementById('debug-click-marker'); if(d) d.remove(); }")
+        except:
+            pass
+            
+        return True
 
-    on_hiring_cafe = "hiring.cafe" in str(state.get("url", "")).lower()
-    has_app_shell = bool(
-        state["has_next_data"] or state["has_next_root"] or state["has_viewjob_link"]
-    )
-    ready_state_ok = state["ready_state"] in ("interactive", "complete")
-    challenge_active = bool(challenge.get("active"))
-
-    if challenge_active:
-        state["reason"] = "challenge_active"
-    elif not on_hiring_cafe:
-        state["reason"] = "not_on_hiring_cafe"
-    elif not ready_state_ok:
-        state["reason"] = "dom_not_ready"
-    elif not has_app_shell:
-        state["reason"] = "app_shell_missing"
-    else:
-        state["reason"] = "ready"
-        state["ready"] = True
-
-    return state
+    except Exception as exc:
+        logger.info("hirecafe turnstile nudge error: %s", exc)
+    return False
 
 
-def _wait_for_hiring_cafe_page_ready(
-    driver,
-    timeout_seconds: int,
-    poll_interval_seconds: float,
-) -> tuple[bool, dict[str, Any]]:
-    deadline = time.time() + max(0, timeout_seconds)
-    last_state = _probe_hiring_cafe_page_ready(driver)
-    while time.time() < deadline:
-        last_state = _probe_hiring_cafe_page_ready(driver)
-        if last_state.get("ready"):
-            return True, last_state
-        time.sleep(max(0.1, poll_interval_seconds))
-    last_state = _probe_hiring_cafe_page_ready(driver)
-    return bool(last_state.get("ready")), last_state
+def _get_camoufox_config() -> dict[str, Any]:
+    """Camoufox config with anti-detection and optional proxy."""
+    return {
+        "headless": os.getenv("HIRECAFE_HEADLESS", "false").lower() == "true",
+        "humanize": True,
+        "browser": "firefox",
+    }
 
 
 def _capture_observation_artifacts(
-    driver,
+    page: Page,
     stage: str,
     extra: Optional[dict[str, Any]] = None,
 ) -> None:
@@ -430,12 +379,13 @@ def _capture_observation_artifacts(
 
         screenshot_ok = False
         try:
-            screenshot_ok = bool(driver.save_screenshot(str(screenshot_path)))
+            page.screenshot(path=str(screenshot_path))
+            screenshot_ok = True
         except Exception:
             screenshot_ok = False
 
         try:
-            html_path.write_text(driver.page_source or "", encoding="utf-8")
+            html_path.write_text(page.content() or "", encoding="utf-8")
         except Exception:
             pass
 
@@ -445,8 +395,8 @@ def _capture_observation_artifacts(
             "screenshot_ok": screenshot_ok,
             "screenshot_path": str(screenshot_path),
             "html_path": str(html_path),
-            "url": getattr(driver, "current_url", ""),
-            "title": getattr(driver, "title", ""),
+            "url": page.url or "",
+            "title": page.title() or "",
             "extra": extra or {},
         }
         meta_path.write_text(
@@ -458,227 +408,25 @@ def _capture_observation_artifacts(
         logger.info("hirecafe observe capture failed stage=%s: %s", stage, type(exc).__name__)
 
 
-def _launch_detectable_driver():
-    """Launch a deliberately easier-to-detect browser profile for CF testing."""
-    try:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options as SeleniumChromeOptions
-        from selenium.webdriver.chrome.service import Service as ChromeService
-    except Exception as exc:
-        logger.warning(
-            "hirecafe detectable mode unavailable (%s), falling back to stealth",
-            type(exc).__name__,
-        )
-        return None
-
-    options = SeleniumChromeOptions()
-    options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-    options.add_argument("--enable-automation")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--window-size=1366,768")
-    options.add_argument("--no-sandbox")
-
-    if HIRECAFE_DETECTABLE_HEADLESS:
-        options.add_argument("--headless=new")
-        options.add_argument(
-            "--user-agent=Mozilla/5.0 (X11; Linux x86_64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "HeadlessChrome/124.0.0.0 Safari/537.36"
-        )
-
-    if HIRECAFE_CHROME_BINARY:
-        options.binary_location = HIRECAFE_CHROME_BINARY
-
-    if HIRECAFE_CHROMEDRIVER_PATH:
-        service = ChromeService(executable_path=HIRECAFE_CHROMEDRIVER_PATH)
-    else:
-        service = ChromeService()
-
-    logger.info(
-        "hirecafe launching detectable selenium browser headless=%s",
-        HIRECAFE_DETECTABLE_HEADLESS,
-    )
-    return webdriver.Chrome(service=service, options=options)
-
-
-def _cleanup_profile_locks(profile_dir: str) -> None:
-    """Remove stale Chrome lock files that prevent profile reuse."""
-    lock_names = ("SingletonLock", "SingletonCookie", "SingletonSocket")
-    for name in lock_names:
-        lock_path = os.path.join(profile_dir, name)
-        try:
-            if os.path.exists(lock_path):
-                os.remove(lock_path)
-                logger.info("hirecafe removed stale lock: %s", lock_path)
-        except Exception as exc:
-            logger.debug("hirecafe lock cleanup failed %s: %s", name, exc)
-
-
-def _inject_stealth_scripts(driver) -> None:
-    """Inject anti-fingerprint JavaScript before any page loads."""
-    try:
-        driver.execute_cdp_cmd(
-            "Page.addScriptToEvaluateOnNewDocument",
-            {"source": _STEALTH_JS},
-        )
-        logger.info("hirecafe stealth scripts injected")
-    except Exception as exc:
-        logger.warning("hirecafe stealth injection failed: %s", exc)
-
-    # Align sec-ch-ua / sec-ch-ua-platform headers with the spoofed UA
-    try:
-        driver.execute_cdp_cmd("Network.setExtraHTTPHeaders", {
-            "headers": {
-                "sec-ch-ua": _CHROME_SEC_CH_UA,
-                "sec-ch-ua-mobile": "?0",
-                "sec-ch-ua-platform": '"Linux"',
-            }
-        })
-    except Exception:
-        pass
-
-
-def _bezier_point(
-    t: float,
-    p0: tuple[float, float],
-    p1: tuple[float, float],
-    p2: tuple[float, float],
-    p3: tuple[float, float],
-) -> tuple[float, float]:
-    """Evaluate a cubic Bézier curve at parameter *t* ∈ [0, 1]."""
-    u = 1 - t
-    x = u**3 * p0[0] + 3 * u**2 * t * p1[0] + 3 * u * t**2 * p2[0] + t**3 * p3[0]
-    y = u**3 * p0[1] + 3 * u**2 * t * p1[1] + 3 * u * t**2 * p2[1] + t**3 * p3[1]
-    return (x, y)
-
-
-def _human_mouse_path(
-    x0: float, y0: float, x1: float, y1: float,
-) -> list[tuple[float, float]]:
-    """Generate 20-40 waypoints along a cubic Bézier from (x0,y0) to (x1,y1)
-    with Gaussian pixel jitter simulating hand tremor."""
-    steps = random.randint(20, 40)
-    dx = x1 - x0
-    dy = y1 - y0
-    # Two random control points — create an organic bow
-    cp1 = (
-        x0 + dx * random.uniform(0.2, 0.4) + random.uniform(-60, 60),
-        y0 + dy * random.uniform(0.0, 0.3) + random.uniform(-40, 40),
-    )
-    cp2 = (
-        x0 + dx * random.uniform(0.6, 0.8) + random.uniform(-60, 60),
-        y0 + dy * random.uniform(0.7, 1.0) + random.uniform(-40, 40),
-    )
-    p0 = (x0, y0)
-    p3 = (x1, y1)
-    path: list[tuple[float, float]] = []
-    for i in range(steps + 1):
-        t = i / steps
-        bx, by = _bezier_point(t, p0, cp1, cp2, p3)
-        # Gaussian jitter — skip on first/last point to hit origin/target exactly
-        if 0 < i < steps:
-            bx += random.gauss(0, 1.5)
-            by += random.gauss(0, 1.5)
-        path.append((bx, by))
-    return path
-
-
-def _human_click(driver, x: int, y: int) -> bool:
-    """Move the mouse along a Bézier curve to (x, y) with realistic timing,
-    then perform a press-hold-release click sequence."""
-    try:
-        # Random origin offset (upper-left of target)
-        ox = x + random.randint(-180, -40)
-        oy = y + random.randint(-120, -25)
-        path = _human_mouse_path(float(ox), float(oy), float(x), float(y))
-
-        for wx, wy in path:
-            driver.execute_cdp_cmd(
-                "Input.dispatchMouseEvent",
-                {"type": "mouseMoved", "x": int(wx), "y": int(wy)},
-            )
-            time.sleep(random.uniform(0.008, 0.025))
-
-        # Pre-click hover pause
-        time.sleep(random.uniform(0.08, 0.20))
-
-        driver.execute_cdp_cmd(
-            "Input.dispatchMouseEvent",
-            {"type": "mousePressed", "x": x, "y": y, "button": "left", "clickCount": 1},
-        )
-        # Hold duration — simulate finger on trackpad
-        time.sleep(random.uniform(0.05, 0.12))
-        driver.execute_cdp_cmd(
-            "Input.dispatchMouseEvent",
-            {"type": "mouseReleased", "x": x, "y": y, "button": "left", "clickCount": 1},
-        )
-        return True
-    except Exception as exc:
-        logger.info("hirecafe human click failed at (%s,%s): %s", x, y, type(exc).__name__)
-        return False
-
-
-def _launch_hirecafe_driver():
-    options = uc.ChromeOptions()
-    options.set_capability("goog:loggingPrefs", {"performance": "ALL"})
-
-    if HIRECAFE_BROWSER_MODE == "detectable":
-        detectable_driver = _launch_detectable_driver()
-        if detectable_driver is not None:
-            return detectable_driver
-
-    # --- Chrome hardening flags ---
-    options.add_argument("--disable-blink-features=AutomationControlled")
-    options.add_argument("--window-size=1920,1080")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument(f"--user-agent={_CHROME_UA}")
-
-    # --- Persistent browser profile ---
-    profile_dir = HIRECAFE_CHROME_PROFILE_DIR
-    if profile_dir:
-        profile_path = Path(profile_dir)
-        if not profile_path.is_absolute():
-            profile_path = Path.cwd() / profile_path
-        profile_path.mkdir(parents=True, exist_ok=True)
-        _cleanup_profile_locks(str(profile_path))
-        options.add_argument(f"--user-data-dir={profile_path}")
-        logger.info("hirecafe using persistent profile: %s", profile_path)
-
-    is_server = os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("PORT")
-    if is_server:
-        logger.info("hirecafe detected server environment, using system chromium binaries")
-        driver = uc.Chrome(
-            options=options,
-            browser_executable_path="/usr/bin/chromium",
-            driver_executable_path="/usr/local/bin/chromedriver",
-        )
-    else:
-        driver = uc.Chrome(options=options, version_main=147)
-
-    _inject_stealth_scripts(driver)
-    return driver
-
-
-def _press_escape_before_scroll(driver) -> None:
+def _press_escape_before_scroll(page: Page) -> None:
     """Dismiss overlays / blur focused inputs so the feed receives scroll events."""
     if not PRE_SCROLL_ESCAPE:
         return
     try:
-        driver.switch_to.default_content()
+        page.keyboard.press("Escape")
+        time.sleep(0.05)
     except Exception:
         pass
+
+
+def _click_viewport_coordinate(page: Page, x: int, y: int) -> bool:
+    """Click at viewport coordinates using Camoufox's human-like movement."""
     try:
-        body = driver.find_element(By.TAG_NAME, "body")
-        body.send_keys(Keys.ESCAPE)
-        time.sleep(0.15)
+        page.mouse.click(x, y)
+        return True
     except Exception as exc:
-        logger.debug("hirecafe pre-scroll Escape: %s", type(exc).__name__)
-
-
-def _click_viewport_coordinate(driver, x: int, y: int) -> bool:
-    """Click at viewport coordinates using human-like Bézier mouse movement."""
-    return _human_click(driver, x, y)
+        logger.debug("hirecafe click coordinate failed: %s", exc)
+        return False
 
 
 def _extract_viewjob_id(url_or_href: str) -> str | None:
@@ -692,97 +440,61 @@ def _extract_viewjob_id(url_or_href: str) -> str | None:
     return slug.strip("/") or None
 
 
-def _ingest_from_performance_logs(
-    driver,
-    job_samples: list[dict[str, Any]],
-    seen_urls: set[str],
-    seen_ids: set[str],
-    max_samples: int,
-) -> int:
-    """Read CDP performance logs and append new viewjob JSON payloads.
-    Returns count of newly captured jobs."""
-    new_count = 0
+def _probe_cloudflare_challenge(page: Page) -> dict[str, Any]:
+    """Check for Cloudflare/Turnstile presence markers."""
     try:
-        logs = driver.get_log("performance")
+        content = (page.content() or "").lower()
+        marker_hits = [m for m in CLOUDFLARE_MARKERS if m in content]
+        
+        # Also check for iframe
+        iframe_found = page.query_selector("iframe[src*='cloudflare']") is not None
+        
+        return {
+            "active": len(marker_hits) > 0 or iframe_found,
+            "marker_hits": marker_hits,
+            "iframe_found": iframe_found
+        }
     except Exception:
-        return 0
-    for log_entry in logs:
-        if len(job_samples) >= max_samples:
-            break
-        try:
-            message = json.loads(log_entry["message"])["message"]
-            if message["method"] != "Network.responseReceived":
-                continue
-            resp = message["params"]["response"]
-            url = resp.get("url", "")
-            if "viewjob/" not in url or ".json" not in url:
-                continue
-            if url in seen_urls:
-                continue
-            if resp.get("status") != 200:
-                continue
-            job_id = _extract_viewjob_id(url)
-            if job_id and job_id in seen_ids:
-                continue
-            req_id = message["params"]["requestId"]
-            body = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": req_id})
-            job_data = json.loads(body["body"])
-            job_samples.append(job_data)
-            seen_urls.add(url)
-            if job_id:
-                seen_ids.add(job_id)
-            new_count += 1
-            logger.debug(
-                "hirecafe captured %s/%s url=%s",
-                len(job_samples), max_samples, url.split("/")[-1][:30],
-            )
-        except Exception:
-            pass
-    return new_count
+        return {"active": False, "marker_hits": [], "iframe_found": False}
 
 
-def _scroll_feed_and_window(driver, scroll_root, pixels: int) -> None:
-    """Scroll both the infinite-scroll inner container and the browser window."""
-    try:
-        driver.execute_script(
-            "var el=arguments[0],px=arguments[1];"
-            "if(el)el.scrollTop+=px;"
-            "window.scrollBy(0,px);",
-            scroll_root, pixels,
-        )
-    except Exception:
-        try:
-            driver.execute_script("window.scrollBy(0,%d);" % pixels)
-        except Exception:
-            pass
+def _wait_for_cloudflare_clearance(page: Page, timeout: int) -> tuple[bool, dict[str, Any]]:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        res = _probe_cloudflare_challenge(page)
+        if not res["active"]:
+            return True, res
+        time.sleep(1.0)
+    return False, _probe_cloudflare_challenge(page)
 
 
-def _is_at_bottom(driver, scroll_root) -> bool:
-    """Check if the scroll container (or window) has reached the bottom."""
-    try:
-        return bool(driver.execute_script(
-            "var el=arguments[0];"
-            "if(el)return el.scrollTop+el.clientHeight>=el.scrollHeight-50;"
-            "return (window.innerHeight+window.scrollY)>=document.body.scrollHeight-50;",
-            scroll_root,
-        ))
-    except Exception:
-        return False
+def _wait_for_hiring_cafe_page_ready(page: Page, timeout: int) -> tuple[bool, dict[str, Any]]:
+    """Wait for core Hiring.Cafe UI elements to appear."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        # Check for card grid or specific Next.js markers
+        grid = page.query_selector("div[class*='grid'], main")
+        has_next_data = page.query_selector("#__NEXT_DATA__") is not None
+        
+        if grid and has_next_data:
+            return True, {"reason": "elements_found", "has_next_data": has_next_data}
+        time.sleep(1.0)
+    return False, {"reason": "timeout"}
 
 
 def _fetch_missing_jobs_via_dom(
-    driver,
-    card,
+    page: Page,
+    card: ElementHandle,
     job_samples: list[dict[str, Any]],
     seen_ids: set[str],
     seen_urls: set[str],
     max_samples: int,
 ) -> int:
     """Fetch viewjob JSON for hrefs visible in a card's DOM but not yet captured.
-    Uses in-page fetch() as a fallback for jobs missed by CDP performance logs."""
-    new_count = 0
+    Uses in-page fetch() via page.evaluate as a fallback."""
+    new_count: int = 0
     try:
-        hrefs = _viewjob_hrefs_in_card(driver, card)
+        hrefs = _viewjob_hrefs_in_card(page, card)
     except Exception:
         return 0
 
@@ -796,124 +508,85 @@ def _fetch_missing_jobs_via_dom(
         return 0
 
     try:
-        build_id = driver.execute_script(
-            "try{return JSON.parse(document.getElementById('__NEXT_DATA__').textContent).buildId}"
-            "catch(e){return null}"
+        build_id = page.evaluate(
+            "() => { try { return JSON.parse(document.getElementById('__NEXT_DATA__').textContent).buildId; } catch(e) { return null; } }"
         )
     except Exception:
         build_id = None
 
     if not build_id:
-        logger.debug("hirecafe dom-fetch: could not determine Next.js buildId, skipping")
         return 0
 
     for jid in missing_ids:
         if len(job_samples) >= max_samples:
             break
-        url = f"/_next/data/{build_id}/viewjob/{jid}.json"
+        
+        path = f"/_next/data/{build_id}/viewjob/{jid}.json"
         try:
-            result = driver.execute_async_script(
-                "var url=arguments[0],done=arguments[arguments.length-1];"
-                "fetch(url,{credentials:'include'})"
-                ".then(function(r){return r.ok?r.json():null})"
-                ".then(function(d){done(d?JSON.stringify(d):null)})"
-                ".catch(function(){done(null)});",
-                url,
+            # Execute fetch in-page
+            result_json = page.evaluate(
+                f"(url) => fetch(url, {{credentials:'include'}}).then(r => r.ok ? r.json() : null).then(d => d ? JSON.stringify(d) : null)",
+                path
             )
-            if not result:
+            if not result_json:
                 continue
-            job_data = json.loads(result)
+                
+            job_data = json.loads(result_json)
             if not job_data.get("pageProps"):
                 continue
+                
             job_samples.append(job_data)
             seen_ids.add(jid)
-            canonical = f"https://hiring.cafe{url}"
-            seen_urls.add(canonical)
+            seen_urls.add(f"https://hiring.cafe{path}")
             new_count += 1
-            logger.debug(
-                "hirecafe dom-fetch captured %s/%s id=%s",
-                len(job_samples), max_samples, jid[:30],
-            )
+            logger.debug("DOM-fetch captured id=%s", jid)
         except Exception:
             pass
+            
     return new_count
 
 
 def _collect_jobs_for_card_until_no_new(
-    driver,
-    card,
+    page: Page,
+    card: ElementHandle,
     job_samples: list[dict[str, Any]],
     seen_ids: set[str],
     seen_urls: set[str],
     *,
     max_samples: int,
-    click_pause_seconds: float,
-    max_carousel_clicks: int | None = None,
-) -> dict[str, Any]:
-    """Capture card jobs from current state, then click carousel until no new job appears.
-
-    Strategy:
-    1) Store currently visible job info for the card.
-    2) Click carousel next.
-    3) Stop when a click yields no new captured jobs and no newly visible ``viewjob`` href.
+) -> int:
+    """
+    Capture card jobs from current state, then click carousel next until no new job appears.
+    Relies on response interception in the main loop to populate job_samples.
     """
     before_card = len(job_samples)
-
-    initial_logs = _ingest_from_performance_logs(
-        driver,
-        job_samples,
-        seen_urls,
-        seen_ids,
-        max_samples,
-    )
-    initial_dom = _fetch_missing_jobs_via_dom(
-        driver,
-        card,
-        job_samples,
-        seen_ids,
-        seen_urls,
-        max_samples,
-    )
+    
+    # Trigger initial capture via DOM nudge
+    _fetch_missing_jobs_via_dom(page, card, job_samples, seen_ids, seen_urls, max_samples)
 
     try:
-        seen_card_hrefs = set(_viewjob_hrefs_in_card(driver, card))
+        seen_card_hrefs = set(_viewjob_hrefs_in_card(page, card))
     except Exception:
         seen_card_hrefs = set()
 
-    click_count = 0
-    stop_reason = ""
-
+    click_count: int = 0
     while len(job_samples) < max_samples:
-        if max_carousel_clicks is not None and click_count >= max_carousel_clicks:
-            stop_reason = "max_carousel_clicks_reached"
+        if click_count >= PHASE2_MAX_CAROUSEL_CLICKS:
             break
 
-        if not _click_carousel_next(driver, card):
-            stop_reason = "next_button_not_clickable"
+        if not _click_carousel_next(page, card):
             break
 
         click_count += 1
-        time.sleep(max(0.0, click_pause_seconds))
+        time.sleep(max(0.0, CAROUSEL_CLICK_DELAY))
 
         before_click = len(job_samples)
-        _ingest_from_performance_logs(
-            driver,
-            job_samples,
-            seen_urls,
-            seen_ids,
-            max_samples,
-        )
-        _fetch_missing_jobs_via_dom(
-            driver,
-            card,
-            job_samples,
-            seen_ids,
-            seen_urls,
-            max_samples,
-        )
+        
+        # Nudge DOM again
+        _fetch_missing_jobs_via_dom(page, card, job_samples, seen_ids, seen_urls, max_samples)
 
         try:
-            current_hrefs = set(_viewjob_hrefs_in_card(driver, card))
+            current_hrefs = set(_viewjob_hrefs_in_card(page, card))
         except Exception:
             current_hrefs = set()
 
@@ -922,45 +595,33 @@ def _collect_jobs_for_card_until_no_new(
         new_jobs_this_click = len(job_samples) - before_click
 
         if new_jobs_this_click <= 0 and not newly_visible_hrefs:
-            stop_reason = "no_new_job_after_click"
             break
 
-    if not stop_reason:
-        if len(job_samples) >= max_samples:
-            stop_reason = "max_samples_reached"
-        else:
-            stop_reason = "completed"
-
-    return {
-        "new_jobs": len(job_samples) - before_card,
-        "clicks": click_count,
-        "visible_hrefs": len(seen_card_hrefs),
-        "initial_new_jobs": initial_logs + initial_dom,
-        "stop_reason": stop_reason,
-    }
+    return len(job_samples) - before_card
 
 
-def _find_card_grid_root(driver: Any) -> tuple[Any | None, list[Any], dict[str, Any]]:
-    candidates = driver.find_elements(By.CSS_SELECTOR, "div[class*='grid-cols-1']")
+def _find_card_grid_root(page: Page) -> tuple[ElementHandle | None, list[ElementHandle], dict[str, Any]]:
+    """
+    Search for the main job results container.
+    Returns (root_element, card_elements, metadata).
+    """
+    candidates = page.query_selector_all("div[class*='grid-cols-1']")
     best_root = None
-    best_cards: list[Any] = []
+    best_cards: list[ElementHandle] = []
     best_score = -1
-    evaluated = 0
+    evaluated: int = 0
 
     for node in candidates:
         try:
-            cls = (node.get_attribute("class") or "").strip()
+            cls = (node.evaluate("el => el.className") or "").strip()
             if "grid" not in cls:
                 continue
 
-            direct_cards = node.find_elements(
-                By.XPATH,
-                "./div[.//a[contains(@href,'/viewjob/')]]",
-            )
+            direct_cards = _grid_children_cards(node)
             if len(direct_cards) < 2:
                 continue
 
-            total_links = len(node.find_elements(By.CSS_SELECTOR, "a[href*='/viewjob/']"))
+            total_links = len(node.query_selector_all("a[href*='/viewjob/']"))
             score = len(direct_cards) * 10 + total_links
             evaluated += 1
             if score > best_score:
@@ -978,7 +639,7 @@ def _find_card_grid_root(driver: Any) -> tuple[Any | None, list[Any], dict[str, 
         }
 
     try:
-        best_cards = _dedupe_card_elements(driver, best_cards)
+        best_cards = _dedupe_card_elements(page, best_cards)
     except Exception:
         pass
 
@@ -990,20 +651,21 @@ def _find_card_grid_root(driver: Any) -> tuple[Any | None, list[Any], dict[str, 
     }
 
 
-def _scroll_to_bottom(driver: Any) -> None:
+def _scroll_to_bottom(page: Page) -> None:
+    """Scroll to the bottom of the page in steps to ensure all content is loaded."""
     last_height = -1
     stable_count = 0
 
     for _ in range(HIRECAFE_PAGINATION_BOTTOM_SCROLL_STEPS):
         try:
-            height = int(driver.execute_script(
-                "return Math.max(document.body.scrollHeight, document.documentElement.scrollHeight);"
-            ) or 0)
+            height = page.evaluate(
+                "Math.max(document.body.scrollHeight, document.documentElement.scrollHeight)"
+            )
         except Exception:
             break
 
         try:
-            driver.execute_script("window.scrollTo(0, arguments[0]);", max(0, height))
+            page.evaluate(f"window.scrollTo(0, {height})")
         except Exception:
             break
 
@@ -1018,186 +680,148 @@ def _scroll_to_bottom(driver: Any) -> None:
         last_height = height
 
 
-def _inspect_pagination_component(driver: Any) -> dict[str, Any]:
+def _inspect_pagination_component(page: Page) -> dict[str, Any]:
     try:
-        data = driver.execute_script(
-            "const norm=(s)=>String(s||'').replace(/\\s+/g,' ').trim();"
-            "const docH=Math.max(document.body.scrollHeight||0,document.documentElement.scrollHeight||0);"
-            "const nodes=[...document.querySelectorAll('nav, footer, div')];"
-            "const cands=[];"
-            "for(const el of nodes){"
-            "  const text=norm(el.innerText);"
-            "  if(!text) continue;"
-            "  const controls=[...el.querySelectorAll('button, a, [role=\"button\"]')];"
-            "  if(controls.length<1) continue;"
-            "  const mapped=controls.map((b,i)=>({"
-            "    index:i,"
-            "    text:norm(b.innerText),"
-            "    aria:norm(b.getAttribute('aria-label')),"
-            "    title:norm(b.getAttribute('title')),"
-            "    className:norm(b.className),"
-            "    tag:(b.tagName||'').toLowerCase(),"
-            "    ariaCurrent:norm(b.getAttribute('aria-current')).toLowerCase(),"
-            "    ariaDisabled:norm(b.getAttribute('aria-disabled')).toLowerCase(),"
-            "    disabled:!!b.disabled||norm(b.getAttribute('aria-disabled')).toLowerCase()==='true'"
-            "  }));"
-            "  const numericButtons=mapped.filter(b=>/^\\d+$/.test(b.text)).length;"
-            "  const hasPage=/page\\s*\\d+\\s*of\\s*\\d+/i.test(text);"
-            "  const hasNext=mapped.some(b=>{const meta=(b.text+' '+b.aria+' '+b.title).toLowerCase();return (meta.includes('next')||meta.includes('→')||meta.includes('›')||meta.includes('»'))&&!meta.includes('dark mode');});"
-            "  const hasPrev=mapped.some(b=>{const meta=(b.text+' '+b.aria+' '+b.title).toLowerCase();return (meta.includes('prev')||meta.includes('previous')||meta.includes('←')||meta.includes('‹')||meta.includes('«'));});"
-            "  const filterChipCopy=/departments|salary|commitment|experience|job titles|benefits|encouraged to apply/i.test(text);"
-            "  const cls=String(el.className||'');"
-            "  const likely=/border-t|bg-gray-50|pagination|justify-center|bottom/i.test(cls);"
-            "  const rect=el.getBoundingClientRect();"
-            "  const absTop=rect.top+window.scrollY;"
-            "  const nearBottom=absTop>(docH*0.45);"
-            "  if(filterChipCopy && !hasPage && numericButtons===0) continue;"
-            "  if(!(hasPage || numericButtons>=2 || (hasNext && numericButtons>=1))) continue;"
-            "  if(!nearBottom && !hasPage && numericButtons<3) continue;"
-            "  const score=(hasPage?120:0)+(nearBottom?40:0)+(numericButtons*8)+(hasNext?25:0)+(hasPrev?10:0)+(likely?10:0)-(filterChipCopy?35:0);"
-            "  cands.push({el:el,text:text,cls:cls,controls:mapped,hasPage:hasPage,score:score,absTop:absTop});"
-            "}"
-            "if(!cands.length)return {found:false};"
-            "cands.sort((a,b)=>(b.score-a.score)||(b.absTop-a.absTop));"
-            "const top=cands[0];"
-            "const root=top.el;"
-            "const controls=[...root.querySelectorAll('button, a, [role=\"button\"]')];"
-            "const buttons=controls.map((b,i)=>({"
-            "  index:i,text:norm(b.innerText),aria:norm(b.getAttribute('aria-label')),title:norm(b.getAttribute('title')),"
-            "  className:norm(b.className),tag:(b.tagName||'').toLowerCase(),"
-            "  ariaCurrent:norm(b.getAttribute('aria-current')).toLowerCase(),"
-            "  ariaDisabled:norm(b.getAttribute('aria-disabled')).toLowerCase(),"
-            "  disabled:!!b.disabled||norm(b.getAttribute('aria-disabled')).toLowerCase()==='true'"
-            "}));"
-            "const m=/page\\s*(\\d+)\\s*of\\s*(\\d+)/i.exec(top.text);"
-            "let currentPage=m?parseInt(m[1],10):null;"
-            "if(currentPage===null){"
-            "  const activeNumeric=buttons.find(b=>/^\\d+$/.test(b.text)&&(b.ariaCurrent==='page'||/active|selected|current/i.test(b.className)));"
-            "  if(activeNumeric) currentPage=parseInt(activeNumeric.text,10);"
-            "}"
-            "let totalPages=m?parseInt(m[2],10):null;"
-            "if(totalPages===null){"
-            "  const nums=buttons.filter(b=>/^\\d+$/.test(b.text)).map(b=>parseInt(b.text,10)).filter(n=>Number.isFinite(n));"
-            "  if(nums.length) totalPages=Math.max(...nums);"
-            "}"
-            "let nextIndex=-1;"
-            "for(const b of buttons){"
-            "  const meta=(b.text+' '+b.aria+' '+b.title).toLowerCase();"
-            "  if((meta.includes('next')||meta.includes('→')||meta.includes('›')||meta.includes('»'))&&!meta.includes('dark mode')){"
-            "    nextIndex=b.index;break;"
-            "  }"
-            "}"
-            "if(nextIndex===-1&&currentPage!==null){"
-            "  const candidates=buttons.filter(b=>!b.disabled&&/^\\d+$/.test(b.text)).map(b=>({i:b.index,n:parseInt(b.text,10)})).filter(x=>x.n>currentPage);"
-            "  if(candidates.length){candidates.sort((a,b)=>a.n-b.n);nextIndex=candidates[0].i;}"
-            "}"
-            "if(nextIndex===-1){"
-            "  const nonNum=buttons.filter(b=>!b.disabled && !/^\\d+$/.test(b.text) && !((b.text+' '+b.aria+' '+b.title).toLowerCase().includes('dark mode')));"
-            "  if(nonNum.length)nextIndex=nonNum[nonNum.length-1].index;"
-            "}"
-            "if(nextIndex===-1){"
-            "  const enabled=buttons.filter(b=>!b.disabled && !((b.text+' '+b.aria+' '+b.title).toLowerCase().includes('dark mode')));"
-            "  if(enabled.length>=2)nextIndex=enabled[enabled.length-1].index;"
-            "}"
-            "return {"
-            "  found:true,"
-            "  text:top.text,"
-            "  className:top.cls,"
-            "  selectedScore:top.score,"
-            "  selectedAbsTop:top.absTop,"
-            "  buttonCount:buttons.length,"
-            "  buttons:buttons,"
-            "  currentPage:currentPage,"
-            "  totalPages:totalPages,"
-            "  nextButtonIndex:nextIndex"
-            "};"
+        data = page.evaluate(
+            """
+            () => {
+                const norm=(s)=>String(s||'').replace(/\\s+/g,' ').trim();
+                const docH=Math.max(document.body.scrollHeight||0,document.documentElement.scrollHeight||0);
+                const nodes=[...document.querySelectorAll('nav, footer, div')];
+                const cands=[];
+                for(const el of nodes){
+                  const text=norm(el.innerText);
+                  if(!text) continue;
+                  const controls=[...el.querySelectorAll('button, a, [role="button"]')];
+                  if(controls.length<1) continue;
+                  const mapped=controls.map((b,i)=>({
+                    index:i,
+                    text:norm(b.innerText),
+                    aria:norm(b.getAttribute('aria-label')),
+                    title:norm(b.getAttribute('title')),
+                    className:norm(b.className),
+                    tag:(b.tagName||'').toLowerCase(),
+                    ariaCurrent:norm(b.getAttribute('aria-current')).toLowerCase(),
+                    ariaDisabled:norm(b.getAttribute('aria-disabled')).toLowerCase(),
+                    disabled:!!b.disabled||norm(b.getAttribute('aria-disabled')).toLowerCase()==='true'
+                  }));
+                  const numericButtons=mapped.filter(b=>/^\\d+$/.test(b.text)).length;
+                  const hasPage=/page\\s*\\d+\\s*of\\s*\\d+/i.test(text);
+                  const hasNext=mapped.some(b=>{const meta=(b.text+' '+b.aria+' '+b.title).toLowerCase();return (meta.includes('next')||meta.includes('→')||meta.includes('›')||meta.includes('»'))&&!meta.includes('dark mode');});
+                  const hasPrev=mapped.some(b=>{const meta=(b.text+' '+b.aria+' '+b.title).toLowerCase();return (meta.includes('prev')||meta.includes('previous')||meta.includes('←')||meta.includes('‹')||meta.includes('«'));});
+                  const filterChipCopy=/departments|salary|commitment|experience|job titles|benefits|encouraged to apply/i.test(text);
+                  const cls=String(el.className||'');
+                  const likely=/border-t|bg-gray-50|pagination|justify-center|bottom/i.test(cls);
+                  const rect=el.getBoundingClientRect();
+                  const absTop=rect.top+window.scrollY;
+                  const nearBottom=absTop>(docH*0.45);
+                  if(filterChipCopy && !hasPage && numericButtons===0) continue;
+                  if(!(hasPage || numericButtons>=2 || (hasNext && numericButtons>=1))) continue;
+                  if(!nearBottom && !hasPage && numericButtons<3) continue;
+                  const score=(hasPage?120:0)+(nearBottom?40:0)+(numericButtons*8)+(hasNext?25:0)+(hasPrev?10:0)+(likely?10:0)-(filterChipCopy?35:0);
+                  cands.push({el:el,text:text,cls:cls,controls:mapped,hasPage:hasPage,score:score,absTop:absTop});
+                }
+                if(!cands.length)return {found:false};
+                cands.sort((a,b)=>(b.score-a.score)||(b.absTop-a.absTop));
+                const top=cands[0];
+                const root=top.el;
+                const controls=[...root.querySelectorAll('button, a, [role="button"]')];
+                const buttons = controls.map((b,i)=>({
+                  index:i,text:norm(b.innerText),aria:norm(b.getAttribute('aria-label')),title:norm(b.getAttribute('title')),
+                  className:norm(b.className),tag:(b.tagName||'').toLowerCase(),
+                  ariaCurrent:norm(b.getAttribute('aria-current')).toLowerCase(),
+                  ariaDisabled:norm(b.getAttribute('aria-disabled')).toLowerCase(),
+                  disabled:!!b.disabled||norm(b.getAttribute('aria-disabled')).toLowerCase()==='true'
+                }));
+                const m=/page\\s*(\\d+)\\s*of\\s*(\\d+)/i.exec(top.text);
+                let currentPage=m?parseInt(m[1],10):null;
+                if(currentPage===null){
+                  const activeNumeric=buttons.find(b=>/^\\d+$/.test(b.text)&&(b.ariaCurrent==='page'||/active|selected|current/i.test(b.className)));
+                  if(activeNumeric) currentPage=parseInt(activeNumeric.text,10);
+                }
+                let totalPages=m?parseInt(m[2],10):null;
+                if(totalPages===null){
+                  const nums=buttons.filter(b=>/^\\d+$/.test(b.text)).map(b=>parseInt(b.text,10)).filter(n=>Number.isFinite(n));
+                  if(nums.length) totalPages=Math.max(...nums);
+                }
+                let nextIndex=-1;
+                for(const b of buttons){
+                  const meta=(b.text+' '+b.aria+' '+b.title).toLowerCase();
+                  if((meta.includes('next')||meta.includes('→')||meta.includes('›')||meta.includes('»'))&&!meta.includes('dark mode')){
+                    nextIndex=b.index;break;
+                  }
+                }
+                if(nextIndex===-1&&currentPage!==null){
+                  const candidates=buttons.filter(b=>!b.disabled&&/^\\d+$/.test(b.text)).map(b=>({i:b.index,n:parseInt(b.text,10)})).filter(x=>x.n>currentPage);
+                  if(candidates.length){candidates.sort((a,b)=>a.n-b.n);nextIndex=candidates[0].i;}
+                }
+                return {
+                  found:true,
+                  text:top.text,
+                  className:top.cls,
+                  selectedScore:top.score,
+                  selectedAbsTop:top.absTop,
+                  buttonCount:buttons.length,
+                  buttons:buttons,
+                  currentPage:currentPage,
+                  totalPages:totalPages,
+                  nextButtonIndex:nextIndex
+                };
+            }
+            """
         )
         return data or {"found": False}
     except Exception as exc:
-        return {"found": False, "error": type(exc).__name__}
+        return {"found": False, "error": str(exc)}
 
 
-def _click_next_pagination(driver: Any) -> dict[str, Any]:
+def _click_next_pagination(page: Page) -> dict[str, Any]:
     try:
-        result = driver.execute_script(
-            "const norm=(s)=>String(s||'').replace(/\\s+/g,' ').trim();"
-            "const docH=Math.max(document.body.scrollHeight||0,document.documentElement.scrollHeight||0);"
-            "const nodes=[...document.querySelectorAll('nav, footer, div')];"
-            "const cands=[];"
-            "for(const el of nodes){"
-            "  const text=norm(el.innerText);"
-            "  if(!text) continue;"
-            "  const controls=[...el.querySelectorAll('button, a, [role=\"button\"]')];"
-            "  if(controls.length<1) continue;"
-            "  const mapped=controls.map((b,i)=>({"
-            "    i:i,text:norm(b.innerText),aria:norm(b.getAttribute('aria-label')),title:norm(b.getAttribute('title')),"
-            "    className:norm(b.className),ariaCurrent:norm(b.getAttribute('aria-current')).toLowerCase(),"
-            "    disabled:!!b.disabled||norm(b.getAttribute('aria-disabled')).toLowerCase()==='true'"
-            "  }));"
-            "  const numericButtons=mapped.filter(b=>/^\\d+$/.test(b.text)).length;"
-            "  const hasPage=/page\\s*\\d+\\s*of\\s*\\d+/i.test(text);"
-            "  const hasNext=mapped.some(b=>{const meta=(b.text+' '+b.aria+' '+b.title).toLowerCase();return (meta.includes('next')||meta.includes('→')||meta.includes('›')||meta.includes('»'))&&!meta.includes('dark mode');});"
-            "  const hasPrev=mapped.some(b=>{const meta=(b.text+' '+b.aria+' '+b.title).toLowerCase();return (meta.includes('prev')||meta.includes('previous')||meta.includes('←')||meta.includes('‹')||meta.includes('«'));});"
-            "  const filterChipCopy=/departments|salary|commitment|experience|job titles|benefits|encouraged to apply/i.test(text);"
-            "  const cls=String(el.className||'');"
-            "  const likely=/border-t|bg-gray-50|pagination|justify-center|bottom/i.test(cls);"
-            "  const rect=el.getBoundingClientRect();"
-            "  const absTop=rect.top+window.scrollY;"
-            "  const nearBottom=absTop>(docH*0.45);"
-            "  if(filterChipCopy && !hasPage && numericButtons===0) continue;"
-            "  if(!(hasPage || numericButtons>=2 || (hasNext && numericButtons>=1))) continue;"
-            "  if(!nearBottom && !hasPage && numericButtons<3) continue;"
-            "  const score=(hasPage?120:0)+(nearBottom?40:0)+(numericButtons*8)+(hasNext?25:0)+(hasPrev?10:0)+(likely?10:0)-(filterChipCopy?35:0);"
-            "  cands.push({el:el,text:text,score:score,absTop:absTop});"
-            "}"
-            "if(!cands.length)return {clicked:false,reason:'pagination_not_found'};"
-            "cands.sort((a,b)=>(b.score-a.score)||(b.absTop-a.absTop));"
-            "const root=cands[0].el;"
-            "const controls=[...root.querySelectorAll('button, a, [role=\"button\"]')];"
-            "if(!controls.length)return {clicked:false,reason:'no_buttons'};"
-            "const mapped=controls.map((b,i)=>({"
-            "  i:i,text:norm(b.innerText),aria:norm(b.getAttribute('aria-label')),title:norm(b.getAttribute('title')),"
-            "  className:norm(b.className),ariaCurrent:norm(b.getAttribute('aria-current')).toLowerCase(),"
-            "  disabled:!!b.disabled||norm(b.getAttribute('aria-disabled')).toLowerCase()==='true'"
-            "}));"
-            "let currentPage=null;"
-            "const activeNumeric=mapped.find(b=>/^\\d+$/.test(b.text)&&(b.ariaCurrent==='page'||/active|selected|current/i.test(b.className)));"
-            "if(activeNumeric) currentPage=parseInt(activeNumeric.text,10);"
-            "let idx=-1;"
-            "for(const b of mapped){"
-            "  const meta=(b.text+' '+b.aria+' '+b.title).toLowerCase();"
-            "  if((meta.includes('next')||meta.includes('→')||meta.includes('›')||meta.includes('»'))&&!meta.includes('dark mode')){idx=b.i;break;}"
-            "}"
-            "if(idx===-1&&currentPage!==null){"
-            "  const candidates=mapped.filter(b=>!b.disabled&&/^\\d+$/.test(b.text)).map(b=>({i:b.i,n:parseInt(b.text,10)})).filter(x=>x.n>currentPage);"
-            "  if(candidates.length){candidates.sort((a,b)=>a.n-b.n);idx=candidates[0].i;}"
-            "}"
-            "if(idx===-1){"
-            "  const nonNum=mapped.filter(b=>!b.disabled && !/^\\d+$/.test(b.text) && !((b.text+' '+b.aria+' '+b.title).toLowerCase().includes('dark mode')));"
-            "  if(nonNum.length)idx=nonNum[nonNum.length-1].i;"
-            "}"
-            "if(idx===-1){"
-            "  const enabled=mapped.filter(b=>!b.disabled && !((b.text+' '+b.aria+' '+b.title).toLowerCase().includes('dark mode')));"
-            "  if(enabled.length>=2)idx=enabled[enabled.length-1].i;"
-            "}"
-            "if(idx===-1)return {clicked:false,reason:'next_button_not_resolved'};"
-            "const btn=controls[idx];"
-            "const isDisabled=!!btn.disabled||btn.getAttribute('aria-disabled')==='true';"
-            "if(isDisabled)return {clicked:false,reason:'next_button_disabled',index:idx};"
-            "try{btn.scrollIntoView({behavior:'auto',block:'center'});}catch(e){}"
-            "btn.click();"
-            "return {clicked:true,index:idx};"
+        # We reuse the logic from _inspect_pagination_component or click directly
+        comp = _inspect_pagination_component(page)
+        if not comp or not comp.get("found"):
+            return {"status": "component_not_found"}
+
+        buttons = comp.get("buttons", [])
+        next_idx = comp.get("nextButtonIndex", -1)
+        
+        if next_idx == -1:
+            return {"status": "next_button_not_found"}
+
+        # Click via JS for reliability
+        clicked = page.evaluate(
+            """
+            (idx) => {
+                const norm=(s)=>String(s||'').replace(/\\s+/g,' ').trim();
+                const nodes=[...document.querySelectorAll('nav, footer, div')];
+                const cands=[];
+                for(const el of nodes){
+                  const text=norm(el.innerText);
+                  if(!text) continue;
+                  const controls=[...el.querySelectorAll('button, a, [role="button"]')];
+                  if(controls.length<1) continue;
+                  if (controls[idx]) {
+                      controls[idx].scrollIntoView({behavior:'auto',block:'center'});
+                      controls[idx].click();
+                      return true;
+                  }
+                }
+                return false;
+            }
+            """,
+            next_idx
         )
-        return result or {"clicked": False, "reason": "unknown"}
+        return {"clicked": True, "index": next_idx} if clicked else {"clicked": False, "reason": "js_click_failed"}
     except Exception as exc:
-        return {"clicked": False, "reason": type(exc).__name__}
+        return {"clicked": False, "reason": "exception", "error": str(exc)}
 
 
-def _page_signature(driver: Any, cards: list[Any]) -> str:
+def _page_signature(page: Page, cards: list[ElementHandle]) -> str:
+    """Generate a stable signature for the current page content to detect transitions."""
     parts: list[str] = []
     for card in cards[:8]:
         try:
-            hrefs = sorted(_viewjob_hrefs_in_card(driver, card))
+            hrefs = sorted(_viewjob_hrefs_in_card(page, card))
             if hrefs:
                 parts.append(hrefs[0])
         except Exception:
@@ -1206,7 +830,7 @@ def _page_signature(driver: Any, cards: list[Any]) -> str:
         return "|".join(parts)
 
     try:
-        pag = _inspect_pagination_component(driver)
+        pag = _inspect_pagination_component(page)
         txt = str(pag.get("text", ""))
         return txt.strip()
     except Exception:
@@ -1214,31 +838,35 @@ def _page_signature(driver: Any, cards: list[Any]) -> str:
 
 
 def _wait_for_page_change(
-    driver: Any,
+    page: Page,
     old_signature: str,
     timeout_seconds: int,
 ) -> tuple[bool, str]:
     deadline = time.time() + max(1, timeout_seconds)
     latest = old_signature
     while time.time() < deadline:
-        root, cards, _ = _find_card_grid_root(driver)
+        root, cards, _ = _find_card_grid_root(page)
         if root:
-            latest = _page_signature(driver, cards)
+            latest = _page_signature(page, cards)
             if latest and latest != old_signature:
                 return True, latest
         time.sleep(0.6)
     return False, latest
 
 
-def _click_card_surface(driver: Any, card: Any) -> bool:
+def _click_card_surface(page: Page, card: ElementHandle) -> bool:
+    """Attempt to click the card surface using JS event dispatch."""
     try:
-        clicked = driver.execute_script(
-            "const card=arguments[0];"
-            "const btn=card.querySelector('button:not([disabled])');"
-            "if(btn){btn.click();return true;}"
-            "card.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window}));"
-            "return true;",
-            card,
+        clicked = page.evaluate(
+            """
+            (card) => {
+                const btn=card.querySelector('button:not([disabled])');
+                if(btn){btn.click();return true;}
+                card.dispatchEvent(new MouseEvent('click',{bubbles:true,cancelable:true,view:window}));
+                return true;
+            }
+            """,
+            card
         )
         return bool(clicked)
     except Exception:
@@ -1250,8 +878,8 @@ def _click_card_surface(driver: Any, card: Any) -> bool:
 
 
 def _process_cards_on_page(
-    driver: Any,
-    cards: list[Any],
+    page: Page,
+    cards: list[ElementHandle],
     job_samples: list[dict[str, Any]],
     seen_urls: set[str],
     seen_ids: set[str],
@@ -1266,7 +894,7 @@ def _process_cards_on_page(
             break
 
         try:
-            if not card.is_displayed():
+            if not card.is_visible():
                 continue
         except Exception:
             continue
@@ -1274,28 +902,23 @@ def _process_cards_on_page(
         processed += 1
 
         try:
-            driver.execute_script(
-                "arguments[0].scrollIntoView({behavior:'auto',block:'center'});",
-                card,
-            )
+            card.scroll_into_view_if_needed()
             time.sleep(0.2)
         except Exception:
             pass
 
-        _click_card_surface(driver, card)
+        _click_card_surface(page, card)
         time.sleep(max(0.0, HIRECAFE_CARD_CLICK_PAUSE_SECONDS))
 
         card_result = _collect_jobs_for_card_until_no_new(
-            driver,
+            page,
             card,
             job_samples,
             seen_ids,
             seen_urls,
             max_samples=max_samples,
-            click_pause_seconds=CAROUSEL_CLICK_DELAY,
-            max_carousel_clicks=PHASE2_MAX_CAROUSEL_CLICKS,
         )
-        page_new_jobs += int(card_result.get("new_jobs", 0))
+        page_new_jobs += card_result
 
     return {
         "cards_seen": len(cards),
@@ -1305,7 +928,7 @@ def _process_cards_on_page(
 
 
 def _scrape_paginated_card_pages(
-    driver: Any,
+    page: Page,
     job_samples: list[dict[str, Any]],
     seen_urls: set[str],
     seen_ids: set[str],
@@ -1313,7 +936,7 @@ def _scrape_paginated_card_pages(
     max_samples: int,
     max_pages: int,
 ) -> int:
-    pages_visited = 0
+    pages_visited: int = 0
     visited_signatures: set[str] = set()
 
     for loop_idx in range(1, max_pages + 1):
@@ -1321,8 +944,8 @@ def _scrape_paginated_card_pages(
             logger.info("hirecafe stop: max_samples reached")
             break
 
-        root, cards, grid_meta = _find_card_grid_root(driver)
-        pagination_meta = _inspect_pagination_component(driver)
+        root, cards, grid_meta = _find_card_grid_root(page)
+        pagination_meta = _inspect_pagination_component(page)
 
         if not root or not cards:
             logger.warning(
@@ -1333,7 +956,7 @@ def _scrape_paginated_card_pages(
             )
             break
 
-        signature = _page_signature(driver, cards)
+        signature = _page_signature(page, cards)
         if signature and signature in visited_signatures:
             logger.info("hirecafe stop: repeated page signature")
             break
@@ -1345,7 +968,7 @@ def _scrape_paginated_card_pages(
 
         before_page = len(job_samples)
         card_metrics = _process_cards_on_page(
-            driver,
+            page,
             cards,
             job_samples,
             seen_urls,
@@ -1372,24 +995,12 @@ def _scrape_paginated_card_pages(
             break
 
         old_signature = signature
-        _scroll_to_bottom(driver)
-        click_next = _click_next_pagination(driver)
+        _scroll_to_bottom(page)
+        click_next = _click_next_pagination(page)
         if not click_next.get("clicked"):
             logger.info(
-                "hirecafe stop: next-page click failed reason=%s",
-                click_next.get("reason"),
-            )
-            break
-
-        changed, new_signature = _wait_for_page_change(
-            driver,
-            old_signature=old_signature,
-            timeout_seconds=HIRECAFE_PAGINATION_WAIT_SECONDS,
-        )
-        if not changed:
-            logger.info(
-                "hirecafe stop: page did not change after next click signature=%s",
-                new_signature,
+                "hirecafe stop: next-page click failed %s",
+                click_next
             )
             break
 
@@ -1398,140 +1009,36 @@ def _scrape_paginated_card_pages(
     return pages_visited
 
 
-def _navigate_to_hirecafe_ready_page(driver: Any, target_url: str) -> None:
+def _navigate_to_hirecafe_ready_page(page: Page, target_url: str) -> None:
     logger.info("hirecafe navigating to url=%s", target_url)
-    driver.get(target_url)
+    page.goto(target_url, wait_until="networkidle")
 
     logger.info("hirecafe waiting %ss for initial load and Cloudflare check", CLOUDFLARE_WAIT_SECONDS)
     time.sleep(max(0, CLOUDFLARE_WAIT_SECONDS))
 
-    initial_challenge = _probe_cloudflare_challenge(driver)
-    logger.info(
-        "hirecafe initial challenge probe active=%s markers=%s selectors=%s url=%s",
-        initial_challenge.get("active"),
-        initial_challenge.get("marker_hits"),
-        initial_challenge.get("selector_hits"),
-        initial_challenge.get("url"),
-    )
-    _capture_observation_artifacts(
-        driver,
-        "initial_landing",
-        {"challenge": initial_challenge, "target_url": target_url},
-    )
+    initial_challenge = _probe_cloudflare_challenge(page)
+    logger.info("hirecafe initial challenge probe active=%s markers=%s url=%s", 
+                initial_challenge.get("active"), initial_challenge.get("marker_hits"), page.url)
+    
+    _capture_observation_artifacts(page, "initial_landing", {"challenge": initial_challenge, "target_url": target_url})
 
     if initial_challenge.get("active"):
-        logger.info("hirecafe detected active Cloudflare challenge")
-        _capture_observation_artifacts(
-            driver,
-            "challenge_detected",
-            {"challenge": initial_challenge},
-        )
-        clicked = False
+        logger.info("hirecafe detected active Cloudflare challenge. Camoufox should handle it, but we can nudge.")
+        _attempt_turnstile_manual_nudge(page)
 
-        try:
-            iframes = driver.find_elements(By.TAG_NAME, "iframe")
-            for iframe in iframes:
-                src = iframe.get_attribute("src")
-                if src and "cloudflare" in src.lower():
-                    logger.info("Found Cloudflare iframe, attempting checkbox click")
-                    driver.switch_to.frame(iframe)
-                    checkbox = WebDriverWait(driver, 5).until(
-                        EC.element_to_be_clickable((By.CSS_SELECTOR, "input[type='checkbox'], .ctp-checkbox-container, .mark"))
-                    )
-                    checkbox.click()
-                    clicked = True
-                    logger.info("Cloudflare checkbox click sent")
-                    break
-        except Exception as exc:
-            logger.info("Cloudflare iframe click unavailable: %s", type(exc).__name__)
-        finally:
-            try:
-                driver.switch_to.default_content()
-            except Exception:
-                pass
-
-        if not clicked:
-            clicked = _click_viewport_coordinate(driver, HARDCODED_CF_CLICK_X, HARDCODED_CF_CLICK_Y)
-            if clicked:
-                logger.info(
-                    "hirecafe sent fallback coordinate click x=%s y=%s",
-                    HARDCODED_CF_CLICK_X,
-                    HARDCODED_CF_CLICK_Y,
-                )
-
-        _capture_observation_artifacts(
-            driver,
-            "challenge_after_click_attempt",
-            {"clicked": clicked},
-        )
-
-        cleared, clear_state = _wait_for_cloudflare_clearance(
-            driver,
-            CLOUDFLARE_CLEAR_TIMEOUT_SECONDS,
-        )
+        cleared, clear_state = _wait_for_cloudflare_clearance(page, CLOUDFLARE_CLEAR_TIMEOUT_SECONDS)
         if cleared:
-            logger.info(
-                "hirecafe cloudflare cleared markers=%s selectors=%s",
-                clear_state.get("marker_hits"),
-                clear_state.get("selector_hits"),
-            )
-            _capture_observation_artifacts(
-                driver,
-                "challenge_cleared",
-                {"challenge": clear_state},
-            )
+            logger.info("hirecafe cloudflare cleared")
         else:
-            logger.warning(
-                "hirecafe cloudflare still active after %ss markers=%s selectors=%s",
-                CLOUDFLARE_CLEAR_TIMEOUT_SECONDS,
-                clear_state.get("marker_hits"),
-                clear_state.get("selector_hits"),
-            )
-            _capture_observation_artifacts(
-                driver,
-                "challenge_uncleared",
-                {"challenge": clear_state},
-            )
-    else:
-        logger.info("hirecafe cloudflare challenge not detected")
+            logger.warning("hirecafe cloudflare still active")
 
-    page_ready, page_state = _wait_for_hiring_cafe_page_ready(
-        driver,
-        HIRECAFE_PAGE_READY_TIMEOUT_SECONDS,
-        HIRECAFE_PAGE_READY_POLL_SECONDS,
-    )
+    page_ready, page_state = _wait_for_hiring_cafe_page_ready(page, HIRECAFE_PAGE_READY_TIMEOUT_SECONDS)
     if page_ready:
-        logger.info(
-            "hirecafe page readiness verified reason=%s ready_state=%s "
-            "next_data=%s next_root=%s viewjob_link=%s",
-            page_state.get("reason"),
-            page_state.get("ready_state"),
-            page_state.get("has_next_data"),
-            page_state.get("has_next_root"),
-            page_state.get("has_viewjob_link"),
-        )
-        _capture_observation_artifacts(
-            driver,
-            "post_challenge_page_ready",
-            {"page_state": page_state},
-        )
+        logger.info("hirecafe page readiness verified")
         if POST_VERIFY_WAIT_SECONDS > 0:
-            logger.info(
-                "hirecafe post-ready wait %ss before scraping",
-                POST_VERIFY_WAIT_SECONDS,
-            )
-            time.sleep(max(0, POST_VERIFY_WAIT_SECONDS))
+            time.sleep(POST_VERIFY_WAIT_SECONDS)
     else:
-        logger.warning(
-            "hirecafe page readiness not verified within %ss reason=%s",
-            HIRECAFE_PAGE_READY_TIMEOUT_SECONDS,
-            page_state.get("reason"),
-        )
-        _capture_observation_artifacts(
-            driver,
-            "post_challenge_page_not_ready",
-            {"page_state": page_state},
-        )
+        logger.warning("hirecafe page readiness not verified: %s", page_state.get("reason"))
 
 
 def scrape_hirecafe_jobs(
@@ -1540,51 +1047,56 @@ def scrape_hirecafe_jobs(
     max_pages: int | None = None,
 ) -> list[dict[str, Any]]:
     """
-    Launch Chrome, navigate to a HireCafe search URL, then scrape jobs from the
-    paginated card list by visiting pages and expanding card carousels.
-
-    Returns a list of raw response dicts (each has ``pageProps.job``).
+    Launch Camoufox, navigate to a HireCafe search URL, then scrape jobs.
+    Uses Playwright response interception for data capture.
     """
     target_url = (search_url or "").strip() or HIRECAFE_SEARCH_URL
     page_limit = max_pages if max_pages is not None else HIRECAFE_MAX_PAGES
     page_limit = max(1, int(page_limit))
 
-    logger.info(
-        "hirecafe launching browser mode=%s max_samples=%s max_pages=%s url=%s",
-        HIRECAFE_BROWSER_MODE,
-        max_samples,
-        page_limit,
-        target_url,
-    )
-    driver = _launch_hirecafe_driver()
+    job_samples: list[dict[str, Any]] = []
+    seen_urls: set[str] = set()
+    seen_ids: set[str] = set()
 
-    try:
-        _navigate_to_hirecafe_ready_page(driver, target_url)
+    with Camoufox(headless=HIRECAFE_BROWSER_MODE == "headless") as browser:
+        page = browser.new_page()
+        
+        # Intercept job JSON data
+        def on_response(response: Response):
+            url = response.url
+            if "viewjob/" in url and ".json" in url and response.status == 200:
+                if url not in seen_urls:
+                    try:
+                        data = response.json()
+                        jid = _extract_viewjob_id(url)
+                        if jid and jid not in seen_ids:
+                            job_samples.append(data)
+                            seen_urls.add(url)
+                            seen_ids.add(jid)
+                            logger.debug("Captured job: %s", jid)
+                    except Exception:
+                        pass
 
-        job_samples: list[dict[str, Any]] = []
-        seen_urls: set[str] = set()
-        seen_ids: set[str] = set()
+        page.on("response", on_response)
 
-        pages_visited = _scrape_paginated_card_pages(
-            driver,
-            job_samples,
-            seen_urls,
-            seen_ids,
-            max_samples=max_samples,
-            max_pages=page_limit,
-        )
-
-        logger.info(
-            "hirecafe scrape complete: pages_visited=%s total=%s jobs",
-            pages_visited,
-            len(job_samples),
-        )
-        return job_samples
-    finally:
         try:
-            driver.quit()
-        except Exception:
-            pass
+            _navigate_to_hirecafe_ready_page(page, target_url)
+            
+            pages_visited = _scrape_paginated_card_pages(
+                page,
+                job_samples,
+                seen_urls,
+                seen_ids,
+                max_samples=max_samples,
+                max_pages=page_limit,
+            )
+
+            logger.info("hirecafe scrape complete: pages_visited=%s total=%s jobs",
+                        pages_visited, len(job_samples))
+            return job_samples
+        except Exception as e:
+            logger.error("Scrape failed: %s", e, exc_info=True)
+            return job_samples
 
 
 def _strip_html(value: str) -> str:

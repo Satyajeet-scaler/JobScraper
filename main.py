@@ -698,14 +698,14 @@ def _role_scrape_sources_for_current_slot() -> list[str]:
     hirecafe_enabled = os.getenv("ROLE_PIPELINE_HIRECAFE_ENABLED", "false").lower() in ("1", "true", "yes")
 
     # First scrape cron slot (07:30) runs every major source.
-    # 10:30, 13:30 and 16:30 slots use jobspy and wellfound only.
+    # 10:30, 13:30 and 16:30 slots use jobspy and hirist only.
     if current_hour == 7:
         sources = ["jobspy", "naukri", "wellfound", "hirist"]
         if hirecafe_enabled:
             sources.append("hirecafe")
         return sources
 
-    return ["jobspy", "wellfound"]
+    return ["jobspy", "hirist"]
 
 
 def _run_recruiter_info_from_scheduler() -> None:

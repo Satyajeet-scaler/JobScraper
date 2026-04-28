@@ -1,30 +1,30 @@
 import logging
-import re
+import os
 import traceback
 import uuid
 from datetime import date
 from time import perf_counter
 from typing import Any
 
-from gspread.exceptions import APIError
-
 from services.apify_linkedin_posts import normalize_linkedin_post_item, scrape_linkedin_posts
-from services.google_sheets import GoogleSheetsWriter
-from services.handover_owners import worksheet_row_dicts
+from services.mysql_linkedin_posts_store import (
+    count_unclassified_linkedin_posts,
+    fetch_unclassified_linkedin_posts,
+    mark_linkedin_posts_classify_done,
+    upsert_linkedin_post,
+    upsert_linkedin_post_relevance,
+)
 from services.linkedin_posts_pipeline import (
     _build_actor_input,
     _classify_relevant_posts,
     _collect_source_columns,
     _dedupe_linkedin_relevant_rows,
-    _write_linkedin_posts_relevant_only,
-    _write_linkedin_posts_scraped_only,
 )
 
 logger = logging.getLogger(__name__)
 
 LINKEDIN_POSTS_SCRAPE_ONLY_RUN_METRICS: dict[str, dict[str, Any]] = {}
 LINKEDIN_POSTS_CLASSIFY_ONLY_RUN_METRICS: dict[str, dict[str, Any]] = {}
-_SCRAPED_TAB_RE = re.compile(r"^linkedin_posts_scraped_(\d{4}-\d{2}-\d{2})$")
 
 
 def run_linkedin_posts_scrape_only(run_id: str | None = None, run_date: str | None = None) -> dict[str, Any]:
@@ -41,15 +41,27 @@ def run_linkedin_posts_scrape_only(run_id: str | None = None, run_date: str | No
         raw_rows = scrape_linkedin_posts(actor_input)
         source_columns = _collect_source_columns(raw_rows)
         normalized = [normalize_linkedin_post_item(row) for row in raw_rows]
-        _write_linkedin_posts_scraped_only(run_date=resolved_run_date, scraped_rows=normalized)
+
+        count = 0
+        for row in normalized:
+            try:
+                upsert_linkedin_post(row)
+                count += 1
+            except Exception as exc:
+                logger.warning(
+                    "linkedin-posts-scrape-only[%s] mysql upsert failed url=%s err=%s",
+                    pipeline_run_id,
+                    row.get("post_url"),
+                    exc,
+                )
 
         metrics = {
             "run_id": pipeline_run_id,
             "status": "completed",
             "run_date": resolved_run_date,
             "scraped_count": len(normalized),
+            "mysql_upserted_count": count,
             "source_columns": source_columns,
-            "scraped_tab": f"linkedin_posts_scraped_{resolved_run_date}",
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         LINKEDIN_POSTS_SCRAPE_ONLY_RUN_METRICS[pipeline_run_id] = metrics
@@ -64,15 +76,7 @@ def run_linkedin_posts_scrape_only(run_id: str | None = None, run_date: str | No
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         LINKEDIN_POSTS_SCRAPE_ONLY_RUN_METRICS[pipeline_run_id] = metrics
-        if isinstance(exc, APIError):
-            logger.exception(
-                "linkedin-posts-scrape-only[%s] failed: Google Sheets API error while writing "
-                "(Apify scrape may have completed). %s",
-                pipeline_run_id,
-                exc,
-            )
-        else:
-            logger.exception("linkedin-posts-scrape-only[%s] failed: %s", pipeline_run_id, exc)
+        logger.exception("linkedin-posts-scrape-only[%s] failed: %s", pipeline_run_id, exc)
         raise
 
 
@@ -86,19 +90,92 @@ def run_linkedin_posts_classify_only(run_id: str | None = None, run_date: str | 
         "run_date": resolved_run_date,
     }
     try:
-        scraped_rows = _read_scraped_rows(resolved_run_date)
-        relevant_rows, classification_errors = _classify_relevant_posts(scraped_rows)
-        relevant_rows_deduped = _dedupe_linkedin_relevant_rows(relevant_rows)
-        _write_linkedin_posts_relevant_only(run_date=resolved_run_date, relevant_rows=relevant_rows_deduped)
+        batch_size = max(1, int(os.getenv("LINKEDIN_POSTS_CLASSIFY_BATCH_SIZE", "30")))
+
+        total_unclassified = count_unclassified_linkedin_posts(
+            requested_role="",
+            run_date=resolved_run_date,
+        )
+        estimated_batches = (total_unclassified + batch_size - 1) // batch_size
+        logger.info(
+            "linkedin-posts-classify-only[%s] starting classify for run_date=%s, total_unclassified=%d, estimated_batches=%d",
+            pipeline_run_id,
+            resolved_run_date,
+            total_unclassified,
+            estimated_batches,
+        )
+
+        total_classified = 0
+        total_relevant = 0
+        total_errors = 0
+        total_mysql_relevance = 0
+        batch_seq = 0
+
+        while True:
+            scraped_rows = fetch_unclassified_linkedin_posts(
+                requested_role="",
+                run_date=resolved_run_date,
+                limit=batch_size,
+            )
+            if not scraped_rows:
+                break
+
+            batch_seq += 1
+
+            relevant_rows, classification_errors = _classify_relevant_posts(scraped_rows)
+            total_errors += classification_errors
+            relevant_rows_deduped = _dedupe_linkedin_relevant_rows(relevant_rows)
+
+            rel_count = 0
+            for row in relevant_rows_deduped:
+                row["classify_run_id"] = pipeline_run_id
+                row["classify_run_seq"] = batch_seq
+                try:
+                    upsert_linkedin_post_relevance(row)
+                    rel_count += 1
+                except Exception as exc:
+                    logger.warning(
+                        "linkedin-posts-classify-only[%s] mysql relevance upsert failed url=%s err=%s",
+                        pipeline_run_id,
+                        row.get("post_url"),
+                        exc,
+                    )
+
+            post_ids = [int(r.get("id") or 0) for r in scraped_rows if int(r.get("id") or 0) > 0]
+            if post_ids:
+                mark_linkedin_posts_classify_done(post_ids=post_ids)
+
+            total_classified += len(scraped_rows)
+            total_relevant += len(relevant_rows_deduped)
+            total_mysql_relevance += rel_count
+
+            logger.info(
+                "linkedin-posts-classify-only[%s] batch=%d/%d classified=%d, relevance_saved=%d, relevant_found=%d",
+                pipeline_run_id,
+                batch_seq,
+                estimated_batches,
+                len(scraped_rows),
+                rel_count,
+                len(relevant_rows_deduped),
+            )
+
+        logger.info(
+            "linkedin-posts-classify-only[%s] classify complete: total_classified=%d, total_relevant=%d, total_errors=%d",
+            pipeline_run_id,
+            total_classified,
+            total_relevant,
+            total_errors,
+        )
+
         metrics = {
             "run_id": pipeline_run_id,
             "status": "completed",
             "run_date": resolved_run_date,
-            "scraped_input_count": len(scraped_rows),
-            "relevant_count": len(relevant_rows_deduped),
-            "classification_errors": classification_errors,
-            "source_scraped_tab": f"linkedin_posts_scraped_{resolved_run_date}",
-            "relevant_tab": f"linkedin_posts_relevant_{resolved_run_date}",
+            "classify_batches": batch_seq,
+            "scraped_input_count": total_classified,
+            "relevant_count": total_relevant,
+            "mysql_relevance_upserted_count": total_mysql_relevance,
+            "classification_errors": total_errors,
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         LINKEDIN_POSTS_CLASSIFY_ONLY_RUN_METRICS[pipeline_run_id] = metrics
@@ -121,48 +198,20 @@ def _resolve_scraped_run_date(run_date: str | None) -> str:
     if run_date and run_date.strip():
         return run_date.strip()
     today = date.today().isoformat()
-    titles = _list_worksheet_titles()
-    today_tab = f"linkedin_posts_scraped_{today}"
-    if today_tab in titles:
-        return today
-    latest = _latest_scraped_tab_date(titles)
+    from services.mysql_linkedin_posts_store import _db
+    sql = """
+    SELECT MAX(run_date) AS latest_run_date
+    FROM linkedin_posts
+    WHERE requested_role = ''
+    """
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql)
+            row = cur.fetchone() or {}
+    latest = str((row or {}).get("latest_run_date") or "").strip()
     if latest:
         return latest
-    raise RuntimeError("No linkedin_posts_scraped_{date} worksheet found to classify.")
-
-
-def _list_worksheet_titles() -> list[str]:
-    writer = _get_writer()
-    return [ws.title for ws in writer.list_worksheets()]
-
-
-def _latest_scraped_tab_date(titles: list[str]) -> str | None:
-    dates: list[str] = []
-    for title in titles:
-        match = _SCRAPED_TAB_RE.match(title)
-        if match:
-            dates.append(match.group(1))
-    return max(dates) if dates else None
-
-
-def _read_scraped_rows(run_date: str) -> list[dict[str, Any]]:
-    writer = _get_writer()
-    tab = f"linkedin_posts_scraped_{run_date}"
-    worksheet = writer.open_worksheet(tab)
-    raw = writer.worksheet_get_all_values(worksheet, f"linkedin_posts_scraped_read:{tab}:get_all_values")
-    rows = worksheet_row_dicts(raw)
-    if not rows:
-        raise RuntimeError(f"No rows found in worksheet {tab}.")
-    return [dict(r) for r in rows]
-
-
-def _get_writer() -> GoogleSheetsWriter:
-    import os
-
-    spreadsheet_id = (os.getenv("GOOGLE_SPREADSHEET_ID") or "").strip()
-    if not spreadsheet_id:
-        raise RuntimeError("GOOGLE_SPREADSHEET_ID is required.")
-    return GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
+    raise RuntimeError("No linkedin_posts rows found in MySQL to classify.")
 
 
 def get_linkedin_posts_scrape_only_metrics(run_id: str) -> dict[str, Any] | None:

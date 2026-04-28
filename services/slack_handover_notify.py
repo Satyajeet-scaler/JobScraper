@@ -145,11 +145,6 @@ def load_recruiter_rows_split_for_handover(
     return filtered, case3
 
 
-def linkedin_posts_relevant_tab_name(run_date: str) -> str:
-    """Tab name for relevant LinkedIn posts (matches ``LINKEDIN_POSTS_RELEVANT_TAB_TEMPLATE``)."""
-    return os.getenv("LINKEDIN_POSTS_RELEVANT_TAB_TEMPLATE", "linkedin_posts_relevant_{date}").format(
-        date=run_date
-    )
 
 
 def candidate_match_tab_name(run_date: str) -> str:
@@ -276,21 +271,15 @@ def load_candidate_match_count_map_for_role(*, role: str, run_date: str) -> dict
     return out
 
 
-def load_linkedin_relevant_posts_from_sheet(run_date: str) -> list[dict[str, Any]]:
-    """Read ``linkedin_posts_relevant_{run_date}`` tab."""
-    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
-    if not spreadsheet_id:
-        return []
-    tab = linkedin_posts_relevant_tab_name(run_date)
+def load_linkedin_relevant_posts(run_date: str) -> list[dict[str, Any]]:
+    """Fetch relevant + unsent LinkedIn posts for handover from MySQL."""
+    from services.mysql_linkedin_posts_store import fetch_unsent_relevant_linkedin_posts_for_run_date
     try:
-        writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-        ws = writer.open_worksheet(tab)
-        raw = writer.worksheet_get_all_values(ws, f"slack_handover_linkedin_relevant:{tab}:get_all_values")
-        rows = worksheet_row_dicts(raw)
-        logger.info("loaded %s relevant linkedin posts from sheet %s", len(rows), tab)
-        return list(rows)
+        rows = fetch_unsent_relevant_linkedin_posts_for_run_date(run_date)
+        logger.info("loaded %s relevant linkedin posts from mysql", len(rows))
+        return rows
     except Exception as exc:
-        logger.warning("failed to load relevant linkedin posts sheet=%s err=%s", tab, exc)
+        logger.warning("failed to fetch relevant linkedin posts from mysql err=%s", exc)
         return []
 
 
@@ -339,9 +328,10 @@ def send_linkedin_post_handover_messages(
     *,
     run_date: str | None = None,
     defaults: SlackNotifyDefaults | None = None,
-    persist_assigned_owner_tab: str | None = None,
 ) -> int:
     """Heading + per-post messages (owners round-robin or Unassigned). Returns POST count."""
+    from services.mysql_linkedin_posts_store import mark_linkedin_post_handover_sent
+
     d = defaults or slack_notify_defaults_from_env()
     if not d.webhook_url:
         logger.info("linkedin-posts slack skipped: SLACK_WEBHOOK_URL not configured")
@@ -363,11 +353,6 @@ def send_linkedin_post_handover_messages(
     sent += 1
 
     if owner_rows_opt:
-        _persist_linkedin_posts_assigned_owner(
-            run_date=run_date,
-            owner_rows=owner_rows_opt,
-            worksheet_title=persist_assigned_owner_tab,
-        )
         owner_buckets: dict[int, list[dict[str, Any]]] = {i: [] for i in range(len(owner_rows_opt))}
         for idx, row in enumerate(relevant_rows):
             owner_buckets[idx % len(owner_rows_opt)].append(row)
@@ -376,19 +361,26 @@ def send_linkedin_post_handover_messages(
             if not bucket:
                 continue
             owner_tag = owner_tag_for_handover(owner)
+            owner_name = (owner.get("owner_name") or "").strip()
             for row in bucket:
+                post_id = int(row.get("linkedin_post_id") or row.get("id") or 0)
                 author = slack_author_from_row(row)
                 url = slack_post_url_from_row(row)
                 msg = format_linkedin_post_lead(owner_tag, url, author)
                 if send_slack_text(msg, defaults=d, sleep_after=1.0):
                     sent += 1
+                    if post_id > 0:
+                        mark_linkedin_post_handover_sent(post_id, owner_name)
     else:
         for row in relevant_rows:
+            post_id = int(row.get("linkedin_post_id") or row.get("id") or 0)
             author = slack_author_from_row(row)
             url = slack_post_url_from_row(row)
             msg = format_linkedin_post_lead("*Unassigned*", url, author)
             if send_slack_text(msg, defaults=d, sleep_after=1.0):
                 sent += 1
+                if post_id > 0:
+                    mark_linkedin_post_handover_sent(post_id, "")
 
     logger.info("linkedin-posts handover sent %s slack messages", sent)
     return sent
@@ -453,7 +445,7 @@ def send_handover_notifications(
         )
 
     if send_linkedin_post:
-        linkedin_rows = load_linkedin_relevant_posts_from_sheet(rd)
+        linkedin_rows = load_linkedin_relevant_posts(rd)
         result["linkedin_post_leads"] = len(linkedin_rows)
         result["linkedin_messages_sent"] = send_linkedin_post_handover_messages(
             linkedin_rows, run_date=rd, defaults=defaults
@@ -640,30 +632,6 @@ def _persist_recruiter_detail_assigned_owner(
         if row_run_date and row_run_date != run_date:
             return False
         return bool((row.get("recruiter_profile_url") or "").strip())
-
-    _persist_assigned_owner_column(
-        spreadsheet_id=spreadsheet_id,
-        worksheet_title=tab,
-        owner_rows=owner_rows,
-        selector=selector,
-    )
-
-
-def _persist_linkedin_posts_assigned_owner(
-    *,
-    run_date: str | None,
-    owner_rows: list[dict[str, str]],
-    worksheet_title: str | None = None,
-) -> None:
-    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
-    if not spreadsheet_id or not owner_rows:
-        return
-    rd = (run_date or date.today().isoformat()).strip()
-    tab = worksheet_title or linkedin_posts_relevant_tab_name(rd)
-
-    def selector(row: dict[str, str]) -> bool:
-        row_run_date = (row.get("run_date") or "").strip()
-        return not row_run_date or row_run_date == rd
 
     _persist_assigned_owner_column(
         spreadsheet_id=spreadsheet_id,

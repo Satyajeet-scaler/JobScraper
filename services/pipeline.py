@@ -24,7 +24,7 @@ from services.handover_owners import worksheet_row_dicts
 from services.linkedin_recruiter.sheets_pipeline import write_linkedin_recruiters_for_relevant_jobs
 from services.linkedin_posts_pipeline import run_linkedin_posts_pipeline, post_linkedin_posts_slack_handover
 from services.slack_handover_notify import (
-    load_linkedin_relevant_posts_from_sheet,
+    load_linkedin_relevant_posts,
     send_handover_notifications,
     send_slack_text,
 )
@@ -148,8 +148,6 @@ def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
             try:
                 post_linkedin_posts_slack_handover(
                     run_date=run_date,
-                    scraped_rows=[],
-                    relevant_rows=_load_relevant_linkedin_posts_from_sheet(run_date),
                 )
             except Exception as exc:
                 logger.warning(
@@ -1245,9 +1243,9 @@ def _post_recruiter_handover_notifications(run_date: str) -> int:
     return sent
 
 
-def _load_relevant_linkedin_posts_from_sheet(run_date: str) -> list[dict[str, Any]]:
-    """Read linkedin_posts_relevant_{date} tab to get rows for Slack handover."""
-    return load_linkedin_relevant_posts_from_sheet(run_date)
+def _load_relevant_linkedin_posts_from_db(run_date: str) -> list[dict[str, Any]]:
+    """Fetch relevant linkedin posts from MySQL for Slack handover."""
+    return load_linkedin_relevant_posts(run_date)
 
 
 def _get_recruiter_handover_case_counts(run_date: str) -> int:

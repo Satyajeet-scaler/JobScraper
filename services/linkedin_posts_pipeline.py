@@ -17,8 +17,15 @@ from services.description_text_parts import (
     combine_three_part_text,
     read_positive_int_env,
 )
-from services.google_sheets import GoogleSheetsWriter
-from services.slack_handover_notify import send_linkedin_post_handover_messages, slack_notify_defaults_from_env
+from services.mysql_linkedin_posts_store import (
+    upsert_linkedin_post,
+    upsert_linkedin_post_relevance,
+)
+from services.slack_handover_notify import (
+    load_linkedin_relevant_posts,
+    send_linkedin_post_handover_messages,
+    slack_notify_defaults_from_env,
+)
 
 try:
     import google.generativeai as genai
@@ -77,17 +84,18 @@ def run_linkedin_posts_pipeline(
             len(relevant_rows),
             classification_errors,
         )
-        _write_linkedin_posts_sheets(run_date=run_date, scraped_rows=normalized, relevant_rows=relevant_rows)
+
+        # Upsert scraped rows to MySQL
+        _upsert_scraped_rows_to_mysql(normalized)
+
+        # Upsert relevant rows to MySQL
+        _upsert_relevant_rows_to_mysql(relevant_rows)
 
         if send_slack:
             try:
-                post_linkedin_posts_slack_handover(
-                    run_date=run_date,
-                    scraped_rows=normalized,
-                    relevant_rows=relevant_rows,
-                )
+                post_linkedin_posts_slack_handover(run_date=run_date)
             except Exception as exc:
-                logger.warning("linkedin-posts slack notification failed (sheets already written): %s", exc)
+                logger.warning("linkedin-posts slack notification failed (mysql already written): %s", exc)
 
         metrics = {
             "run_id": pipeline_run_id,
@@ -393,69 +401,32 @@ def _classify_single_post(
     }
 
 
-def _write_linkedin_posts_sheets(
-    run_date: str,
-    scraped_rows: list[dict[str, Any]],
-    relevant_rows: list[dict[str, Any]],
-) -> None:
-    _write_linkedin_posts_scraped_only(run_date=run_date, scraped_rows=scraped_rows)
-    _write_linkedin_posts_relevant_only(run_date=run_date, relevant_rows=relevant_rows)
-
-
-def _write_linkedin_posts_scraped_only(
-    run_date: str,
-    scraped_rows: list[dict[str, Any]],
-) -> None:
-    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
-    if not spreadsheet_id:
-        raise RuntimeError("GOOGLE_SPREADSHEET_ID is required for LinkedIn posts pipeline.")
-
-    writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-    chunk_size = max(1, int(os.getenv("GOOGLE_SHEETS_WRITE_CHUNK_SIZE", "200")))
-    scraped_tab = os.getenv("LINKEDIN_POSTS_SCRAPED_TAB_TEMPLATE", "linkedin_posts_scraped_{date}").format(date=run_date)
-    rows_with_run_date = _with_run_date(scraped_rows, run_date)
-    rows_for_sheet, overflow_rows, overflow_chars = apply_three_part_text_columns(rows_with_run_date, "post_text")
-    if overflow_rows:
-        logger.warning(
-            "post_text split truncated rows=%s overflow_chars=%s tab=%s",
-            overflow_rows,
-            overflow_chars,
-            scraped_tab,
-        )
-    writer.write_rows(scraped_tab, rows_for_sheet, chunk_size=chunk_size)
-
-
-def _write_linkedin_posts_relevant_only(
-    run_date: str,
-    relevant_rows: list[dict[str, Any]],
-) -> None:
-    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
-    if not spreadsheet_id:
-        raise RuntimeError("GOOGLE_SPREADSHEET_ID is required for LinkedIn posts pipeline.")
-
-    writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-    chunk_size = max(1, int(os.getenv("GOOGLE_SHEETS_WRITE_CHUNK_SIZE", "200")))
-    relevant_tab = os.getenv("LINKEDIN_POSTS_RELEVANT_TAB_TEMPLATE", "linkedin_posts_relevant_{date}").format(date=run_date)
-    deduped_relevant_rows = _dedupe_linkedin_relevant_rows(relevant_rows)
-    rows_with_run_date = _with_run_date(deduped_relevant_rows, run_date)
-    rows_for_sheet, overflow_rows, overflow_chars = apply_three_part_text_columns(rows_with_run_date, "post_text")
-    if overflow_rows:
-        logger.warning(
-            "post_text split truncated rows=%s overflow_chars=%s tab=%s",
-            overflow_rows,
-            overflow_chars,
-            relevant_tab,
-        )
-    writer.write_rows(relevant_tab, rows_for_sheet, chunk_size=chunk_size)
-
-
-def _with_run_date(rows: list[dict[str, Any]], run_date: str) -> list[dict[str, Any]]:
-    output: list[dict[str, Any]] = []
+def _upsert_scraped_rows_to_mysql(rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    count = 0
     for row in rows:
-        copy = dict(row)
-        copy["run_date"] = run_date
-        output.append(copy)
-    return output
+        try:
+            post_id = upsert_linkedin_post(row)
+            if post_id:
+                row["id"] = post_id
+                count += 1
+        except Exception as exc:
+            logger.warning("linkedin-posts mysql upsert (scraped) failed for row url=%s err=%s", row.get("post_url"), exc)
+    logger.info("linkedin-posts mysql upsert (scraped) success count=%d/%d", count, len(rows))
+
+
+def _upsert_relevant_rows_to_mysql(rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        return
+    count = 0
+    for row in rows:
+        try:
+            upsert_linkedin_post_relevance(row)
+            count += 1
+        except Exception as exc:
+            logger.warning("linkedin-posts mysql upsert (relevance) failed for row url=%s err=%s", row.get("post_url"), exc)
+    logger.info("linkedin-posts mysql upsert (relevance) success count=%d/%d", count, len(rows))
 
 
 def _dedupe_linkedin_relevant_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -802,14 +773,13 @@ Return ONLY valid JSON (no markdown, no prose):
 
 def post_linkedin_posts_slack_handover(
     run_date: str,
-    scraped_rows: list[dict[str, Any]],
-    relevant_rows: list[dict[str, Any]],
 ) -> None:
     """Send LinkedIn posts handover to Slack, grouped by owner.
 
     Public so the daily pipeline can call it after all other case messages finish.
     """
-    logger.info("linkedin-posts slack handover scraped=%s relevant=%s", len(scraped_rows), len(relevant_rows))
+    relevant_rows = load_linkedin_relevant_posts(run_date)
+    logger.info("linkedin-posts slack handover relevant=%s", len(relevant_rows))
     send_linkedin_post_handover_messages(
         relevant_rows,
         run_date=run_date,

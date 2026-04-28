@@ -96,6 +96,8 @@ def normalize_linkedin_post_item(item: dict[str, Any]) -> dict[str, Any]:
         "posted_at": _first_non_empty(item, ["postedAt", "createdAt", "timestamp", "date"]),
         "author_name": author_name,
         "author_profile_url": author_profile_url,
+        "author_info": _first_non_empty_deep(item, ["author.info"]),
+        "author_type": _first_non_empty_deep(item, ["author.type"]) or _first_non_empty(item, ["authorType", "type"]),
         "company": company,
         "job_title_hint": _first_non_empty(item, ["title", "jobTitle", "headline"]),
         "likes_count": _first_non_empty(item, ["likesCount", "numLikes", "reactionsCount"]),

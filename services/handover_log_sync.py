@@ -9,10 +9,8 @@ from typing import Any
 from services.google_sheets import GoogleSheetsWriter
 from services.handover_owners import worksheet_row_dicts
 from services.linkedin_posts_slack_row import slack_post_url_from_row
-from services.slack_handover_notify import (
-    linkedin_posts_relevant_tab_name,
-    load_recruiter_rows_split_for_handover,
-)
+from services.mysql_linkedin_posts_store import fetch_all_relevant_linkedin_posts
+from services.slack_handover_notify import load_recruiter_rows_split_for_handover
 
 logger = logging.getLogger(__name__)
 
@@ -29,19 +27,12 @@ HANDOVER_LOG_HEADER: list[str] = [
 
 
 def _load_linkedin_relevant_rows(run_date: str) -> list[dict[str, Any]]:
-    spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
-    if not spreadsheet_id:
-        return []
-    tab = linkedin_posts_relevant_tab_name(run_date)
     try:
-        writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-        ws = writer.open_worksheet(tab)
-        raw = writer.worksheet_get_all_values(ws, f"handover_log_sync:{tab}:get_all_values")
-        rows = worksheet_row_dicts(raw)
-        logger.info("handover_log_sync loaded %s linkedin relevant rows from %s", len(rows), tab)
-        return list(rows)
+        rows = fetch_all_relevant_linkedin_posts(run_date)
+        logger.info("handover_log_sync loaded %s linkedin relevant rows from mysql", len(rows))
+        return rows
     except Exception as exc:
-        logger.warning("handover_log_sync linkedin tab unavailable tab=%s err=%s", tab, exc)
+        logger.warning("handover_log_sync linkedin mysql fetch failed err=%s", exc)
         return []
 
 

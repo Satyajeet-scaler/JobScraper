@@ -371,7 +371,6 @@ def _role_linkedin_posts_classify_work(run_id: str, run_date: str, role: str) ->
         run_id=run_id,
         run_date=run_date,
         role=role,
-        post_classify_notify_enabled=False,
     )
 
 

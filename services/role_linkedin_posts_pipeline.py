@@ -170,6 +170,20 @@ def run_role_linkedin_posts_classify_only(
         batch_size = max(1, int(os.getenv("ROLE_LINKEDIN_POSTS_CLASSIFY_BATCH_SIZE", "30")))
         run_date_obj = date.fromisoformat(resolved_run_date)
 
+        total_unclassified = count_unclassified_linkedin_posts(
+            requested_role=resolved_role,
+            run_date=run_date_obj,
+        )
+        estimated_batches = (total_unclassified + batch_size - 1) // batch_size
+        logger.info(
+            "role-linkedin-posts-classify-only[%s] starting classify for role=%s, run_date=%s, total_unclassified=%d, estimated_batches=%d",
+            pipeline_run_id,
+            resolved_role,
+            resolved_run_date,
+            total_unclassified,
+            estimated_batches,
+        )
+
         total_classified = 0
         total_relevant = 0
         total_errors = 0
@@ -186,12 +200,6 @@ def run_role_linkedin_posts_classify_only(
                 break
 
             batch_seq += 1
-            logger.info(
-                "role-linkedin-posts-classify-only[%s] batch=%d input=%d",
-                pipeline_run_id,
-                batch_seq,
-                len(classify_input_rows),
-            )
 
             relevant_rows, classification_errors = _classify_relevant_posts_for_role_pipeline(
                 classify_input_rows,
@@ -224,6 +232,24 @@ def run_role_linkedin_posts_classify_only(
             total_relevant += len(relevant_rows)
             total_mysql_relevance += rel_count
 
+            logger.info(
+                "role-linkedin-posts-classify-only[%s] batch=%d/%d classified=%d, relevance_saved=%d, relevant_found=%d",
+                pipeline_run_id,
+                batch_seq,
+                estimated_batches,
+                len(classify_input_rows),
+                rel_count,
+                len(relevant_rows),
+            )
+
+        logger.info(
+            "role-linkedin-posts-classify-only[%s] classify complete: total_classified=%d, total_relevant=%d, total_errors=%d",
+            pipeline_run_id,
+            total_classified,
+            total_relevant,
+            total_errors,
+        )
+
         metrics = {
             "run_id": pipeline_run_id,
             "status": "completed",
@@ -237,19 +263,6 @@ def run_role_linkedin_posts_classify_only(
             "classification_errors": total_errors,
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
-        notify_enabled = (
-            post_classify_notify_enabled
-            if post_classify_notify_enabled is not None
-            else os.getenv("ROLE_LINKEDIN_POSTS_POST_CLASSIFY_NOTIFY_ENABLED", "true").lower() in ("1", "true", "yes")
-        )
-        metrics["post_classify_notify_enabled"] = notify_enabled
-        if notify_enabled and total_relevant > 0:
-            notify_summary = send_role_linkedin_posts_notifications(
-                run_date=resolved_run_date,
-                role=resolved_role,
-                upstream_run_id=pipeline_run_id,
-            )
-            metrics["post_classify_notify_summary"] = notify_summary
         ROLE_LINKEDIN_POSTS_CLASSIFY_RUN_METRICS[pipeline_run_id] = metrics
         return metrics
     except Exception as exc:

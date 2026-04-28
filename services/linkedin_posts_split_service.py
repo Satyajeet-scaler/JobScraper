@@ -8,6 +8,7 @@ from typing import Any
 
 from services.apify_linkedin_posts import normalize_linkedin_post_item, scrape_linkedin_posts
 from services.mysql_linkedin_posts_store import (
+    count_unclassified_linkedin_posts,
     fetch_unclassified_linkedin_posts,
     mark_linkedin_posts_classify_done,
     upsert_linkedin_post,
@@ -90,6 +91,20 @@ def run_linkedin_posts_classify_only(run_id: str | None = None, run_date: str | 
     }
     try:
         batch_size = max(1, int(os.getenv("LINKEDIN_POSTS_CLASSIFY_BATCH_SIZE", "30")))
+
+        total_unclassified = count_unclassified_linkedin_posts(
+            requested_role="",
+            run_date=resolved_run_date,
+        )
+        estimated_batches = (total_unclassified + batch_size - 1) // batch_size
+        logger.info(
+            "linkedin-posts-classify-only[%s] starting classify for run_date=%s, total_unclassified=%d, estimated_batches=%d",
+            pipeline_run_id,
+            resolved_run_date,
+            total_unclassified,
+            estimated_batches,
+        )
+
         total_classified = 0
         total_relevant = 0
         total_errors = 0
@@ -106,12 +121,6 @@ def run_linkedin_posts_classify_only(run_id: str | None = None, run_date: str | 
                 break
 
             batch_seq += 1
-            logger.info(
-                "linkedin-posts-classify-only[%s] batch=%d input=%d",
-                pipeline_run_id,
-                batch_seq,
-                len(scraped_rows),
-            )
 
             relevant_rows, classification_errors = _classify_relevant_posts(scraped_rows)
             total_errors += classification_errors
@@ -139,6 +148,24 @@ def run_linkedin_posts_classify_only(run_id: str | None = None, run_date: str | 
             total_classified += len(scraped_rows)
             total_relevant += len(relevant_rows_deduped)
             total_mysql_relevance += rel_count
+
+            logger.info(
+                "linkedin-posts-classify-only[%s] batch=%d/%d classified=%d, relevance_saved=%d, relevant_found=%d",
+                pipeline_run_id,
+                batch_seq,
+                estimated_batches,
+                len(scraped_rows),
+                rel_count,
+                len(relevant_rows_deduped),
+            )
+
+        logger.info(
+            "linkedin-posts-classify-only[%s] classify complete: total_classified=%d, total_relevant=%d, total_errors=%d",
+            pipeline_run_id,
+            total_classified,
+            total_relevant,
+            total_errors,
+        )
 
         metrics = {
             "run_id": pipeline_run_id,

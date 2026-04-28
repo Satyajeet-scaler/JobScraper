@@ -90,39 +90,65 @@ def run_linkedin_posts_classify_only(run_id: str | None = None, run_date: str | 
     }
     try:
         batch_size = max(1, int(os.getenv("LINKEDIN_POSTS_CLASSIFY_BATCH_SIZE", "30")))
-        scraped_rows = fetch_unclassified_linkedin_posts(
-            requested_role="",
-            run_date=resolved_run_date,
-            limit=batch_size,
-        )
-        relevant_rows, classification_errors = _classify_relevant_posts(scraped_rows)
-        relevant_rows_deduped = _dedupe_linkedin_relevant_rows(relevant_rows)
+        total_classified = 0
+        total_relevant = 0
+        total_errors = 0
+        total_mysql_relevance = 0
+        batch_seq = 0
 
-        rel_count = 0
-        for row in relevant_rows_deduped:
-            try:
-                upsert_linkedin_post_relevance(row)
-                rel_count += 1
-            except Exception as exc:
-                logger.warning(
-                    "linkedin-posts-classify-only[%s] mysql relevance upsert failed url=%s err=%s",
-                    pipeline_run_id,
-                    row.get("post_url"),
-                    exc,
-                )
+        while True:
+            scraped_rows = fetch_unclassified_linkedin_posts(
+                requested_role="",
+                run_date=resolved_run_date,
+                limit=batch_size,
+            )
+            if not scraped_rows:
+                break
 
-        post_ids = [int(r.get("id") or 0) for r in scraped_rows if int(r.get("id") or 0) > 0]
-        if post_ids:
-            mark_linkedin_posts_classify_done(post_ids=post_ids)
+            batch_seq += 1
+            logger.info(
+                "linkedin-posts-classify-only[%s] batch=%d input=%d",
+                pipeline_run_id,
+                batch_seq,
+                len(scraped_rows),
+            )
+
+            relevant_rows, classification_errors = _classify_relevant_posts(scraped_rows)
+            total_errors += classification_errors
+            relevant_rows_deduped = _dedupe_linkedin_relevant_rows(relevant_rows)
+
+            rel_count = 0
+            for row in relevant_rows_deduped:
+                row["classify_run_id"] = pipeline_run_id
+                row["classify_run_seq"] = batch_seq
+                try:
+                    upsert_linkedin_post_relevance(row)
+                    rel_count += 1
+                except Exception as exc:
+                    logger.warning(
+                        "linkedin-posts-classify-only[%s] mysql relevance upsert failed url=%s err=%s",
+                        pipeline_run_id,
+                        row.get("post_url"),
+                        exc,
+                    )
+
+            post_ids = [int(r.get("id") or 0) for r in scraped_rows if int(r.get("id") or 0) > 0]
+            if post_ids:
+                mark_linkedin_posts_classify_done(post_ids=post_ids)
+
+            total_classified += len(scraped_rows)
+            total_relevant += len(relevant_rows_deduped)
+            total_mysql_relevance += rel_count
 
         metrics = {
             "run_id": pipeline_run_id,
             "status": "completed",
             "run_date": resolved_run_date,
-            "scraped_input_count": len(scraped_rows),
-            "relevant_count": len(relevant_rows_deduped),
-            "mysql_relevance_upserted_count": rel_count,
-            "classification_errors": classification_errors,
+            "classify_batches": batch_seq,
+            "scraped_input_count": total_classified,
+            "relevant_count": total_relevant,
+            "mysql_relevance_upserted_count": total_mysql_relevance,
+            "classification_errors": total_errors,
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         LINKEDIN_POSTS_CLASSIFY_ONLY_RUN_METRICS[pipeline_run_id] = metrics

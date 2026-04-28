@@ -169,37 +169,60 @@ def run_role_linkedin_posts_classify_only(
     try:
         batch_size = max(1, int(os.getenv("ROLE_LINKEDIN_POSTS_CLASSIFY_BATCH_SIZE", "30")))
         run_date_obj = date.fromisoformat(resolved_run_date)
-        classify_input_rows = fetch_unclassified_linkedin_posts(
-            requested_role=resolved_role,
-            run_date=run_date_obj,
-            limit=batch_size,
-        )
-        if classify_input_rows:
+
+        total_classified = 0
+        total_relevant = 0
+        total_errors = 0
+        total_mysql_relevance = 0
+        batch_seq = 0
+
+        while True:
+            classify_input_rows = fetch_unclassified_linkedin_posts(
+                requested_role=resolved_role,
+                run_date=run_date_obj,
+                limit=batch_size,
+            )
+            if not classify_input_rows:
+                break
+
+            batch_seq += 1
+            logger.info(
+                "role-linkedin-posts-classify-only[%s] batch=%d input=%d",
+                pipeline_run_id,
+                batch_seq,
+                len(classify_input_rows),
+            )
+
             relevant_rows, classification_errors = _classify_relevant_posts_for_role_pipeline(
                 classify_input_rows,
                 role=resolved_role,
             )
-        else:
-            relevant_rows, classification_errors = [], 0
-        relevant_rows = _enrich_role_context(relevant_rows, resolved_role, role_slug)
-        relevant_rows = _dedupe_linkedin_relevant_rows(relevant_rows)
+            total_errors += classification_errors
+            relevant_rows = _enrich_role_context(relevant_rows, resolved_role, role_slug)
+            relevant_rows = _dedupe_linkedin_relevant_rows(relevant_rows)
 
-        rel_count = 0
-        for row in relevant_rows:
-            try:
-                upsert_linkedin_post_relevance(row)
-                rel_count += 1
-            except Exception as exc:
-                logger.warning(
-                    "role-linkedin-posts-classify-only[%s] mysql relevance upsert failed url=%s err=%s",
-                    pipeline_run_id,
-                    row.get("post_url"),
-                    exc,
-                )
+            rel_count = 0
+            for row in relevant_rows:
+                row["classify_run_id"] = pipeline_run_id
+                row["classify_run_seq"] = batch_seq
+                try:
+                    upsert_linkedin_post_relevance(row)
+                    rel_count += 1
+                except Exception as exc:
+                    logger.warning(
+                        "role-linkedin-posts-classify-only[%s] mysql relevance upsert failed url=%s err=%s",
+                        pipeline_run_id,
+                        row.get("post_url"),
+                        exc,
+                    )
 
-        post_ids = [int(r.get("id") or 0) for r in classify_input_rows if int(r.get("id") or 0) > 0]
-        if post_ids:
-            mark_linkedin_posts_classify_done(post_ids=post_ids)
+            post_ids = [int(r.get("id") or 0) for r in classify_input_rows if int(r.get("id") or 0) > 0]
+            if post_ids:
+                mark_linkedin_posts_classify_done(post_ids=post_ids)
+
+            total_classified += len(classify_input_rows)
+            total_relevant += len(relevant_rows)
+            total_mysql_relevance += rel_count
 
         metrics = {
             "run_id": pipeline_run_id,
@@ -207,10 +230,11 @@ def run_role_linkedin_posts_classify_only(
             "run_date": resolved_run_date,
             "role": resolved_role,
             "role_slug": role_slug,
-            "classify_input_count": len(classify_input_rows),
-            "relevant_count": len(relevant_rows),
-            "mysql_relevance_upserted_count": rel_count,
-            "classification_errors": classification_errors,
+            "classify_batches": batch_seq,
+            "classify_input_count": total_classified,
+            "relevant_count": total_relevant,
+            "mysql_relevance_upserted_count": total_mysql_relevance,
+            "classification_errors": total_errors,
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         notify_enabled = (
@@ -219,7 +243,7 @@ def run_role_linkedin_posts_classify_only(
             else os.getenv("ROLE_LINKEDIN_POSTS_POST_CLASSIFY_NOTIFY_ENABLED", "true").lower() in ("1", "true", "yes")
         )
         metrics["post_classify_notify_enabled"] = notify_enabled
-        if notify_enabled:
+        if notify_enabled and total_relevant > 0:
             notify_summary = send_role_linkedin_posts_notifications(
                 run_date=resolved_run_date,
                 role=resolved_role,

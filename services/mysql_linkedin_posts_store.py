@@ -438,3 +438,59 @@ def fetch_all_relevant_linkedin_posts(run_date: str) -> list[dict[str, Any]]:
                 item["raw_payload"] = {}
         out.append(item)
     return out
+
+
+def fetch_unsynced_relevant_linkedin_posts_for_role(
+    *,
+    role: str,
+    run_date: str,
+) -> list[dict[str, Any]]:
+    """Fetch relevant rows for a specific role and run date that have not yet been synced to the handover log sheet."""
+    sql = """
+    SELECT
+        lp.id AS linkedin_post_id,
+        lp.*,
+        lpr.is_relevant, lpr.tier, lpr.role_category, lpr.reason,
+        lpr.author_company AS ai_author_company, lpr.hiring_company AS ai_hiring_company,
+        lpr.confidence AS ai_confidence, lpr.priority AS ai_priority,
+        lpr.assigned_owner, lpr.handover_sent,
+        lpr.classify_run_id, lpr.classify_run_seq
+    FROM linkedin_posts lp
+    JOIN linkedin_post_relevance lpr ON lp.id = lpr.linkedin_post_id
+    WHERE lp.requested_role = %s
+      AND lp.run_date = %s
+      AND lpr.is_relevant = TRUE
+      AND lpr.handover_log_synced = FALSE
+    ORDER BY lp.id ASC
+    """
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (role, run_date))
+            rows = cur.fetchall() or []
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        item = dict(r)
+        raw_json = item.get("raw_payload_json")
+        if raw_json:
+            try:
+                item["raw_payload"] = json.loads(str(raw_json))
+            except Exception:
+                item["raw_payload"] = {}
+        out.append(item)
+    return out
+
+
+def mark_linkedin_posts_log_synced(*, post_ids: list[int]) -> int:
+    """Mark LinkedIn post relevance rows as synced to the handover log sheet."""
+    if not post_ids:
+        return 0
+    placeholders = ",".join(["%s"] * len(post_ids))
+    sql = f"""
+    UPDATE linkedin_post_relevance
+    SET handover_log_synced = TRUE, updated_at = CURRENT_TIMESTAMP
+    WHERE linkedin_post_id IN ({placeholders})
+    """
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(post_ids))
+            return int(cur.rowcount or 0)

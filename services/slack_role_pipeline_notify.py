@@ -4,11 +4,10 @@ import logging
 from datetime import date
 from typing import Any
 
-from services.google_sheets import GoogleSheetsWriter
-from services.handover_owners import load_owner_rows_for_handover, worksheet_row_dicts
+from services.handover_owners import load_owner_rows_for_handover
 from services.role_pipeline import _role_slug
 from services.role_recruiter_info_service import role_recruiters_tab_name_for_role
-from services.mysql_jobs_store import fetch_recruiter_rows_for_role, mark_recruiter_contacts_handover_sent
+from services.mysql_jobs_store import mark_recruiter_contacts_handover_sent
 from services.slack_relevant_jobs_handover import (
     _resolve_min_candidate_match,
     _role_includes_candidate_match_in_slack,
@@ -114,58 +113,6 @@ def send_role_handover_notifications(
         out["handover_sent_rows_updated"] = 0
 
     return out
-
-
-def _read_role_recruiter_rows(
-    tab: str,
-    *,
-    role: str,
-    run_date: str,
-    upstream_run_id: str | None = None,
-) -> list[dict[str, str]]:
-    import os
-
-    use_mysql = (os.getenv("ROLE_PIPELINE_MYSQL_READ_ENABLED") or "false").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
-    if use_mysql:
-        rows = fetch_recruiter_rows_for_role(role=role, run_date=run_date, upstream_run_id=upstream_run_id)
-        return [dict(r) for r in rows]
-
-    spreadsheet_id = (os.getenv("GOOGLE_SPREADSHEET_ID") or "").strip()
-    if not spreadsheet_id:
-        return []
-    try:
-        writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
-        ws = writer.open_worksheet(tab)
-        raw = writer.worksheet_get_all_values(ws, f"role_slack_handover:{tab}:get_all_values")
-    except Exception as exc:
-        logger.warning("role slack handover: recruiters tab unavailable tab=%s err=%s", tab, exc)
-        return []
-    return [dict(r) for r in worksheet_row_dicts(raw)]
-
-
-def _split_recruiter_case3_rows(
-    rows: list[dict[str, str]],
-    run_date: str,
-    *,
-    upstream_run_id: str | None = None,
-) -> list[dict[str, str]]:
-    case3: list[dict[str, str]] = []
-    for row in rows:
-        row_run_date = (row.get("run_date") or "").strip()
-        if row_run_date and row_run_date != run_date:
-            continue
-        if upstream_run_id:
-            row_upstream = (row.get("role_pipeline_upstream_run_id") or "").strip()
-            if row_upstream and row_upstream != upstream_run_id:
-                continue
-        profile = (row.get("recruiter_profile_url") or "").strip()
-        if profile:
-            case3.append(row)
-    return case3
 
 
 def _normalize_job_key(url: str) -> str:

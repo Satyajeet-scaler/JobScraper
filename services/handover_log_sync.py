@@ -36,16 +36,21 @@ def _load_linkedin_relevant_rows(run_date: str) -> list[dict[str, Any]]:
         return []
 
 
+def _get_owner(row: dict[str, Any]) -> str:
+    """Read owner from either MySQL snake_case or legacy sheet space-separated keys."""
+    return (row.get("assigned_owner") or row.get("assigned owner") or "").strip()
+
+
 def _recruiter_row_to_log_cells(row: dict[str, str]) -> list[str]:
     def g(key: str) -> str:
-        return (row.get(key) or "").strip()
+        return str(row.get(key) or "").strip()
 
     return [
         g("run_date"),
         g("job_url"),
         g("company"),
         g("title"),
-        g("assigned owner"),
+        _get_owner(row),
         "",
         "",
         "",
@@ -57,7 +62,7 @@ def _linkedin_row_to_log_cells(row: dict[str, Any]) -> list[str]:
     link = slack_post_url_from_row(row).strip()
     if link in ("", "-"):
         link = str(row.get("post_url") or "").strip()
-    owner = str(row.get("assigned owner") or "").strip()
+    owner = _get_owner(row)
     # Company name + Title are not used for LinkedIn post leads; sheet convention is NA.
     return [run_date, link, "NA", "NA", owner, "", "", ""]
 
@@ -69,6 +74,10 @@ def sync_handover_log_to_sheet(run_date: str) -> dict[str, Any]:
 
     No-op if ``HANDOVER_LOG_SPREADSHEET_ID`` is unset.
     """
+    logger.warning(
+        "Legacy sync_handover_log_to_sheet is deprecated. "
+        "Use /internal/sync-role-handover-log for new pipeline runs."
+    )
     log_id = (os.getenv("HANDOVER_LOG_SPREADSHEET_ID") or "").strip()
     if not log_id:
         return {"skipped": True, "reason": "HANDOVER_LOG_SPREADSHEET_ID not set"}

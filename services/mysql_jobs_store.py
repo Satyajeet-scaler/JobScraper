@@ -234,6 +234,47 @@ def fetch_recruiter_rows_for_role(*, role: str, run_date: str, upstream_run_id: 
     return [dict(row) for row in rows]
 
 
+def fetch_unsynced_recruiter_rows_for_role(*, role: str, run_date: str) -> list[dict[str, Any]]:
+    """Return recruiter contacts that have not yet been synced to the handover log sheet."""
+    sql = """
+    SELECT
+        c.id AS _rc_id,
+        c.run_date, j.job_url, j.title, j.company, j.site,
+        r.matched_role, r.role_category, r.priority,
+        c.recruiter_name, c.recruiter_headline, c.recruiter_profile_url, c.recruiter_email,
+        c.recruiter_source, c.scrape_error, c.assigned_owner, c.handover_sent
+    FROM job_recruiter_contacts c
+    JOIN jobs j ON j.id = c.job_id
+    LEFT JOIN job_relevance r ON r.job_id = j.id
+    WHERE j.requested_role = %s
+      AND c.run_date = %s
+      AND c.handover_sent = TRUE
+      AND c.handover_log_synced = FALSE
+    ORDER BY c.id ASC
+    """
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (role, run_date))
+            rows = cur.fetchall() or []
+    return [dict(row) for row in rows]
+
+
+def mark_recruiter_contacts_log_synced(*, rc_ids: list[int]) -> int:
+    """Mark recruiter contact rows as synced to the handover log sheet."""
+    if not rc_ids:
+        return 0
+    placeholders = ",".join(["%s"] * len(rc_ids))
+    sql = f"""
+    UPDATE job_recruiter_contacts
+    SET handover_log_synced = TRUE, updated_at = CURRENT_TIMESTAMP
+    WHERE id IN ({placeholders})
+    """
+    with _db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(rc_ids))
+            return int(cur.rowcount or 0)
+
+
 def fetch_jd_rows_for_role(*, role: str, run_date: str) -> list[dict[str, Any]]:
     sql = """
     SELECT

@@ -5,6 +5,7 @@ from datetime import date
 from typing import Any
 
 from services.handover_owners import load_owner_rows_for_handover
+from services.handover_owner_state import get_start_owner_index, update_last_owner
 from services.role_pipeline import _role_slug
 from services.role_recruiter_info_service import role_recruiters_tab_name_for_role
 from services.mysql_jobs_store import mark_recruiter_contacts_handover_sent
@@ -79,14 +80,21 @@ def send_role_handover_notifications(
     sent_assignments: list[tuple[str, int]] = []
 
     if send_recruiter_info and case3 and owner_rows:
+        state_key = f"handover:role_recruiter:{role_slug}"
+        start_index = get_start_owner_index(state_key, owner_rows)
         if send_slack_text(HEADING_RECRUITER_DETAIL, defaults=defaults, sleep_after=1.0):
             out["recruiter_messages_sent"] += 1
             owner_buckets: dict[int, list[dict[str, Any]]] = {i: [] for i in range(len(owner_rows))}
             for idx, row in enumerate(case3):
-                owner_buckets[idx % len(owner_rows)].append(row)
+                owner_buckets[(start_index + idx) % len(owner_rows)].append(row)
+            last_assigned_index = -1
             for owner_idx, owner in enumerate(owner_rows):
                 owner_name = _owner_display_name(owner)
-                for row in owner_buckets.get(owner_idx, []):
+                bucket = owner_buckets.get(owner_idx, [])
+                if not bucket:
+                    continue
+                bucket_sent = False
+                for row in bucket:
                     tag = owner_tag_for_handover(owner)
                     company = (row.get("company") or "-").strip() or "-"
                     role_category = recruiter_row_role_label_for_slack(row)
@@ -104,7 +112,12 @@ def send_role_handover_notifications(
                     )
                     if send_slack_text(msg, defaults=defaults, sleep_after=1.0):
                         out["recruiter_messages_sent"] += 1
+                        bucket_sent = True
                         sent_assignments.append((row["_rc_id"], owner_name))
+                if bucket_sent:
+                    last_assigned_index = owner_idx
+            if last_assigned_index != -1:
+                update_last_owner(state_key, owner_rows, last_assigned_index)
 
     if sent_assignments:
         out["assigned_owner_rows_updated"] = len(sent_assignments)

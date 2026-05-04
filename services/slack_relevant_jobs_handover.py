@@ -25,6 +25,7 @@ from zoneinfo import ZoneInfo
 
 from services.google_sheets import GoogleSheetsWriter
 from services.handover_owners import load_owner_rows_for_handover, worksheet_row_dicts
+from services.handover_owner_state import get_start_owner_index, update_last_owner
 from services.role_pipeline import _resolve_role_config, role_relevant_tab_name, _role_slug
 from services.slack_handover_notify import (
     _normalize_job_url_for_match,
@@ -142,11 +143,15 @@ def send_relevant_jobs_handover(
     sent_identities: set[tuple[str, str]] = set()
     sent_timestamp = _now_iso()
 
+    start_index = get_start_owner_index("handover:relevant_jobs", owner_rows)
+
     # Round-robin allocation, then group consecutively by owner so each owner
     # receives one sub-heading followed by all of their leads.
     owner_buckets: dict[int, list[dict[str, str]]] = {i: [] for i in range(len(owner_rows))}
     for idx, row in enumerate(eligible):
-        owner_buckets[idx % len(owner_rows)].append(row)
+        owner_buckets[(start_index + idx) % len(owner_rows)].append(row)
+
+    last_assigned_index = -1
 
     # Iterate owner-by-owner so all leads for one owner are posted back-to-back.
     # Owner tag is inlined on each lead (no separate sub-heading).
@@ -155,6 +160,7 @@ def send_relevant_jobs_handover(
         if not bucket:
             continue
         owner_tag = owner_tag_for_handover(owner)
+        bucket_sent = False
         for row in bucket:
             company = (row.get("company") or "-").strip() or "-"
             lead_role = (row.get("matched_role") or row.get("role_category") or row.get("title") or "-").strip() or "-"
@@ -170,7 +176,10 @@ def send_relevant_jobs_handover(
             )
             if send_slack_text(msg, defaults=defaults, sleep_after=1.0):
                 out["messages_sent"] += 1
+                bucket_sent = True
                 sent_identities.add(_relevant_row_identity(row))
+        if bucket_sent:
+            last_assigned_index = owner_idx
 
     if sent_identities:
         updated = _persist_handover_markers(
@@ -179,9 +188,13 @@ def send_relevant_jobs_handover(
             owner_rows=owner_rows,
             sent_identities=sent_identities,
             sent_timestamp=sent_timestamp,
+            start_index=start_index,
         )
         out["handover_sent_rows_updated"] = updated
         out["assigned_owner_rows_updated"] = updated
+
+    if last_assigned_index != -1:
+        update_last_owner("handover:relevant_jobs", owner_rows, last_assigned_index)
 
     return out
 
@@ -373,9 +386,13 @@ def _persist_handover_markers(
     owner_rows: list[dict[str, str]],
     sent_identities: set[tuple[str, str]],
     sent_timestamp: str,
+    start_index: int = 0,
 ) -> int:
     """Write ``assigned owner`` (round-robin) and ``handover_sent`` timestamp
     back to the relevant tab for every row in ``sent_identities``.
+
+    The *start_index* offsets the round-robin so the persisted owner
+    matches the owner that received the lead in Slack.
 
     Returns the number of rows updated.
     """
@@ -417,7 +434,7 @@ def _persist_handover_markers(
             return 0
 
         for order_idx, pos in enumerate(selected_positions):
-            data_rows[pos][assigned_col] = owner_names[order_idx % len(owner_names)]
+            data_rows[pos][assigned_col] = owner_names[(start_index + order_idx) % len(owner_names)]
             data_rows[pos][sent_col] = sent_timestamp
 
         writer.worksheet_update(

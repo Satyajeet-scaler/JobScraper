@@ -19,6 +19,7 @@ from services.handover_owners import (
     load_owner_rows_for_handover,
     worksheet_row_dicts,
 )
+from services.handover_owner_state import get_start_owner_index, update_last_owner
 from services.linkedin_posts_slack_row import slack_author_from_row, slack_post_url_from_row
 
 logger = logging.getLogger(__name__)
@@ -301,15 +302,18 @@ def send_recruiter_handover_case(
         return 0
     sent += 1
 
+    start_index = get_start_owner_index("handover:recruiter_detail", owner_rows)
     owner_buckets: dict[int, list[dict[str, str]]] = {i: [] for i in range(len(owner_rows))}
     for idx, row in enumerate(rows):
-        owner_buckets[idx % len(owner_rows)].append(row)
+        owner_buckets[(start_index + idx) % len(owner_rows)].append(row)
 
+    last_assigned_index = -1
     for owner_idx, owner in enumerate(owner_rows):
         bucket = owner_buckets.get(owner_idx, [])
         if not bucket:
             continue
         tag = owner_tag_for_handover(owner)
+        bucket_sent = False
         for row in bucket:
             company = (row.get("company") or "-").strip() or "-"
             role = recruiter_row_role_label_for_slack(row)
@@ -319,7 +323,15 @@ def send_recruiter_handover_case(
             msg = format_recruiter_detail_lead(tag, company, role, job_url, profile_url, matched_count)
             if send_slack_text(msg, defaults=defaults, sleep_after=1.0):
                 sent += 1
-    _persist_recruiter_detail_assigned_owner(run_date=run_date, owner_rows=owner_rows)
+                bucket_sent = True
+        if bucket_sent:
+            last_assigned_index = owner_idx
+
+    if last_assigned_index != -1:
+        update_last_owner("handover:recruiter_detail", owner_rows, last_assigned_index)
+    _persist_recruiter_detail_assigned_owner(
+        run_date=run_date, owner_rows=owner_rows, start_index=start_index
+    )
     return sent
 
 
@@ -353,15 +365,18 @@ def send_linkedin_post_handover_messages(
     sent += 1
 
     if owner_rows_opt:
+        start_index = get_start_owner_index("handover:linkedin_post", owner_rows_opt)
         owner_buckets: dict[int, list[dict[str, Any]]] = {i: [] for i in range(len(owner_rows_opt))}
         for idx, row in enumerate(relevant_rows):
-            owner_buckets[idx % len(owner_rows_opt)].append(row)
+            owner_buckets[(start_index + idx) % len(owner_rows_opt)].append(row)
+        last_assigned_index = -1
         for owner_idx, owner in enumerate(owner_rows_opt):
             bucket = owner_buckets.get(owner_idx, [])
             if not bucket:
                 continue
             owner_tag = owner_tag_for_handover(owner)
             owner_name = (owner.get("owner_name") or "").strip()
+            bucket_sent = False
             for row in bucket:
                 post_id = int(row.get("linkedin_post_id") or row.get("id") or 0)
                 author = slack_author_from_row(row)
@@ -369,8 +384,13 @@ def send_linkedin_post_handover_messages(
                 msg = format_linkedin_post_lead(owner_tag, url, author)
                 if send_slack_text(msg, defaults=d, sleep_after=1.0):
                     sent += 1
+                    bucket_sent = True
                     if post_id > 0:
                         mark_linkedin_post_handover_sent(post_id, owner_name)
+            if bucket_sent:
+                last_assigned_index = owner_idx
+        if last_assigned_index != -1:
+            update_last_owner("handover:linkedin_post", owner_rows_opt, last_assigned_index)
     else:
         for row in relevant_rows:
             post_id = int(row.get("linkedin_post_id") or row.get("id") or 0)
@@ -620,6 +640,7 @@ def _persist_recruiter_detail_assigned_owner(
     *,
     run_date: str,
     owner_rows: list[dict[str, str]],
+    start_index: int = 0,
 ) -> None:
     """Round-robin ``assigned owner`` for Case 3 rows (recruiter profile URL present)."""
     spreadsheet_id = os.getenv("GOOGLE_SPREADSHEET_ID")
@@ -638,6 +659,7 @@ def _persist_recruiter_detail_assigned_owner(
         worksheet_title=tab,
         owner_rows=owner_rows,
         selector=selector,
+        start_index=start_index,
     )
 
 
@@ -647,6 +669,7 @@ def persist_assigned_owner_round_robin(
     worksheet_title: str,
     owner_rows: list[dict[str, str]],
     selector: Callable[[dict[str, str]], bool],
+    start_index: int = 0,
 ) -> None:
     """Public helper to persist round-robin assigned owner for selected rows."""
     if not spreadsheet_id or not owner_rows:
@@ -656,6 +679,7 @@ def persist_assigned_owner_round_robin(
         worksheet_title=worksheet_title,
         owner_rows=owner_rows,
         selector=selector,
+        start_index=start_index,
     )
 
 
@@ -665,6 +689,7 @@ def _persist_assigned_owner_column(
     worksheet_title: str,
     owner_rows: list[dict[str, str]],
     selector: Callable[[dict[str, str]], bool],
+    start_index: int = 0,
 ) -> None:
     try:
         writer = GoogleSheetsWriter(spreadsheet_id=spreadsheet_id)
@@ -704,7 +729,7 @@ def _persist_assigned_owner_column(
 
         owner_names = [_owner_display_name(owner) for owner in owner_rows]
         for idx, row_pos in enumerate(selected_row_positions):
-            data_rows[row_pos][assigned_col_idx] = owner_names[idx % len(owner_names)]
+            data_rows[row_pos][assigned_col_idx] = owner_names[(start_index + idx) % len(owner_names)]
 
         # Ensure header exists before writing column values.
         writer.worksheet_update(

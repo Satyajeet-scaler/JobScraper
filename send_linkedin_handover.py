@@ -36,6 +36,8 @@ from typing import Any
 
 import requests
 
+from services.handover_owner_state import get_start_owner_index, update_last_owner
+
 
 def _post_slack(webhook_url: str, text: str, channel: str, username: str, icon_emoji: str) -> None:
     payload = {
@@ -123,11 +125,12 @@ def main() -> None:
     if not owners:
         print("No owner rows found; sending without owner assignment.")
 
-    # Round-robin assign rows to owners
+    # Round-robin assign rows to owners (continues from last run)
     if owners:
+        start_index = get_start_owner_index("handover:linkedin_post_legacy", owners)
         owner_buckets: dict[int, list[dict[str, str]]] = defaultdict(list)
         for idx, row in enumerate(rows):
-            owner_buckets[idx % len(owners)].append(row)
+            owner_buckets[(start_index + idx) % len(owners)].append(row)
     else:
         owner_buckets = {0: rows}
         owners = [{"owner_name": "-", "owner_slack_id": "", "owner_email": "-"}]
@@ -141,6 +144,8 @@ def main() -> None:
     _post_slack(webhook_url, heading, channel, username, icon_emoji)
     sleep(1)
     sent = 1
+
+    last_assigned_index = -1
 
     # 2) Per owner: one owner message, then one message per post
     for owner_idx, owner in enumerate(owners):
@@ -157,6 +162,7 @@ def main() -> None:
         sleep(1)
         sent += 1
 
+        bucket_sent = False
         for row in bucket:
             author = _d(row.get("author_name"))
             company = _d(row.get("company"))
@@ -170,6 +176,12 @@ def main() -> None:
             _post_slack(webhook_url, post_msg, channel, username, icon_emoji)
             sleep(1)
             sent += 1
+            bucket_sent = True
+        if bucket_sent:
+            last_assigned_index = owner_idx
+
+    if last_assigned_index != -1:
+        update_last_owner("handover:linkedin_post_legacy", owners, last_assigned_index)
 
     print(f"Sent {sent} Slack message(s) for {len(rows)} post(s) across {len([b for b in owner_buckets.values() if b])} owner(s).")
 

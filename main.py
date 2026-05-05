@@ -14,6 +14,13 @@ from pathlib import Path
 from typing import Any, Literal, Optional
 from zoneinfo import ZoneInfo
 
+# Use spawn instead of fork so cron jobs run in clean Python processes.
+# Fork from a threaded parent (APScheduler) causes copy-on-write bloat.
+try:
+    multiprocessing.set_start_method("spawn", force=True)
+except RuntimeError:
+    pass
+
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
 from fastapi.encoders import jsonable_encoder
@@ -275,12 +282,14 @@ def _cron_today() -> str:
 
 def _run_in_subprocess(func, *args, **kwargs) -> int:
     """
-    Run func(*args, **kwargs) in a forked child process.
-    When the child exits, the OS reclaims ALL its memory instantly.
+    Run func(*args, **kwargs) in a spawned child process.
+    Spawn gives a clean minimal process instead of copying the bloated parent.
     After join, we also gc + malloc_trim the parent and drop page cache
     so the container-level memory (cgroup) drops back to baseline.
     """
     name = getattr(func, "__name__", str(func))
+    rss_before = _get_rss_mb()
+    cgroup_before = _get_cgroup_memory_mb()
     proc = multiprocessing.Process(target=func, args=args, kwargs=kwargs)
     proc.start()
     proc.join()
@@ -294,6 +303,19 @@ def _run_in_subprocess(func, *args, **kwargs) -> int:
     gc.collect()
     _malloc_trim()
     _drop_page_cache()
+    rss_after = _get_rss_mb()
+    cgroup_after = _get_cgroup_memory_mb()
+    logger.info(
+        "cron memory after %s rss_before=%.1fMB rss_after=%.1fMB freed=%.1fMB "
+        "cgroup_before=%.1fMB cgroup_after=%.1fMB freed=%.1fMB",
+        name,
+        rss_before,
+        rss_after,
+        rss_before - rss_after,
+        cgroup_before,
+        cgroup_after,
+        cgroup_before - cgroup_after,
+    )
     return exitcode
 
 
@@ -449,6 +471,28 @@ def _slack_handover_work(run_date: str) -> None:
     logger.info("scheduler slack-handover summary-counts=%s", summary_counts)
 
 
+def _role_handover_log_sync_work(run_date: str, role: str) -> None:
+    _configure_logging()
+    try:
+        result = sync_role_handover_log_to_sheet(run_date=run_date, role=role)
+        logger.info("scheduler role-handover-log-sync role=%s result=%s", role, result)
+    except Exception:
+        logger.exception(
+            "scheduler role-handover-log-sync failed run_date=%s role=%s",
+            run_date,
+            role,
+        )
+
+
+def _handover_log_sync_work(run_date: str) -> None:
+    _configure_logging()
+    try:
+        result = sync_handover_log_to_sheet(run_date)
+        logger.info("scheduler handover-log-sync result=%s", result)
+    except Exception:
+        logger.exception("scheduler handover-log-sync failed run_date=%s", run_date)
+
+
 def _run_scrape_jobs_from_scheduler() -> None:
     _run_in_subprocess(_scrape_jobs_work, str(uuid.uuid4()), _cron_today())
 
@@ -554,15 +598,7 @@ def _run_role_handover_log_sync_from_scheduler() -> None:
     """Append role handover rows to shared handover log after role slack slot."""
     run_date = _cron_today()
     for role in _resolve_cron_roles():
-        try:
-            result = sync_role_handover_log_to_sheet(run_date=run_date, role=role)
-            logger.info("scheduler role-handover-log-sync role=%s result=%s", role, result)
-        except Exception:
-            logger.exception(
-                "scheduler role-handover-log-sync failed run_date=%s role=%s",
-                run_date,
-                role,
-            )
+        _run_in_subprocess(_role_handover_log_sync_work, run_date, role)
 
 
 # --- Manual triggers: same work as intraday role-pipeline crons (all roles) ---
@@ -663,15 +699,7 @@ def _trigger_role_pipeline_slack_handover_cron_work(run_date: str, roles: list[s
 def _trigger_role_pipeline_handover_log_sync_cron_work(run_date: str, roles: list[str]) -> None:
     _configure_logging()
     for role in roles:
-        try:
-            result = sync_role_handover_log_to_sheet(run_date=run_date, role=role)
-            logger.info("manual trigger role-handover-log-sync role=%s result=%s", role, result)
-        except Exception:
-            logger.exception(
-                "manual trigger role-handover-log-sync failed run_date=%s role=%s",
-                run_date,
-                role,
-            )
+        _run_in_subprocess(_role_handover_log_sync_work, run_date, role)
 
 
 def _trigger_role_pipeline_recruiter_info_cron_work(run_date: str, roles: list[str]) -> None:
@@ -739,12 +767,7 @@ def _run_slack_handover_from_scheduler() -> None:
 
 def _run_handover_log_sync_from_scheduler() -> None:
     """Append handover rows to the handover log sheet; runs after the 9:30 Slack handover slot."""
-    run_date = _cron_today()
-    try:
-        result = sync_handover_log_to_sheet(run_date)
-        logger.info("scheduler handover-log-sync result=%s", result)
-    except Exception:
-        logger.exception("scheduler handover-log-sync failed run_date=%s", run_date)
+    _run_in_subprocess(_handover_log_sync_work, _cron_today())
 
 
 def _run_linkedin_auto_login_and_log(job_id: str) -> None:
@@ -1078,6 +1101,18 @@ def _build_scheduler() -> BackgroundScheduler:
             coalesce=True,
             misfire_grace_time=1800,
         )
+    # Memory cleanup also runs after each role-pipeline cycle so it works
+    # when legacy cron is disabled.
+    if role_pipeline_enabled:
+        scheduler.add_job(
+            _run_free_memory_from_scheduler,
+            trigger=CronTrigger(hour="9,12,15,18", minute=47, timezone=timezone),
+            id="intraday-role-post-cron-memory-cleanup",
+            replace_existing=True,
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=1800,
+        )
     return scheduler
 
 
@@ -1173,6 +1208,65 @@ def trigger_free_memory(
     validate_internal_trigger_token(x_internal_token)
     result = free_memory()
     return JSONResponse(content=jsonable_encoder(result))
+
+
+@app.get("/internal/memory-stats")
+def memory_stats(
+    x_internal_token: Optional[str] = Header(default=None),
+) -> JSONResponse:
+    """Return current RSS and cgroup memory (what Railway bills)."""
+    validate_internal_trigger_token(x_internal_token)
+    from services.pipeline import PIPELINE_RUN_METRICS
+    from services.scrape_relevance_service import SCRAPE_ONLY_RUN_METRICS, CLASSIFY_ONLY_RUN_METRICS
+    from services.recruiter_info_service import RECRUITER_INFO_RUN_METRICS
+    from services.linkedin_posts_pipeline import LINKEDIN_POSTS_RUN_METRICS
+    from services.linkedin_posts_split_service import (
+        LINKEDIN_POSTS_SCRAPE_ONLY_RUN_METRICS,
+        LINKEDIN_POSTS_CLASSIFY_ONLY_RUN_METRICS,
+    )
+    from services.naukri_only_pipeline import NAUKRI_RUN_METRICS
+    from services.wellfound_only_pipeline import WELLFOUND_RUN_METRICS
+    from services.wellfound_classify_pipeline import WELLFOUND_CLASSIFY_RUN_METRICS
+    from services.hirecafe_only_pipeline import HIRECAFE_RUN_METRICS
+    from services.hirist_only_pipeline import HIRIST_RUN_METRICS
+    from services.role_pipeline import ROLE_CLASSIFY_RUN_METRICS, ROLE_SCRAPE_RUN_METRICS
+    from services.role_linkedin_posts_pipeline import (
+        ROLE_LINKEDIN_POSTS_CLASSIFY_RUN_METRICS,
+        ROLE_LINKEDIN_POSTS_NOTIFY_RUN_METRICS,
+        ROLE_LINKEDIN_POSTS_SCRAPE_RUN_METRICS,
+    )
+    from services.candidate_jd_evaluator_service import CANDIDATE_JD_EVALUATOR_RUN_METRICS
+    from services.role_recruiter_info_service import ROLE_RECRUITER_INFO_RUN_METRICS
+    from services.recruiter_profile_backfill_service import RECRUITER_PROFILE_BACKFILL_RUN_METRICS
+    from services.relevant_jobs_tab_fix_service import RELEVANT_JOBS_TAB_FIX_RUN_METRICS
+
+    return JSONResponse(content=jsonable_encoder({
+        "rss_mb": round(_get_rss_mb(), 1),
+        "cgroup_mb": round(_get_cgroup_memory_mb(), 1),
+        "metrics_counts": {
+            "pipeline": len(PIPELINE_RUN_METRICS),
+            "scrape_only": len(SCRAPE_ONLY_RUN_METRICS),
+            "classify_only": len(CLASSIFY_ONLY_RUN_METRICS),
+            "recruiter_info": len(RECRUITER_INFO_RUN_METRICS),
+            "linkedin_posts": len(LINKEDIN_POSTS_RUN_METRICS),
+            "linkedin_posts_scrape_only": len(LINKEDIN_POSTS_SCRAPE_ONLY_RUN_METRICS),
+            "linkedin_posts_classify_only": len(LINKEDIN_POSTS_CLASSIFY_ONLY_RUN_METRICS),
+            "naukri": len(NAUKRI_RUN_METRICS),
+            "wellfound": len(WELLFOUND_RUN_METRICS),
+            "wellfound_classify": len(WELLFOUND_CLASSIFY_RUN_METRICS),
+            "hirecafe": len(HIRECAFE_RUN_METRICS),
+            "hirist": len(HIRIST_RUN_METRICS),
+            "role_scrape": len(ROLE_SCRAPE_RUN_METRICS),
+            "role_classify": len(ROLE_CLASSIFY_RUN_METRICS),
+            "role_linkedin_posts_scrape": len(ROLE_LINKEDIN_POSTS_SCRAPE_RUN_METRICS),
+            "role_linkedin_posts_classify": len(ROLE_LINKEDIN_POSTS_CLASSIFY_RUN_METRICS),
+            "role_linkedin_posts_notify": len(ROLE_LINKEDIN_POSTS_NOTIFY_RUN_METRICS),
+            "candidate_jd_evaluator": len(CANDIDATE_JD_EVALUATOR_RUN_METRICS),
+            "role_recruiter_info": len(ROLE_RECRUITER_INFO_RUN_METRICS),
+            "recruiter_profile_backfill": len(RECRUITER_PROFILE_BACKFILL_RUN_METRICS),
+            "relevant_jobs_tab_fix": len(RELEVANT_JOBS_TAB_FIX_RUN_METRICS),
+        },
+    }))
 
 
 @app.get("/")

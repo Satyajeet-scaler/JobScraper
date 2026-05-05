@@ -14,6 +14,15 @@ logger = logging.getLogger(__name__)
 RECRUITER_INFO_RUN_METRICS: dict[str, dict[str, Any]] = {}
 
 
+def _cap_metrics_dict(d: dict, max_size: int = 50) -> None:
+    while len(d) > max_size:
+        try:
+            del d[next(iter(d))]
+        except StopIteration:
+            break
+
+
+
 def run_recruiter_info_extraction(run_id: str | None = None, run_date: str | None = None) -> dict[str, Any]:
     """
     Read `relevant_jobs_{date}` from GOOGLE_SPREADSHEET_ID and write `recruiters_info_{date}`.
@@ -49,6 +58,7 @@ def run_recruiter_info_extraction(run_id: str | None = None, run_date: str | Non
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         RECRUITER_INFO_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(RECRUITER_INFO_RUN_METRICS)
         logger.info(
             "recruiter-info[%s] completed relevant=%s rows_written=%s",
             pipeline_run_id,
@@ -66,6 +76,7 @@ def run_recruiter_info_extraction(run_id: str | None = None, run_date: str | Non
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         RECRUITER_INFO_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(RECRUITER_INFO_RUN_METRICS)
         logger.exception("recruiter-info[%s] failed: %s", pipeline_run_id, exc)
         raise
 

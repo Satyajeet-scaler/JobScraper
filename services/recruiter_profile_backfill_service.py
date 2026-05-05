@@ -19,6 +19,15 @@ from services.role_recruiter_info_service import role_recruiters_tab_name_for_ro
 logger = logging.getLogger(__name__)
 
 RECRUITER_PROFILE_BACKFILL_RUN_METRICS: dict[str, dict[str, Any]] = {}
+
+
+def _cap_metrics_dict(d: dict, max_size: int = 50) -> None:
+    while len(d) > max_size:
+        try:
+            del d[next(iter(d))]
+        except StopIteration:
+            break
+
 DEFAULT_RECRUITER_TITLES: tuple[str, ...] = (
     "Recruiter",
     "Talent Acquisition",
@@ -188,6 +197,7 @@ def run_recruiter_profile_backfill(
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         RECRUITER_PROFILE_BACKFILL_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(RECRUITER_PROFILE_BACKFILL_RUN_METRICS)
         return metrics
     except Exception as exc:
         metrics = {
@@ -202,6 +212,7 @@ def run_recruiter_profile_backfill(
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         RECRUITER_PROFILE_BACKFILL_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(RECRUITER_PROFILE_BACKFILL_RUN_METRICS)
         logger.exception("recruiter-profile-backfill[%s] failed: %s", pipeline_run_id, exc)
         raise
 

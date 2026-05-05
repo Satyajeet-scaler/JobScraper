@@ -1,3 +1,4 @@
+import gc
 import json
 import logging
 import os
@@ -22,6 +23,15 @@ except ImportError:  # pragma: no cover - optional dependency behavior
 logger = logging.getLogger(__name__)
 
 CANDIDATE_JD_EVALUATOR_RUN_METRICS: dict[str, dict[str, Any]] = {}
+
+
+def _cap_metrics_dict(d: dict, max_size: int = 50) -> None:
+    while len(d) > max_size:
+        try:
+            del d[next(iter(d))]
+        except StopIteration:
+            break
+
 
 
 def run_candidate_jd_evaluator(run_id: str | None = None, run_date: str | None = None) -> dict[str, Any]:
@@ -116,6 +126,9 @@ def run_candidate_jd_evaluator(run_id: str | None = None, run_date: str | None =
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         CANDIDATE_JD_EVALUATOR_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(CANDIDATE_JD_EVALUATOR_RUN_METRICS)
+        del candidates, jd_rows, combined_output_rows, results
+        gc.collect()
         return metrics
     except Exception as exc:
         metrics = {
@@ -127,7 +140,9 @@ def run_candidate_jd_evaluator(run_id: str | None = None, run_date: str | None =
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         CANDIDATE_JD_EVALUATOR_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(CANDIDATE_JD_EVALUATOR_RUN_METRICS)
         logger.exception("candidate-jd-evaluator[%s] failed: %s", pipeline_run_id, exc)
+        gc.collect()
         raise
 
 
@@ -291,6 +306,9 @@ def run_candidate_jd_evaluator_for_role(
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         CANDIDATE_JD_EVALUATOR_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(CANDIDATE_JD_EVALUATOR_RUN_METRICS)
+        del candidates, jd_rows, combined_output_rows, results
+        gc.collect()
         return metrics
     except Exception as exc:
         metrics = {
@@ -305,12 +323,14 @@ def run_candidate_jd_evaluator_for_role(
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         CANDIDATE_JD_EVALUATOR_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(CANDIDATE_JD_EVALUATOR_RUN_METRICS)
         logger.exception(
             "role-candidate-jd-evaluator[%s] failed role=%s: %s",
             pipeline_run_id,
             resolved_role,
             exc,
         )
+        gc.collect()
         raise
 
 

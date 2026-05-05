@@ -14,6 +14,15 @@ from services.pipeline import _classify_relevant_jobs, _dedupe_jobs
 logger = logging.getLogger(__name__)
 
 WELLFOUND_CLASSIFY_RUN_METRICS: dict[str, dict[str, Any]] = {}
+
+
+def _cap_metrics_dict(d: dict, max_size: int = 50) -> None:
+    while len(d) > max_size:
+        try:
+            del d[next(iter(d))]
+        except StopIteration:
+            break
+
 _WELLFOUND_SCRAPED_TAB_RE = re.compile(r"^wellfound_jobs_(\d{4}-\d{2}-\d{2})$")
 
 
@@ -53,6 +62,7 @@ def run_wellfound_classify_only_pipeline(
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         WELLFOUND_CLASSIFY_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(WELLFOUND_CLASSIFY_RUN_METRICS)
         logger.info(
             "wellfound-classify-only[%s] completed date=%s scraped=%s deduped=%s relevant=%s",
             pipeline_run_id,
@@ -72,6 +82,7 @@ def run_wellfound_classify_only_pipeline(
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         WELLFOUND_CLASSIFY_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(WELLFOUND_CLASSIFY_RUN_METRICS)
         logger.exception("wellfound-classify-only[%s] failed: %s", pipeline_run_id, exc)
         raise
 

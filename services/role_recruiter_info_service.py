@@ -14,6 +14,15 @@ logger = logging.getLogger(__name__)
 ROLE_RECRUITER_INFO_RUN_METRICS: dict[str, dict[str, Any]] = {}
 
 
+def _cap_metrics_dict(d: dict, max_size: int = 50) -> None:
+    while len(d) > max_size:
+        try:
+            del d[next(iter(d))]
+        except StopIteration:
+            break
+
+
+
 def run_role_recruiter_info_extraction(
     run_id: str | None = None,
     run_date: str | None = None,
@@ -79,6 +88,7 @@ def run_role_recruiter_info_extraction(
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         ROLE_RECRUITER_INFO_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(ROLE_RECRUITER_INFO_RUN_METRICS)
         return metrics
     except Exception as exc:
         metrics = {
@@ -92,6 +102,7 @@ def run_role_recruiter_info_extraction(
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         ROLE_RECRUITER_INFO_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(ROLE_RECRUITER_INFO_RUN_METRICS)
         logger.exception("role-recruiter-info[%s] failed: %s", pipeline_run_id, exc)
         raise
 

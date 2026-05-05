@@ -15,6 +15,15 @@ logger = logging.getLogger(__name__)
 HIRECAFE_RUN_METRICS: dict[str, dict[str, Any]] = {}
 
 
+def _cap_metrics_dict(d: dict, max_size: int = 50) -> None:
+    while len(d) > max_size:
+        try:
+            del d[next(iter(d))]
+        except StopIteration:
+            break
+
+
+
 def _sheet_run_date_ist() -> str:
     """YYYY-MM-DD in ``CRON_TIMEZONE`` (default Asia/Kolkata / IST), not the host system date."""
     tz = ZoneInfo(os.getenv("CRON_TIMEZONE", "Asia/Kolkata"))
@@ -85,6 +94,7 @@ def run_hirecafe_scrape_only_pipeline(
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         HIRECAFE_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(HIRECAFE_RUN_METRICS)
         logger.info(
             "hirecafe-only pipeline[%s] completed scraped_count=%s",
             pipeline_run_id, len(rows_for_sheet),
@@ -100,6 +110,7 @@ def run_hirecafe_scrape_only_pipeline(
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         HIRECAFE_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(HIRECAFE_RUN_METRICS)
         logger.exception("hirecafe-only pipeline[%s] failed: %s", pipeline_run_id, exc)
         raise
 

@@ -15,6 +15,15 @@ logger = logging.getLogger(__name__)
 RELEVANT_JOBS_TAB_FIX_RUN_METRICS: dict[str, dict[str, Any]] = {}
 
 
+def _cap_metrics_dict(d: dict, max_size: int = 50) -> None:
+    while len(d) > max_size:
+        try:
+            del d[next(iter(d))]
+        except StopIteration:
+            break
+
+
+
 def run_fix_relevant_jobs_tab(run_id: str | None = None, run_date: str | None = None) -> dict[str, Any]:
     pipeline_run_id = run_id or str(uuid.uuid4())
     resolved_run_date = _resolve_run_date(run_date)
@@ -114,6 +123,7 @@ def run_fix_relevant_jobs_tab(run_id: str | None = None, run_date: str | None = 
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         RELEVANT_JOBS_TAB_FIX_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(RELEVANT_JOBS_TAB_FIX_RUN_METRICS)
         return metrics
     except Exception as exc:
         metrics = {
@@ -125,6 +135,7 @@ def run_fix_relevant_jobs_tab(run_id: str | None = None, run_date: str | None = 
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         RELEVANT_JOBS_TAB_FIX_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(RELEVANT_JOBS_TAB_FIX_RUN_METRICS)
         logger.exception("relevant-jobs-tab-fix[%s] failed: %s", pipeline_run_id, exc)
         raise
 

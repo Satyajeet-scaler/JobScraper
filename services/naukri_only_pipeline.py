@@ -14,6 +14,15 @@ logger = logging.getLogger(__name__)
 NAUKRI_RUN_METRICS: dict[str, dict[str, Any]] = {}
 
 
+def _cap_metrics_dict(d: dict, max_size: int = 50) -> None:
+    while len(d) > max_size:
+        try:
+            del d[next(iter(d))]
+        except StopIteration:
+            break
+
+
+
 def run_naukri_scrape_only_pipeline(run_id: str | None = None) -> dict[str, Any]:
     """
     Scrape only Naukri via Apify and write scraped rows to a dedicated sheet tab.
@@ -90,6 +99,7 @@ def run_naukri_scrape_only_pipeline(run_id: str | None = None) -> dict[str, Any]
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         NAUKRI_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(NAUKRI_RUN_METRICS)
         logger.info("naukri-only pipeline[%s] completed scraped_count=%s", pipeline_run_id, len(rows_for_sheet))
         return metrics
     except Exception as exc:
@@ -102,6 +112,7 @@ def run_naukri_scrape_only_pipeline(run_id: str | None = None) -> dict[str, Any]
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         NAUKRI_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(NAUKRI_RUN_METRICS)
         logger.exception("naukri-only pipeline[%s] failed: %s", pipeline_run_id, exc)
         raise
 

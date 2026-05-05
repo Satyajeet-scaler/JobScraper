@@ -15,6 +15,15 @@ from services.google_sheets import GoogleSheetsWriter
 logger = logging.getLogger(__name__)
 WELLFOUND_RUN_METRICS: dict[str, dict[str, Any]] = {}
 
+
+def _cap_metrics_dict(d: dict, max_size: int = 50) -> None:
+    while len(d) > max_size:
+        try:
+            del d[next(iter(d))]
+        except StopIteration:
+            break
+
+
 TARGET_ROLES = [
     "Developer",
     "Data Engineer",
@@ -139,6 +148,7 @@ def _run_wellfound_scrape_only_pipeline(
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         WELLFOUND_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(WELLFOUND_RUN_METRICS)
         logger.info(
             "wellfound-only pipeline[%s] completed raw=%s post_time=%s written=%s",
             pipeline_run_id,
@@ -157,6 +167,7 @@ def _run_wellfound_scrape_only_pipeline(
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         WELLFOUND_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(WELLFOUND_RUN_METRICS)
         logger.exception("wellfound-only pipeline[%s] failed: %s", pipeline_run_id, exc)
         raise
 

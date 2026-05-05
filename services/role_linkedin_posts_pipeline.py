@@ -38,8 +38,35 @@ from services.slack_handover_notify import (
 logger = logging.getLogger(__name__)
 
 ROLE_LINKEDIN_POSTS_SCRAPE_RUN_METRICS: dict[str, dict[str, Any]] = {}
+
+
+def _cap_metrics_dict(d: dict, max_size: int = 50) -> None:
+    while len(d) > max_size:
+        try:
+            del d[next(iter(d))]
+        except StopIteration:
+            break
+
 ROLE_LINKEDIN_POSTS_CLASSIFY_RUN_METRICS: dict[str, dict[str, Any]] = {}
+
+
+def _cap_metrics_dict(d: dict, max_size: int = 50) -> None:
+    while len(d) > max_size:
+        try:
+            del d[next(iter(d))]
+        except StopIteration:
+            break
+
 ROLE_LINKEDIN_POSTS_NOTIFY_RUN_METRICS: dict[str, dict[str, Any]] = {}
+
+
+def _cap_metrics_dict(d: dict, max_size: int = 50) -> None:
+    while len(d) > max_size:
+        try:
+            del d[next(iter(d))]
+        except StopIteration:
+            break
+
 
 _linkedin_posts_role_config_file_cache: dict[str, Any] | None = None
 _linkedin_posts_role_config_file_cache_valid: bool = False
@@ -131,6 +158,7 @@ def run_role_linkedin_posts_scrape_only(
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         ROLE_LINKEDIN_POSTS_SCRAPE_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(ROLE_LINKEDIN_POSTS_SCRAPE_RUN_METRICS)
         return metrics
     except Exception as exc:
         metrics = {
@@ -144,6 +172,7 @@ def run_role_linkedin_posts_scrape_only(
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         ROLE_LINKEDIN_POSTS_SCRAPE_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(ROLE_LINKEDIN_POSTS_SCRAPE_RUN_METRICS)
         logger.exception("role-linkedin-posts-scrape-only[%s] failed: %s", pipeline_run_id, exc)
         raise
 
@@ -264,6 +293,7 @@ def run_role_linkedin_posts_classify_only(
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         ROLE_LINKEDIN_POSTS_CLASSIFY_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(ROLE_LINKEDIN_POSTS_CLASSIFY_RUN_METRICS)
         return metrics
     except Exception as exc:
         metrics = {
@@ -277,6 +307,7 @@ def run_role_linkedin_posts_classify_only(
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         ROLE_LINKEDIN_POSTS_CLASSIFY_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(ROLE_LINKEDIN_POSTS_CLASSIFY_RUN_METRICS)
         logger.exception("role-linkedin-posts-classify-only[%s] failed: %s", pipeline_run_id, exc)
         raise
 

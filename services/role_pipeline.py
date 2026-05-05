@@ -1,3 +1,4 @@
+import gc
 import logging
 import os
 import re
@@ -26,6 +27,15 @@ from services.role_scrapers import SCRAPER_REGISTRY
 logger = logging.getLogger(__name__)
 
 ROLE_SCRAPE_RUN_METRICS: dict[str, dict[str, Any]] = {}
+
+
+def _cap_metrics_dict(d: dict, max_size: int = 50) -> None:
+    while len(d) > max_size:
+        try:
+            del d[next(iter(d))]
+        except StopIteration:
+            break
+
 ROLE_CLASSIFY_RUN_METRICS: dict[str, dict[str, Any]] = {}
 ROLE_PIPELINE_ALLOWED_SOURCES = SCRAPER_REGISTRY.available_sources()
 ROLE_PIPELINE_SOURCE_ALIASES: dict[str, str] = {
@@ -135,6 +145,9 @@ def run_role_scrape_only(
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         ROLE_SCRAPE_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(ROLE_SCRAPE_RUN_METRICS)
+        del scraped, deduped, new_rows, new_rows_with_run, existing_scraped_rows
+        gc.collect()
         return metrics
     except Exception as exc:
         metrics = {
@@ -149,7 +162,9 @@ def run_role_scrape_only(
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         ROLE_SCRAPE_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(ROLE_SCRAPE_RUN_METRICS)
         logger.exception("role-scrape-only[%s] failed: %s", pipeline_run_id, exc)
+        gc.collect()
         raise
 
 
@@ -274,6 +289,9 @@ def run_role_classify_only(
             metrics["post_classify_recruiter_summary"] = recruiter_summary
             metrics["post_classify_slack_summary"] = slack_summary
         ROLE_CLASSIFY_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(ROLE_CLASSIFY_RUN_METRICS)
+        del classify_input_rows, relevant, relevant_deduped, relevant_rows_with_run
+        gc.collect()
         return metrics
     except Exception as exc:
         metrics = {
@@ -287,7 +305,9 @@ def run_role_classify_only(
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         ROLE_CLASSIFY_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(ROLE_CLASSIFY_RUN_METRICS)
         logger.exception("role-classify-only[%s] failed: %s", pipeline_run_id, exc)
+        gc.collect()
         raise
 
 

@@ -24,6 +24,7 @@ Each adapter reads the keys it cares about from its own config dict
 and falls back to env-var defaults when a key is absent.
 """
 
+import gc
 import logging
 import math
 import os
@@ -255,6 +256,8 @@ class JobSpyAdapter:
             item["role_query"] = query
         all_jobs.extend(indeed_items)
 
+        del linkedin_df, indeed_df
+        gc.collect()
         return all_jobs
 
 

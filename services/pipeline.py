@@ -1,3 +1,4 @@
+import gc
 import json
 import logging
 import math
@@ -48,6 +49,14 @@ TARGET_ROLES = [
 TARGET_SITES = ["linkedin", "indeed"]
 PIPELINE_RUN_METRICS: dict[str, dict[str, Any]] = {}
 logger = logging.getLogger(__name__)
+
+
+def _cap_metrics_dict(d: dict, max_size: int = 50) -> None:
+    while len(d) > max_size:
+        try:
+            del d[next(iter(d))]
+        except StopIteration:
+            break
 
 
 def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
@@ -195,7 +204,10 @@ def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         PIPELINE_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(PIPELINE_RUN_METRICS)
         logger.info("pipeline[%s] completed duration_seconds=%s", pipeline_run_id, metrics["duration_seconds"])
+        del scraped, deduped, relevant, relevant_deduped
+        gc.collect()
         return metrics
     except Exception as exc:
         tb = traceback.format_exc()
@@ -208,7 +220,9 @@ def run_daily_jobs_pipeline(run_id: str | None = None) -> dict[str, Any]:
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         PIPELINE_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(PIPELINE_RUN_METRICS)
         logger.exception("pipeline[%s] failed: %s", pipeline_run_id, exc)
+        gc.collect()
         raise
 
 
@@ -443,6 +457,8 @@ def _scrape_target_jobs() -> list[dict[str, Any]]:
         len(filtered_jobs),
         len(normalized_jobs) - len(filtered_jobs),
     )
+    del all_jobs, normalized_jobs
+    gc.collect()
     return filtered_jobs
 
 

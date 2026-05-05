@@ -34,6 +34,15 @@ except ImportError:  # pragma: no cover - optional dependency behavior
 
 logger = logging.getLogger(__name__)
 LINKEDIN_POSTS_RUN_METRICS: dict[str, dict[str, Any]] = {}
+
+
+def _cap_metrics_dict(d: dict, max_size: int = 50) -> None:
+    while len(d) > max_size:
+        try:
+            del d[next(iter(d))]
+        except StopIteration:
+            break
+
 _SLACK_TEXT_SOFT_LIMIT = 3500
 
 
@@ -108,6 +117,7 @@ def run_linkedin_posts_pipeline(
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         LINKEDIN_POSTS_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(LINKEDIN_POSTS_RUN_METRICS)
         logger.info(
             "linkedin-posts pipeline[%s] completed scraped=%s relevant=%s",
             pipeline_run_id,
@@ -125,6 +135,7 @@ def run_linkedin_posts_pipeline(
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         LINKEDIN_POSTS_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(LINKEDIN_POSTS_RUN_METRICS)
         logger.exception("linkedin-posts pipeline[%s] failed: %s", pipeline_run_id, exc)
         raise
 

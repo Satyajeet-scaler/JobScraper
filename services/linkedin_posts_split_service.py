@@ -24,7 +24,25 @@ from services.linkedin_posts_pipeline import (
 logger = logging.getLogger(__name__)
 
 LINKEDIN_POSTS_SCRAPE_ONLY_RUN_METRICS: dict[str, dict[str, Any]] = {}
+
+
+def _cap_metrics_dict(d: dict, max_size: int = 50) -> None:
+    while len(d) > max_size:
+        try:
+            del d[next(iter(d))]
+        except StopIteration:
+            break
+
 LINKEDIN_POSTS_CLASSIFY_ONLY_RUN_METRICS: dict[str, dict[str, Any]] = {}
+
+
+def _cap_metrics_dict(d: dict, max_size: int = 50) -> None:
+    while len(d) > max_size:
+        try:
+            del d[next(iter(d))]
+        except StopIteration:
+            break
+
 
 
 def run_linkedin_posts_scrape_only(run_id: str | None = None, run_date: str | None = None) -> dict[str, Any]:
@@ -65,6 +83,7 @@ def run_linkedin_posts_scrape_only(run_id: str | None = None, run_date: str | No
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         LINKEDIN_POSTS_SCRAPE_ONLY_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(LINKEDIN_POSTS_SCRAPE_ONLY_RUN_METRICS)
         return metrics
     except Exception as exc:
         metrics = {
@@ -76,6 +95,7 @@ def run_linkedin_posts_scrape_only(run_id: str | None = None, run_date: str | No
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         LINKEDIN_POSTS_SCRAPE_ONLY_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(LINKEDIN_POSTS_SCRAPE_ONLY_RUN_METRICS)
         logger.exception("linkedin-posts-scrape-only[%s] failed: %s", pipeline_run_id, exc)
         raise
 
@@ -179,6 +199,7 @@ def run_linkedin_posts_classify_only(run_id: str | None = None, run_date: str | 
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         LINKEDIN_POSTS_CLASSIFY_ONLY_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(LINKEDIN_POSTS_CLASSIFY_ONLY_RUN_METRICS)
         return metrics
     except Exception as exc:
         metrics = {
@@ -190,6 +211,7 @@ def run_linkedin_posts_classify_only(run_id: str | None = None, run_date: str | 
             "duration_seconds": round(perf_counter() - started_at, 2),
         }
         LINKEDIN_POSTS_CLASSIFY_ONLY_RUN_METRICS[pipeline_run_id] = metrics
+        _cap_metrics_dict(LINKEDIN_POSTS_CLASSIFY_ONLY_RUN_METRICS)
         logger.exception("linkedin-posts-classify-only[%s] failed: %s", pipeline_run_id, exc)
         raise
 

@@ -14,17 +14,6 @@ else
     echo "[!] /data directory not found, skipping chown."
 fi
 
-# Create a setuid helper so the unprivileged appuser can drop kernel page caches.
-# This is the main lever for reducing Railway's billed cgroup memory after heavy I/O.
-cat > /usr/local/bin/drop_page_cache << 'HELPEREOF'
-#!/bin/sh
-# setuid root helper — must be installed by root before dropping privileges.
-sync
-echo 1 > /proc/sys/vm/drop_caches
-HELPEREOF
-chmod 4755 /usr/local/bin/drop_page_cache
-echo "[*] setuid helper /usr/local/bin/drop_page_cache installed."
-
 # Ensure appuser home is writable for xvfb authority files
 # Export environment
 export HOME=/home/appuser

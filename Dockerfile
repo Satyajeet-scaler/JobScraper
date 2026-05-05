@@ -32,6 +32,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgtk-3-0 \
     libasound2 \
     libx11-xcb1 \
+    gcc \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user — reduces bot detection flags from running as uid 0
@@ -54,6 +55,11 @@ RUN playwright install --with-deps chromium \
     && chmod -R 755 /home/appuser/.cache /opt/pw-browsers
 
 COPY . /app
+
+# Compile the setuid root helper so the unprivileged appuser can drop page caches.
+RUN gcc -o /usr/local/bin/drop_page_cache /app/drop_page_cache.c \
+    && chmod 4755 /usr/local/bin/drop_page_cache \
+    && rm /app/drop_page_cache.c
 
 # Ensure app dir and browser cache are accessible by appuser
 RUN mkdir -p /data/chrome_profile /home/appuser/.cache \

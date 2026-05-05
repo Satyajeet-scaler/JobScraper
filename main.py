@@ -5,6 +5,7 @@ import math
 import multiprocessing
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import uuid
@@ -300,6 +301,7 @@ def _run_in_subprocess(func, *args, **kwargs) -> int:
         logger.error("subprocess %s pid=%d exited with code %d", name, proc.pid, exitcode)
     proc.close()
 
+    _cleanup_lingering_browsers()
     gc.collect()
     _malloc_trim()
     _drop_page_cache()
@@ -823,13 +825,58 @@ def _drop_page_cache() -> bool:
     Railway/cgroup memory accounting includes page cache, so dropping it
     directly reduces the billed container memory after heavy I/O (HTTP
     responses from Apify/Sheets, Playwright page loads, Chromium temp files).
+
+    Uses the setuid root helper installed by entrypoint.sh so this works
+    even when the uvicorn worker runs as an unprivileged user.
     """
+    helper = "/usr/local/bin/drop_page_cache"
+    if os.path.exists(helper):
+        try:
+            subprocess.run([helper], check=True, capture_output=True)
+            return True
+        except (subprocess.CalledProcessError, OSError, PermissionError):
+            pass
+    # Fallback — works only if running as root or with CAP_SYS_ADMIN.
     try:
         with open("/proc/sys/vm/drop_caches", "w") as f:
             f.write("1\n")
         return True
     except (OSError, PermissionError):
         return False
+
+
+def _cleanup_lingering_browsers() -> None:
+    """
+    Kill any zombie browser processes left behind by subprocess scrapers
+    and remove their temp directories. Browsers (Chrome/Camoufox) write
+    profiles and caches to /tmp tmpfs, which counts toward cgroup memory.
+    """
+    for name in ("chrome", "chromium", "firefox", "camoufox"):
+        try:
+            subprocess.run(
+                ["pkill", "-9", "-f", name],
+                capture_output=True,
+                timeout=5,
+            )
+        except Exception:
+            pass
+
+    import glob
+
+    for pattern in (
+        "/tmp/uc_chromedriver/*",
+        "/tmp/.com.google.Chrome.*",
+        "/tmp/playwright_*",
+        "/tmp/camoufox_*",
+    ):
+        for path in glob.glob(pattern):
+            try:
+                if os.path.isdir(path):
+                    shutil.rmtree(path, ignore_errors=True)
+                else:
+                    os.unlink(path)
+            except OSError:
+                pass
 
 
 def _get_cgroup_memory_mb() -> float:

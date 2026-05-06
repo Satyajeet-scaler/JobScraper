@@ -33,6 +33,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libasound2 \
     libx11-xcb1 \
     gcc \
+    libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Non-root user — reduces bot detection flags from running as uid 0

@@ -920,7 +920,11 @@ def _cgroup_memory_reclaim(target_bytes: int) -> int:
         write_ok = True
     except (OSError, PermissionError) as exc:
         write_errno = getattr(exc, "errno", None)
-        if write_errno in (1, 2, 13):  # EPERM, ENOENT, EACCES
+        # Permanent: EPERM (1), ENOENT (2), EACCES (13), EROFS (30 — Railway
+        # mounts /sys/fs/cgroup read-only inside the container).
+        # Transient (no latch): EAGAIN, EBUSY, EINVAL — the file is writable
+        # in principle but the kernel rejected this specific value/state.
+        if write_errno in (1, 2, 13, 30):
             _CGROUP_RECLAIM_KNOWN_BROKEN = True
     after = _get_cgroup_memory_mb() * 1024 * 1024
     freed = max(0, int(before - after))

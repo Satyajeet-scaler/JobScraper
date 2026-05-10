@@ -1146,9 +1146,10 @@ def _drive_to_baseline(*, allow_balloon: bool = True) -> dict[str, Any]:
          cache + shrink slab inside our cgroup. This is the only mechanism that
          reduces the "billed" memory you see on Railway when there's no global
          memory pressure.
-      4. Balloon fallback (only if memory.reclaim was a no-op AND the gap to
-         baseline is meaningful). Allocates and frees a buffer to force the
-         kernel to evict cache by making room for the allocation.
+      4. Balloon fallback (any time we're still meaningfully above baseline
+         after step 3, regardless of *why* memory.reclaim couldn't help —
+         Railway's kernel silently rejects writes to memory.reclaim instead
+         of returning an error, so we can't gate this on a "broken" flag).
       5. Best-effort ``drop_caches`` (no-op on Railway, kept for self-hosted).
     """
     baseline_mb = _memory_baseline_mb()
@@ -1172,15 +1173,24 @@ def _drive_to_baseline(*, allow_balloon: bool = True) -> dict[str, Any]:
     cgroup_after_reclaim = _get_cgroup_memory_mb()
     still_over_bytes = int((cgroup_after_reclaim - baseline_mb) * 1024 * 1024)
 
+    # Engage the balloon whenever there is still a meaningful gap to baseline.
+    # We deliberately do NOT require ``_CGROUP_RECLAIM_KNOWN_BROKEN`` here:
+    # Railway-class containers tend to silently accept the write to
+    # memory.reclaim without actually reclaiming anything, so keying the
+    # fallback on an exception flag would (and did) leave the balloon dormant
+    # and the cgroup stuck high. If memory.reclaim *did* work, then
+    # ``still_over_bytes`` will already be small and the threshold below
+    # short-circuits the balloon naturally.
     reclaimed_via_balloon = 0
     if (
         allow_balloon
-        and _CGROUP_RECLAIM_KNOWN_BROKEN
         and not _BALLOON_FALLBACK_DISABLED
-        and still_over_bytes > 128 * 1024 * 1024
+        and still_over_bytes > 64 * 1024 * 1024
     ):
-        # Cap the balloon to avoid spiking too close to the cgroup ceiling.
-        balloon_cap = min(still_over_bytes, 512 * 1024 * 1024)
+        # Cap the balloon so a slow-leaking process doesn't trip the cgroup
+        # ceiling. 768 MB is enough to clear a typical scrape's residual
+        # without risking a small (1 GB plan) Railway service.
+        balloon_cap = min(still_over_bytes, 768 * 1024 * 1024)
         reclaimed_via_balloon = _force_reclaim_via_balloon(balloon_cap)
 
     page_cache_dropped = _drop_page_cache()

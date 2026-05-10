@@ -886,86 +886,121 @@ def _find_cgroup_reclaim_path() -> str | None:
     return None
 
 
+_CGROUP_RECLAIM_LOGGED_DIAG = False
+
+
 def _cgroup_memory_reclaim(target_bytes: int) -> int:
     """
     Ask the kernel to reclaim up to ``target_bytes`` of file-backed page cache,
     slab caches, and (with swap) anonymous memory from this container's cgroup.
 
     Cgroup v2 exposes ``memory.reclaim`` (kernel >= 5.12, writable since 5.19).
-    Railway and most modern PaaS use cgroup v2 with delegation, so this is the
-    one supported way to reproduce the "fresh redeploy" baseline from inside an
-    unprivileged container.
-
-    Returns the cgroup memory delta in bytes (positive = freed). Returns 0 and
-    latches a global flag if the kernel/container doesn't support it, so we
-    don't keep retrying on every cron cycle.
+    Returns the cgroup memory delta in bytes (positive = freed). Returns 0 if
+    the kernel silently rejects the write (Railway-class containers do this on
+    older kernels) or if there is nothing reclaimable.
     """
-    global _CGROUP_RECLAIM_KNOWN_BROKEN
+    global _CGROUP_RECLAIM_KNOWN_BROKEN, _CGROUP_RECLAIM_LOGGED_DIAG
     if _CGROUP_RECLAIM_KNOWN_BROKEN or target_bytes <= 0:
         return 0
 
     path = _find_cgroup_reclaim_path()
     if not path:
+        if not _CGROUP_RECLAIM_LOGGED_DIAG:
+            logger.info("cgroup memory.reclaim diag: file not found; using balloon only")
+            _CGROUP_RECLAIM_LOGGED_DIAG = True
         _CGROUP_RECLAIM_KNOWN_BROKEN = True
         return 0
 
     before = _get_cgroup_memory_mb() * 1024 * 1024
+    write_errno = None
+    write_ok = False
     try:
         with open(path, "w") as f:
             f.write(str(int(target_bytes)))
+        write_ok = True
     except (OSError, PermissionError) as exc:
-        # EAGAIN / EBUSY: kernel couldn't reclaim that much right now — partial
-        # reclaim may still have happened, so don't latch broken on those.
-        # ENOENT / EACCES / EPERM: feature unavailable in this container.
-        if getattr(exc, "errno", None) in (13, 1, 2):  # EACCES, EPERM, ENOENT
+        write_errno = getattr(exc, "errno", None)
+        if write_errno in (1, 2, 13):  # EPERM, ENOENT, EACCES
             _CGROUP_RECLAIM_KNOWN_BROKEN = True
-            logger.info(
-                "cgroup memory.reclaim unsupported in this container (%s); "
-                "falling back to balloon if enabled",
-                exc,
-            )
-            return 0
-        # else: transient — try again next cycle.
     after = _get_cgroup_memory_mb() * 1024 * 1024
-    return max(0, int(before - after))
+    freed = max(0, int(before - after))
+
+    if not _CGROUP_RECLAIM_LOGGED_DIAG:
+        logger.info(
+            "cgroup memory.reclaim diag: path=%s requested=%dMB write_ok=%s errno=%s freed=%dMB",
+            path,
+            target_bytes // (1024 * 1024),
+            write_ok,
+            write_errno,
+            freed // (1024 * 1024),
+        )
+        _CGROUP_RECLAIM_LOGGED_DIAG = True
+
+    return freed
 
 
 def _force_reclaim_via_balloon(target_bytes: int, chunk_mb: int = 64) -> int:
     """
-    Last-resort fallback when ``memory.reclaim`` is unavailable.
+    Allocate and free ``target_bytes`` of anonymous memory in chunks to force
+    the kernel to evict file-backed page cache and shrink slab. Used when
+    ``memory.reclaim`` is silently rejected by the container's kernel.
 
-    Briefly allocate and touch ``target_bytes`` of anonymous memory in chunks,
-    then free it. Forcing the kernel to make room for these pages causes it to
-    evict file-backed page cache and shrink slab. Because our glibc is
-    configured with ``MALLOC_MMAP_THRESHOLD_=64KB`` (see Dockerfile), large
-    chunks come from ``mmap`` and are returned to the OS immediately on free,
-    so net memory after this returns to (pre-balloon - reclaimed_cache).
-
-    ``MEMORY_BALLOON_FALLBACK_DISABLED=true`` turns this off if the temporary
-    spike (~target_bytes) risks tripping the cgroup limit on small plans.
+    Returns ``cgroup_before - cgroup_after`` in bytes (positive = freed). May
+    legitimately return 0 even when reclaim happened: ``MALLOC_MMAP_THRESHOLD_``
+    sends large allocations through ``mmap``, which is returned to the OS
+    immediately on free, so a successful balloon that freed exactly its own
+    size of cache shows up as net-zero. The peak-during-balloon log line below
+    is what tells you the balloon actually ran.
     """
-    if _BALLOON_FALLBACK_DISABLED or target_bytes <= 0:
+    if _BALLOON_FALLBACK_DISABLED:
+        logger.info("balloon: skipped (MEMORY_BALLOON_FALLBACK_DISABLED=true)")
         return 0
+    if target_bytes <= 0:
+        return 0
+
     chunk = chunk_mb * 1024 * 1024
     n_chunks = max(1, target_bytes // chunk)
     before = _get_cgroup_memory_mb() * 1024 * 1024
+    peak = before
+    chunks_allocated = 0
+    hit_memory_error = False
+
     buffers: list[bytearray] = []
     try:
         for _ in range(n_chunks):
             try:
                 buf = bytearray(chunk)
-                # Touch one byte per 4KB page to actually back the allocation.
                 for off in range(0, len(buf), 4096):
                     buf[off] = 1
                 buffers.append(buf)
+                chunks_allocated += 1
+                cur = _get_cgroup_memory_mb() * 1024 * 1024
+                if cur > peak:
+                    peak = cur
             except MemoryError:
+                hit_memory_error = True
                 break
     finally:
         buffers.clear()
         gc.collect()
         _malloc_trim()
+
     after = _get_cgroup_memory_mb() * 1024 * 1024
-    return max(0, int(before - after))
+    freed = max(0, int(before - after))
+
+    logger.info(
+        "balloon ran: requested=%dMB chunks=%d/%d peak_during=%dMB before=%dMB after=%dMB net_freed=%dMB oom_during_alloc=%s",
+        target_bytes // (1024 * 1024),
+        chunks_allocated,
+        n_chunks,
+        peak // (1024 * 1024),
+        before // (1024 * 1024),
+        after // (1024 * 1024),
+        freed // (1024 * 1024),
+        hit_memory_error,
+    )
+
+    return freed
 
 
 def _drop_page_cache() -> bool:
@@ -1182,16 +1217,28 @@ def _drive_to_baseline(*, allow_balloon: bool = True) -> dict[str, Any]:
     # ``still_over_bytes`` will already be small and the threshold below
     # short-circuits the balloon naturally.
     reclaimed_via_balloon = 0
-    if (
-        allow_balloon
-        and not _BALLOON_FALLBACK_DISABLED
-        and still_over_bytes > 64 * 1024 * 1024
-    ):
-        # Cap the balloon so a slow-leaking process doesn't trip the cgroup
-        # ceiling. 768 MB is enough to clear a typical scrape's residual
-        # without risking a small (1 GB plan) Railway service.
-        balloon_cap = min(still_over_bytes, 768 * 1024 * 1024)
-        reclaimed_via_balloon = _force_reclaim_via_balloon(balloon_cap)
+    if still_over_bytes > 64 * 1024 * 1024:
+        if not allow_balloon:
+            logger.info(
+                "balloon: skipped (allow_balloon=False) still_over=%dMB",
+                still_over_bytes // (1024 * 1024),
+            )
+        elif _BALLOON_FALLBACK_DISABLED:
+            logger.info(
+                "balloon: skipped (MEMORY_BALLOON_FALLBACK_DISABLED=true) still_over=%dMB",
+                still_over_bytes // (1024 * 1024),
+            )
+        else:
+            # Cap the balloon so a slow-leaking process doesn't trip the
+            # cgroup ceiling. 768 MB clears a typical scrape's residual
+            # without risking a 1 GB Railway plan.
+            balloon_cap = min(still_over_bytes, 768 * 1024 * 1024)
+            reclaimed_via_balloon = _force_reclaim_via_balloon(balloon_cap)
+    elif still_over_bytes > 0:
+        logger.info(
+            "balloon: skipped (overshoot %dMB below 64MB threshold)",
+            still_over_bytes // (1024 * 1024),
+        )
 
     page_cache_dropped = _drop_page_cache()
     cgroup_after = _get_cgroup_memory_mb()

@@ -10,6 +10,8 @@ from contextlib import suppress
 from pathlib import Path
 from typing import Any, Sequence
 
+from services.playwright_launch import chromium_launch_kwargs
+
 logger = logging.getLogger(__name__)
 
 
@@ -83,7 +85,7 @@ async def fetch_html_playwright(
 
     async def _fetch_once() -> str:
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=headless)
+            browser = await p.chromium.launch(**chromium_launch_kwargs(headless=headless))
             try:
                 context = await browser.new_context(**ctx_kwargs)
                 page = await context.new_page()
@@ -152,7 +154,7 @@ async def fetch_html_playwright_many(
 
         async def _open_session():
             nonlocal browser, context
-            browser = await p.chromium.launch(headless=headless)
+            browser = await p.chromium.launch(**chromium_launch_kwargs(headless=headless))
             context = await browser.new_context(**ctx_kwargs)
 
         async def _close_session():

@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import uuid
 import logging
 import zipfile
@@ -283,41 +284,71 @@ def _cron_today() -> str:
 
 def _run_in_subprocess(func, *args, **kwargs) -> int:
     """
-    Run func(*args, **kwargs) in a spawned child process.
+    Run ``func(*args, **kwargs)`` in a spawned child process.
+
     Spawn gives a clean minimal process instead of copying the bloated parent.
-    After join, we also gc + malloc_trim the parent and drop page cache
-    so the container-level memory (cgroup) drops back to baseline.
+    After ``join``, we run ``_drive_to_baseline`` to bring the container's
+    cgroup memory back to ``MEMORY_BASELINE_MB`` (default 350 MB) — i.e. the
+    fresh-redeploy state — using tmpfs cleanup, ``cgroup memory.reclaim``, and
+    a balloon fallback. See ``_drive_to_baseline`` for details.
     """
     name = getattr(func, "__name__", str(func))
     rss_before = _get_rss_mb()
-    cgroup_before = _get_cgroup_memory_mb()
     proc = multiprocessing.Process(target=func, args=args, kwargs=kwargs)
-    proc.start()
-    proc.join()
-    exitcode = proc.exitcode if proc.exitcode is not None else -1
-    if exitcode == 0:
-        logger.info("subprocess %s pid=%d completed successfully", name, proc.pid)
-    else:
-        logger.error("subprocess %s pid=%d exited with code %d", name, proc.pid, exitcode)
-    proc.close()
-
-    _cleanup_lingering_browsers()
-    gc.collect()
-    _malloc_trim()
-    _drop_page_cache()
-    rss_after = _get_rss_mb()
-    cgroup_after = _get_cgroup_memory_mb()
-    logger.info(
-        "cron memory after %s rss_before=%.1fMB rss_after=%.1fMB freed=%.1fMB "
-        "cgroup_before=%.1fMB cgroup_after=%.1fMB freed=%.1fMB",
-        name,
-        rss_before,
-        rss_after,
-        rss_before - rss_after,
-        cgroup_before,
-        cgroup_after,
-        cgroup_before - cgroup_after,
-    )
+    exitcode = -1
+    try:
+        proc.start()
+        proc.join()
+        exitcode = proc.exitcode if proc.exitcode is not None else -1
+        if exitcode == 0:
+            logger.info("subprocess %s pid=%d completed successfully", name, proc.pid)
+        else:
+            logger.error("subprocess %s pid=%d exited with code %d", name, proc.pid, exitcode)
+    except BaseException:
+        logger.exception("subprocess %s parent-side error", name)
+        # Make sure the child doesn't outlive us if we somehow got here while it
+        # was still running (KeyboardInterrupt, SystemExit, etc.).
+        if proc.is_alive():
+            try:
+                proc.terminate()
+                proc.join(timeout=10)
+                if proc.is_alive():
+                    proc.kill()
+                    proc.join(timeout=5)
+            except Exception:
+                pass
+        raise
+    finally:
+        # Always release the Process handle and run the reclaim chain, even on
+        # subprocess crash, OOM-kill, parent-side exception, or odd exit codes.
+        try:
+            proc.close()
+        except Exception:
+            pass
+        try:
+            stats = _drive_to_baseline()
+            rss_after = _get_rss_mb()
+            logger.info(
+                "cron memory after %s rss_before=%.1fMB rss_after=%.1fMB rss_freed=%.1fMB | "
+                "cgroup %.1fMB -> %.1fMB (target=%.0fMB, hit=%s, freed=%.1fMB) | "
+                "tmpfs[files=%d dirs=%d freed=%.1fMB] cgroup_reclaim=%.1fMB balloon=%.1fMB",
+                name,
+                rss_before,
+                rss_after,
+                rss_before - rss_after,
+                stats["cgroup_before_mb"],
+                stats["cgroup_after_mb"],
+                stats["baseline_mb"],
+                stats["hit_baseline"],
+                stats["freed_total_mb"],
+                stats["tmpfs_files_removed"],
+                stats["tmpfs_dirs_removed"],
+                stats["tmpfs_mb_freed"],
+                stats["cgroup_reclaim_mb"],
+                stats["balloon_mb"],
+            )
+        except Exception:
+            logger.exception("cron memory cleanup after %s failed", name)
     return exitcode
 
 
@@ -819,39 +850,270 @@ def _malloc_trim() -> bool:
         return False
 
 
-def _drop_page_cache() -> bool:
-    """
-    Ask the kernel to drop clean file-backed page cache.
-    Railway/cgroup memory accounting includes page cache, so dropping it
-    directly reduces the billed container memory after heavy I/O (HTTP
-    responses from Apify/Sheets, Playwright page loads, Chromium temp files).
+# Note: writing to /proc/sys/vm/drop_caches requires CAP_SYS_ADMIN on the host
+# kernel, which Railway (and most container PaaS) does not grant. Setuid root
+# alone is not enough. We keep this as a best-effort fallback for self-hosted
+# Linux but treat it as a confirmed no-op on Railway and don't rely on it for
+# the memory cleanup story — tmpfs file deletion (below) is what actually
+# reduces cgroup memory in production.
+_DROP_PAGE_CACHE_KNOWN_BROKEN = False
+_CGROUP_RECLAIM_KNOWN_BROKEN = False
+_BALLOON_FALLBACK_DISABLED = os.getenv("MEMORY_BALLOON_FALLBACK_DISABLED", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
 
-    Uses the setuid root helper installed by entrypoint.sh so this works
-    even when the uvicorn worker runs as an unprivileged user.
+
+def _find_cgroup_reclaim_path() -> str | None:
+    """Locate the writable ``memory.reclaim`` for the current container's cgroup v2."""
+    candidates = ["/sys/fs/cgroup/memory.reclaim"]
+    try:
+        with open("/proc/self/cgroup") as f:
+            for line in f:
+                # cgroup v2 lines look like: 0::/some/path
+                parts = line.strip().split(":", 2)
+                if len(parts) == 3 and parts[1] == "":
+                    rel = parts[2].lstrip("/")
+                    if rel:
+                        candidates.append(f"/sys/fs/cgroup/{rel}/memory.reclaim")
+                    break
+    except OSError:
+        pass
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _cgroup_memory_reclaim(target_bytes: int) -> int:
     """
+    Ask the kernel to reclaim up to ``target_bytes`` of file-backed page cache,
+    slab caches, and (with swap) anonymous memory from this container's cgroup.
+
+    Cgroup v2 exposes ``memory.reclaim`` (kernel >= 5.12, writable since 5.19).
+    Railway and most modern PaaS use cgroup v2 with delegation, so this is the
+    one supported way to reproduce the "fresh redeploy" baseline from inside an
+    unprivileged container.
+
+    Returns the cgroup memory delta in bytes (positive = freed). Returns 0 and
+    latches a global flag if the kernel/container doesn't support it, so we
+    don't keep retrying on every cron cycle.
+    """
+    global _CGROUP_RECLAIM_KNOWN_BROKEN
+    if _CGROUP_RECLAIM_KNOWN_BROKEN or target_bytes <= 0:
+        return 0
+
+    path = _find_cgroup_reclaim_path()
+    if not path:
+        _CGROUP_RECLAIM_KNOWN_BROKEN = True
+        return 0
+
+    before = _get_cgroup_memory_mb() * 1024 * 1024
+    try:
+        with open(path, "w") as f:
+            f.write(str(int(target_bytes)))
+    except (OSError, PermissionError) as exc:
+        # EAGAIN / EBUSY: kernel couldn't reclaim that much right now — partial
+        # reclaim may still have happened, so don't latch broken on those.
+        # ENOENT / EACCES / EPERM: feature unavailable in this container.
+        if getattr(exc, "errno", None) in (13, 1, 2):  # EACCES, EPERM, ENOENT
+            _CGROUP_RECLAIM_KNOWN_BROKEN = True
+            logger.info(
+                "cgroup memory.reclaim unsupported in this container (%s); "
+                "falling back to balloon if enabled",
+                exc,
+            )
+            return 0
+        # else: transient — try again next cycle.
+    after = _get_cgroup_memory_mb() * 1024 * 1024
+    return max(0, int(before - after))
+
+
+def _force_reclaim_via_balloon(target_bytes: int, chunk_mb: int = 64) -> int:
+    """
+    Last-resort fallback when ``memory.reclaim`` is unavailable.
+
+    Briefly allocate and touch ``target_bytes`` of anonymous memory in chunks,
+    then free it. Forcing the kernel to make room for these pages causes it to
+    evict file-backed page cache and shrink slab. Because our glibc is
+    configured with ``MALLOC_MMAP_THRESHOLD_=64KB`` (see Dockerfile), large
+    chunks come from ``mmap`` and are returned to the OS immediately on free,
+    so net memory after this returns to (pre-balloon - reclaimed_cache).
+
+    ``MEMORY_BALLOON_FALLBACK_DISABLED=true`` turns this off if the temporary
+    spike (~target_bytes) risks tripping the cgroup limit on small plans.
+    """
+    if _BALLOON_FALLBACK_DISABLED or target_bytes <= 0:
+        return 0
+    chunk = chunk_mb * 1024 * 1024
+    n_chunks = max(1, target_bytes // chunk)
+    before = _get_cgroup_memory_mb() * 1024 * 1024
+    buffers: list[bytearray] = []
+    try:
+        for _ in range(n_chunks):
+            try:
+                buf = bytearray(chunk)
+                # Touch one byte per 4KB page to actually back the allocation.
+                for off in range(0, len(buf), 4096):
+                    buf[off] = 1
+                buffers.append(buf)
+            except MemoryError:
+                break
+    finally:
+        buffers.clear()
+        gc.collect()
+        _malloc_trim()
+    after = _get_cgroup_memory_mb() * 1024 * 1024
+    return max(0, int(before - after))
+
+
+def _drop_page_cache() -> bool:
+    """Best-effort kernel page-cache drop. Returns True only if it actually worked."""
+    global _DROP_PAGE_CACHE_KNOWN_BROKEN
+    if _DROP_PAGE_CACHE_KNOWN_BROKEN:
+        return False
+
     helper = "/usr/local/bin/drop_page_cache"
     if os.path.exists(helper):
         try:
-            subprocess.run([helper], check=True, capture_output=True)
+            subprocess.run([helper], check=True, capture_output=True, timeout=5)
             return True
-        except (subprocess.CalledProcessError, OSError, PermissionError):
+        except (subprocess.CalledProcessError, OSError, PermissionError, subprocess.TimeoutExpired):
             pass
-    # Fallback — works only if running as root or with CAP_SYS_ADMIN.
     try:
         with open("/proc/sys/vm/drop_caches", "w") as f:
             f.write("1\n")
         return True
     except (OSError, PermissionError):
+        # Latch on first failure so we don't keep trying every cron cycle.
+        _DROP_PAGE_CACHE_KNOWN_BROKEN = True
         return False
 
 
-def _cleanup_lingering_browsers() -> None:
+# Files / directories under /tmp and /dev/shm that we must NEVER delete even
+# though they're owned by us — they belong to the long-running uvicorn parent
+# (Xvfb, X11 sockets, /tmp/xvfb.log written by entrypoint.sh, etc.).
+_TMPFS_PRESERVE_PREFIXES: tuple[str, ...] = (
+    "/tmp/.X11-unix",
+    "/tmp/.X1-lock",
+    "/tmp/.X11-lock",
+    "/tmp/.ICE-unix",
+    "/tmp/.font-unix",
+    "/tmp/.XIM-unix",
+    "/tmp/.Test-unix",
+    "/tmp/xvfb.log",
+    "/tmp/systemd-private",
+)
+
+
+def _is_preserved_tmpfs_path(path: str) -> bool:
+    return any(path == p or path.startswith(p + "/") or path.startswith(p) for p in _TMPFS_PRESERVE_PREFIXES)
+
+
+def _cleanup_browser_tmpfs(min_age_s: float = 5.0) -> dict[str, Any]:
     """
-    Kill any zombie browser processes left behind by subprocess scrapers
-    and remove their temp directories. Browsers (Chrome/Camoufox) write
-    profiles and caches to /tmp tmpfs, which counts toward cgroup memory.
+    Delete browser/scraper leftovers from tmpfs mounts (/tmp, /dev/shm).
+
+    On Railway, cgroup memory accounting includes anonymous tmpfs files. When a
+    spawned scraper subprocess exits, its Chromium/Camoufox/Playwright profile
+    dirs and /dev/shm IPC files remain on tmpfs and stay charged to the
+    container's memory.cgroup until something unlinks them. ``drop_caches`` is
+    not available inside an unprivileged container, so this function is the
+    primary mechanism that actually returns memory to the OS after a cron run.
+
+    Safety:
+      - Only deletes paths owned by the current uid.
+      - Only deletes paths whose mtime is older than ``min_age_s`` seconds, so
+        anything an in-flight sibling request just created is left alone.
+      - Refuses to touch the X11/Xvfb/systemd preserve list above.
     """
-    for name in ("chrome", "chromium", "firefox", "camoufox"):
+    my_uid = os.getuid() if hasattr(os, "getuid") else -1
+    now = time.time()
+    bytes_freed = 0
+    files_removed = 0
+    dirs_removed = 0
+    errors = 0
+
+    def _entry_size(path: str) -> int:
+        try:
+            st = os.lstat(path)
+        except OSError:
+            return 0
+        if not (st.st_mode & 0o170000) == 0o040000:  # not a dir
+            return st.st_size
+        total = 0
+        for root, _dirs, files in os.walk(path, topdown=True, followlinks=False):
+            for fn in files:
+                try:
+                    total += os.lstat(os.path.join(root, fn)).st_size
+                except OSError:
+                    pass
+        return total
+
+    for root_dir in ("/tmp", "/dev/shm"):
+        try:
+            entries = os.listdir(root_dir)
+        except OSError:
+            continue
+
+        for name in entries:
+            full = os.path.join(root_dir, name)
+            if _is_preserved_tmpfs_path(full):
+                continue
+            try:
+                st = os.lstat(full)
+            except OSError:
+                continue
+            # Only remove things we own.
+            if my_uid != -1 and st.st_uid != my_uid:
+                continue
+            # Skip very recent files — could belong to an in-flight HTTP request.
+            try:
+                age = now - st.st_mtime
+            except Exception:
+                age = min_age_s + 1
+            if age < min_age_s:
+                continue
+
+            try:
+                size = _entry_size(full)
+            except Exception:
+                size = 0
+
+            try:
+                if os.path.islink(full):
+                    os.unlink(full)
+                    files_removed += 1
+                elif os.path.isdir(full):
+                    shutil.rmtree(full, ignore_errors=True)
+                    if not os.path.exists(full):
+                        dirs_removed += 1
+                        bytes_freed += size
+                    else:
+                        errors += 1
+                else:
+                    os.unlink(full)
+                    files_removed += 1
+                    bytes_freed += size
+            except OSError:
+                errors += 1
+
+    return {
+        "files_removed": files_removed,
+        "dirs_removed": dirs_removed,
+        "bytes_freed": bytes_freed,
+        "errors": errors,
+    }
+
+
+def _cleanup_lingering_browsers() -> dict[str, Any]:
+    """
+    Kill any zombie browser processes left behind by subprocess scrapers and
+    remove their tmpfs leftovers. Run this only after the spawned worker has
+    joined — never while a scrape is in flight.
+    """
+    for name in ("chrome", "chromium", "headless_shell", "firefox", "camoufox"):
         try:
             subprocess.run(
                 ["pkill", "-9", "-f", name],
@@ -860,23 +1122,85 @@ def _cleanup_lingering_browsers() -> None:
             )
         except Exception:
             pass
+    return _cleanup_browser_tmpfs()
 
-    import glob
 
-    for pattern in (
-        "/tmp/uc_chromedriver/*",
-        "/tmp/.com.google.Chrome.*",
-        "/tmp/playwright_*",
-        "/tmp/camoufox_*",
+def _memory_baseline_mb() -> float:
+    """Target cgroup memory after a cron run, in MB. Configurable via env."""
+    try:
+        return float(os.getenv("MEMORY_BASELINE_MB", "350"))
+    except ValueError:
+        return 350.0
+
+
+def _drive_to_baseline(*, allow_balloon: bool = True) -> dict[str, Any]:
+    """
+    Run the full post-cron memory reclaim chain. Goal: bring cgroup memory back
+    down to ``MEMORY_BASELINE_MB`` (default 350 MB), reproducing the fresh
+    redeploy baseline. Order matters:
+
+      1. Kill zombie browsers and unlink their tmpfs files. Frees tmpfs pages
+         immediately (they are accounted as anon in the cgroup).
+      2. Python GC + ``malloc_trim``. Returns Python heap pages to the OS.
+      3. ``cgroup memory.reclaim``. Asks the kernel to evict file-backed page
+         cache + shrink slab inside our cgroup. This is the only mechanism that
+         reduces the "billed" memory you see on Railway when there's no global
+         memory pressure.
+      4. Balloon fallback (only if memory.reclaim was a no-op AND the gap to
+         baseline is meaningful). Allocates and frees a buffer to force the
+         kernel to evict cache by making room for the allocation.
+      5. Best-effort ``drop_caches`` (no-op on Railway, kept for self-hosted).
+    """
+    baseline_mb = _memory_baseline_mb()
+    cgroup_before = _get_cgroup_memory_mb()
+
+    cleanup_stats = _cleanup_lingering_browsers()
+    gc.collect()
+    _malloc_trim()
+
+    cgroup_after_tmpfs = _get_cgroup_memory_mb()
+    overshoot_bytes = int((cgroup_after_tmpfs - baseline_mb) * 1024 * 1024)
+
+    reclaim_target = max(overshoot_bytes, 0)
+    # Always ask for at least a small reclaim if we're above baseline, so the
+    # kernel actively shrinks slab even when overshoot is modest.
+    if 0 < reclaim_target < 64 * 1024 * 1024:
+        reclaim_target = 64 * 1024 * 1024
+
+    reclaimed_via_cgroup = _cgroup_memory_reclaim(reclaim_target) if reclaim_target > 0 else 0
+
+    cgroup_after_reclaim = _get_cgroup_memory_mb()
+    still_over_bytes = int((cgroup_after_reclaim - baseline_mb) * 1024 * 1024)
+
+    reclaimed_via_balloon = 0
+    if (
+        allow_balloon
+        and _CGROUP_RECLAIM_KNOWN_BROKEN
+        and not _BALLOON_FALLBACK_DISABLED
+        and still_over_bytes > 128 * 1024 * 1024
     ):
-        for path in glob.glob(pattern):
-            try:
-                if os.path.isdir(path):
-                    shutil.rmtree(path, ignore_errors=True)
-                else:
-                    os.unlink(path)
-            except OSError:
-                pass
+        # Cap the balloon to avoid spiking too close to the cgroup ceiling.
+        balloon_cap = min(still_over_bytes, 512 * 1024 * 1024)
+        reclaimed_via_balloon = _force_reclaim_via_balloon(balloon_cap)
+
+    page_cache_dropped = _drop_page_cache()
+    cgroup_after = _get_cgroup_memory_mb()
+
+    return {
+        "baseline_mb": baseline_mb,
+        "cgroup_before_mb": round(cgroup_before, 1),
+        "cgroup_after_tmpfs_mb": round(cgroup_after_tmpfs, 1),
+        "cgroup_after_reclaim_mb": round(cgroup_after_reclaim, 1),
+        "cgroup_after_mb": round(cgroup_after, 1),
+        "freed_total_mb": round(cgroup_before - cgroup_after, 1),
+        "tmpfs_files_removed": cleanup_stats.get("files_removed", 0),
+        "tmpfs_dirs_removed": cleanup_stats.get("dirs_removed", 0),
+        "tmpfs_mb_freed": round(cleanup_stats.get("bytes_freed", 0) / (1024 * 1024), 1),
+        "cgroup_reclaim_mb": round(reclaimed_via_cgroup / (1024 * 1024), 1),
+        "balloon_mb": round(reclaimed_via_balloon / (1024 * 1024), 1),
+        "page_cache_dropped": page_cache_dropped,
+        "hit_baseline": cgroup_after <= baseline_mb,
+    }
 
 
 def _get_cgroup_memory_mb() -> float:
@@ -893,13 +1217,14 @@ def _get_cgroup_memory_mb() -> float:
 def free_memory() -> dict[str, Any]:
     """
     Aggressively free process memory after heavy cron workloads.
+
     1. Clear all in-process run-metrics dicts (stale data that grows unbounded).
-    2. Full GC sweep.
-    3. malloc_trim to release freed heap pages back to the OS.
-    4. Drop kernel page cache (the main contributor to Railway's billed memory).
+    2. Run the full reclaim chain (`_drive_to_baseline`):
+       GC + malloc_trim + tmpfs cleanup + cgroup memory.reclaim + balloon
+       fallback. The goal is to bring cgroup memory back to MEMORY_BASELINE_MB
+       (~300-350 MB on Railway), reproducing the fresh redeploy baseline.
     """
     rss_before = _get_rss_mb()
-    cgroup_before = _get_cgroup_memory_mb()
 
     from services.pipeline import PIPELINE_RUN_METRICS
     from services.scrape_relevance_service import SCRAPE_ONLY_RUN_METRICS, CLASSIFY_ONLY_RUN_METRICS
@@ -943,23 +1268,14 @@ def free_memory() -> dict[str, Any]:
     for m in all_metrics:
         m.clear()
 
-    gc.collect()
-    trimmed = _malloc_trim()
-    cache_dropped = _drop_page_cache()
-
+    stats = _drive_to_baseline()
     rss_after = _get_rss_mb()
-    cgroup_after = _get_cgroup_memory_mb()
     result = {
         "rss_before_mb": round(rss_before, 1),
         "rss_after_mb": round(rss_after, 1),
         "freed_rss_mb": round(rss_before - rss_after, 1),
-        "cgroup_before_mb": round(cgroup_before, 1),
-        "cgroup_after_mb": round(cgroup_after, 1),
-        "freed_cgroup_mb": round(cgroup_before - cgroup_after, 1),
         "metrics_entries_cleared": entries_cleared,
-        "gc_collected": True,
-        "malloc_trimmed": trimmed,
-        "page_cache_dropped": cache_dropped,
+        **stats,
     }
     logger.info("free_memory result=%s", result)
     return result

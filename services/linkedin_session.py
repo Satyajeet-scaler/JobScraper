@@ -36,6 +36,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from services.playwright_launch import chromium_launch_kwargs
+
 logger = logging.getLogger(__name__)
 
 _SERVICE_ROOT = Path(__file__).resolve().parent.parent
@@ -185,7 +187,12 @@ async def login_linkedin_save_storage_async(
     max_polls = max(10, int(nav_timeout_ms / (poll_interval_s * 1000)))
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
+        # Headed (LINKEDIN_HEADLESS=false) sessions skip the low-memory args
+        # because they're for interactive debugging on a real display.
+        if headless:
+            browser = await p.chromium.launch(**chromium_launch_kwargs(headless=True))
+        else:
+            browser = await p.chromium.launch(headless=False)
         try:
             context = await browser.new_context(
                 viewport={"width": 1280, "height": 800},

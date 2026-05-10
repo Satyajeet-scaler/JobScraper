@@ -16,6 +16,7 @@ from services.linkedin_posts_pipeline import (
     _dedupe_linkedin_relevant_rows,
 )
 from services.mysql_linkedin_posts_store import (
+    count_unclassified_linkedin_posts,
     existing_linkedin_post_url_normalized_set,
     fetch_unclassified_linkedin_posts,
     fetch_unsent_relevant_linkedin_posts_for_role,
@@ -199,19 +200,44 @@ def run_role_linkedin_posts_classify_only(
         batch_size = max(1, int(os.getenv("ROLE_LINKEDIN_POSTS_CLASSIFY_BATCH_SIZE", "30")))
         run_date_obj = date.fromisoformat(resolved_run_date)
 
-        total_unclassified = count_unclassified_linkedin_posts(
-            requested_role=resolved_role,
-            run_date=run_date_obj,
-        )
-        estimated_batches = (total_unclassified + batch_size - 1) // batch_size
-        logger.info(
-            "role-linkedin-posts-classify-only[%s] starting classify for role=%s, run_date=%s, total_unclassified=%d, estimated_batches=%d",
-            pipeline_run_id,
-            resolved_role,
-            resolved_run_date,
-            total_unclassified,
-            estimated_batches,
-        )
+        # Pre-count is purely informational; if it fails (DB blip, missing fn, no
+        # rows because upstream Apify scrape failed on an expired key, etc.),
+        # we don't want to crash the whole subprocess — the fetch loop below
+        # will simply find zero rows and break cleanly.
+        try:
+            total_unclassified = count_unclassified_linkedin_posts(
+                requested_role=resolved_role,
+                run_date=run_date_obj,
+            )
+        except Exception as exc:
+            logger.warning(
+                "role-linkedin-posts-classify-only[%s] count_unclassified_linkedin_posts failed (%s); "
+                "continuing without precount",
+                pipeline_run_id,
+                exc,
+            )
+            total_unclassified = 0
+
+        if total_unclassified <= 0:
+            logger.info(
+                "role-linkedin-posts-classify-only[%s] nothing to classify for role=%s, run_date=%s "
+                "(upstream scrape may have produced no posts)",
+                pipeline_run_id,
+                resolved_role,
+                resolved_run_date,
+            )
+            estimated_batches = 0
+        else:
+            estimated_batches = (total_unclassified + batch_size - 1) // batch_size
+            logger.info(
+                "role-linkedin-posts-classify-only[%s] starting classify for role=%s, run_date=%s, "
+                "total_unclassified=%d, estimated_batches=%d",
+                pipeline_run_id,
+                resolved_role,
+                resolved_run_date,
+                total_unclassified,
+                estimated_batches,
+            )
 
         total_classified = 0
         total_relevant = 0
